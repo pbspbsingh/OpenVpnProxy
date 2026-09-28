@@ -1,0 +1,31 @@
+[workspace]
+members = ["crates/*"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace.dependencies]
+anyhow = "1.0"
+aes = "0.8.4"
+aes-gcm = "0.10.3"
+ctr = "0.9.2"
+getrandom = "0.3.4"
+hmac = "0.12.1"
+rustls = { version = "0.23.45", default-features = false, features = ["std", "tls12", "aws_lc_rs"] }
+rustls-pemfile = "2.2.0"
+sha2 = "0.10.9"
+smoltcp = { version = "0.14.0", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "socket-tcp", "socket-dns"] }
+serde = { version = "1.0", features = ["derive"] }
+thiserror = "2.0.17"
+tokio = { version = "1.53.1", features = ["rt", "macros", "net", "time", "sync", "io-util", "signal", "fs"] }
+toml = "1.1.6"
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.20", features = ["env-filter", "fmt"] }
+
+ovpn-profile = { path = "crates/profile" }
+ovpn-client = { path = "crates/openvpn" }
+ovpn-netstack = { path = "crates/netstack" }
+ovpn-socks5 = { path = "crates/socks5" }

@@ -1,0 +1,9 @@
+# Copy this file to config.toml and fill in your own values.
+# Relative profile paths are resolved from the directory containing config.toml.
+profile_path = "client.ovpn"
+username = ""
+password = ""
+socks5_address = "127.0.0.1:1080"
+
+# Set this only when the VPN server does not provide a usable DNS server.
+# dns_override = "1.1.1.1"

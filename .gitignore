@@ -1,0 +1,6 @@
+/target/
+*.ovpn
+*.key
+*.pem
+.env
+config.toml

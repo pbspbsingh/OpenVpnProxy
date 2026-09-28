@@ -1,0 +1,11 @@
+[package]
+name = "ovpn-netstack"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+smoltcp.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true

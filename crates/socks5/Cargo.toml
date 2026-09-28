@@ -1,0 +1,11 @@
+[package]
+name = "ovpn-socks5"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+ovpn-netstack.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true

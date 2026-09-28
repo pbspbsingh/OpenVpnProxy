@@ -35,11 +35,6 @@ pub(crate) async fn load_config(path: &Path) -> Result<AppConfig> {
     let mut config: AppConfig = toml::from_str(&content).map_err(|error: toml::de::Error| {
         anyhow::anyhow!("invalid config {}: {}", path.display(), error.message())
     })?;
-    if !config.socks5_address.ip().is_loopback() {
-        bail!(
-            "SOCKS5 socks5_address must be a loopback address until proxy authentication is supported"
-        );
-    }
     if config.profile_path.is_relative() {
         let parent = path
             .parent()

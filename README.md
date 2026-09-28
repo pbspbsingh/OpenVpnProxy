@@ -25,7 +25,7 @@ cp config.toml.example config.toml
 cargo run --release -p openvpn-proxy-app
 ```
 
-`config.toml` contains `profile_path`, `username`, `password`, and `socks5_address`; `dns_override` is optional. Relative profile paths resolve from the config file's directory. The proxy listens only on loopback because it has no client authentication. `config.toml` and `*.ovpn` are ignored by Git. Keep the config file private because it contains credentials. To use a different file, pass its path as the only argument.
+`config.toml` contains `profile_path`, `username`, `password`, and `socks5_address`; `dns_override` is optional. Relative profile paths resolve from the config file's directory. Set `socks5_address = "0.0.0.0:1080"` to accept connections from other machines. The SOCKS5 proxy does not authenticate clients. `config.toml` and `*.ovpn` are ignored by Git. Keep the config file private because it contains credentials. To use a different file, pass its path as the only argument.
 
 ```sh
 curl --socks5-hostname 127.0.0.1:1080 https://example.com

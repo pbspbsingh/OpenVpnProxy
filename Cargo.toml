@@ -8,23 +8,37 @@ edition = "2024"
 publish = false
 
 [workspace.dependencies]
+# Error handling
 anyhow = "1.0"
+thiserror = "2.0.17"
+
+# OpenVPN packet cryptography and randomness
 aes = "0.8.4"
 aes-gcm = "0.10.3"
 ctr = "0.9.2"
 getrandom = "0.3.4"
 hmac = "0.12.1"
+sha2 = "0.10.9"
+
+# OpenVPN TLS and certificate parsing
 rustls = { version = "0.23.45", default-features = false, features = ["std", "tls12", "aws_lc_rs"] }
 rustls-pemfile = "2.2.0"
-sha2 = "0.10.9"
+
+# Userspace TCP, IPv4, and DNS
 smoltcp = { version = "0.14.0", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "socket-tcp", "socket-dns"] }
+
+# TOML application configuration
 serde = { version = "1.0", features = ["derive"] }
-thiserror = "2.0.17"
-tokio = { version = "1.53.1", features = ["rt", "macros", "net", "time", "sync", "io-util", "signal", "fs"] }
 toml = "1.1.6"
+
+# Async I/O and task scheduling
+tokio = { version = "1.53.1", features = ["rt", "macros", "net", "time", "sync", "io-util", "signal", "fs"] }
+
+# Structured logging
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter", "fmt"] }
 
+# Local workspace crates
 ovpn-profile = { path = "crates/profile" }
 ovpn-client = { path = "crates/openvpn" }
 ovpn-netstack = { path = "crates/netstack" }

@@ -5,7 +5,12 @@ edition.workspace = true
 publish.workspace = true
 
 [dependencies]
+# Userspace TCP and DNS transport
 ovpn-netstack.workspace = true
-thiserror.workspace = true
+
+# Async SOCKS5 sockets
 tokio.workspace = true
+
+# Typed errors and diagnostics
+thiserror.workspace = true
 tracing.workspace = true

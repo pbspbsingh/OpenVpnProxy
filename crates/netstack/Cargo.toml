@@ -5,7 +5,12 @@ edition.workspace = true
 publish.workspace = true
 
 [dependencies]
+# Userspace packet stack
 smoltcp.workspace = true
-thiserror.workspace = true
+
+# Async worker and channels
 tokio.workspace = true
+
+# Typed errors and diagnostics
+thiserror.workspace = true
 tracing.workspace = true

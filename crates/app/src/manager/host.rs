@@ -10,7 +10,8 @@ use tokio::sync::{Semaphore, mpsc, watch};
 use tokio::time;
 
 use super::discovery::HostCandidate;
-use super::routing::{HostPhase, HostUsage, Shared, UsageState};
+use super::probe::{LatencyScore, PROBE_INTERVAL, measure, measure_with_session};
+use super::routing::{HostActivation, HostPhase, Shared};
 
 const TUNNEL_PACKET_QUEUE_CAPACITY: usize = 1024;
 pub(super) const CONTROL_SETUP_ALLOWANCE: Duration = Duration::from_secs(30);
@@ -18,7 +19,8 @@ const INITIAL_RETRY_DELAY: Duration = Duration::from_secs(2);
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(60);
 const STABLE_SESSION_WINDOW: Duration = Duration::from_secs(30);
 const HOST_STATUS_INTERVAL: Duration = Duration::from_secs(10);
-const VPN_IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+const PROBE_STAGGER_SECONDS: u64 = 3;
+const PROBE_STAGGER_SLOTS: u64 = 20;
 
 pub(super) struct HostWorker {
     pub(super) id: usize,
@@ -28,7 +30,7 @@ pub(super) struct HostWorker {
     pub(super) password: Arc<str>,
     pub(super) dns_override: Option<Ipv4Addr>,
     pub(super) permits: Arc<Semaphore>,
-    pub(super) usage: Arc<HostUsage>,
+    pub(super) enabled: watch::Receiver<HostActivation>,
     pub(super) shared: Arc<Shared>,
     pub(super) stop: watch::Receiver<bool>,
 }
@@ -48,11 +50,10 @@ impl HostWorker {
             password,
             dns_override,
             permits,
-            usage,
+            mut enabled,
             shared,
             mut stop,
         } = self;
-        let mut demand = usage.subscribe();
         let mut delay = INITIAL_RETRY_DELAY;
         let mut next_endpoint = 0;
         'worker: loop {
@@ -60,30 +61,37 @@ impl HostWorker {
                 break;
             }
             shared.phase(id, HostPhase::Dormant);
-            while demand.borrow().active == 0 {
+            while *enabled.borrow() == HostActivation::Dormant {
                 tokio::select! {
-                    changed = demand.changed() => if changed.is_err() { break 'worker; },
+                    changed = enabled.changed() => if changed.is_err() { break 'worker; },
                     _ = stop.changed() => break,
                 }
                 if *stop.borrow() {
                     break;
                 }
             }
-            if *stop.borrow() || demand.borrow().active == 0 {
+            if *stop.borrow() || *enabled.borrow() == HostActivation::Dormant {
                 if *stop.borrow() {
                     break;
                 }
                 continue;
             }
+            let HostActivation::Active(epoch) = *enabled.borrow() else {
+                continue;
+            };
             let permit = tokio::select! {
                 result = permits.acquire() => match result {
                     Ok(permit) => permit,
                     Err(_) => break,
                 },
+                _ = enabled.changed() => continue,
                 _ = stop.changed() => break,
             };
-            if *stop.borrow() {
-                break;
+            if *stop.borrow() || *enabled.borrow() != HostActivation::Active(epoch) {
+                if *stop.borrow() {
+                    break;
+                }
+                continue;
             }
             shared.phase(id, HostPhase::Connecting);
             let Some(&endpoint) = candidate.endpoints.get(next_endpoint) else {
@@ -92,18 +100,50 @@ impl HostWorker {
             };
             next_endpoint = (next_endpoint + 1) % candidate.endpoints.len();
             let started = Instant::now();
-            tracing::info!(host_id = id, address = %candidate.address, %endpoint, "connecting VPN host on demand");
+            tracing::info!(host_id = id, address = %candidate.address, %endpoint, epoch, "connecting selected VPN host");
             let connect_timeout = profile
                 .handshake_window
                 .saturating_add(CONTROL_SETUP_ALLOWANCE);
             let result = tokio::select! {
                 result = time::timeout(connect_timeout, connect_host(endpoint, &profile, &username, &password, dns_override)) =>
                     result.map_err(|_| anyhow!("VPN host connection timed out")).and_then(|result| result),
+                _ = enabled.changed() => continue,
                 _ = stop.changed() => break,
             };
             match result {
-                Ok((session, stack, outbound)) => {
-                    shared.ready(id, endpoint, &stack, started.elapsed());
+                Ok((mut session, stack, mut outbound)) => {
+                    let fresh_score = tokio::select! {
+                        result = measure_with_session(&mut session, &stack, &mut outbound) => result,
+                        _ = enabled.changed() => {
+                            let _ = stack.reset().await;
+                            continue;
+                        },
+                        _ = stop.changed() => {
+                            let _ = stack.reset().await;
+                            break;
+                        },
+                    };
+                    let score = match fresh_score {
+                        Ok(score) => score,
+                        Err(error) => {
+                            tracing::warn!(host_id = id, %endpoint, %error, "fresh VPN host probe failed");
+                            shared.down(id, false);
+                            let _ = stack.reset().await;
+                            drop(permit);
+                            tokio::select! {
+                                _ = time::sleep(delay) => {},
+                                _ = enabled.changed() => {},
+                                _ = stop.changed() => break,
+                            }
+                            delay = delay.saturating_mul(2).min(MAX_RETRY_DELAY);
+                            continue;
+                        }
+                    };
+                    if *enabled.borrow() != HostActivation::Active(epoch) {
+                        let _ = stack.reset().await;
+                        continue;
+                    }
+                    shared.ready(id, endpoint, &stack, started.elapsed(), score);
                     let active_since = Instant::now();
                     let result = drive_host(
                         id,
@@ -112,13 +152,16 @@ impl HostWorker {
                         session,
                         outbound,
                         &shared,
-                        &mut demand,
+                        &mut enabled,
+                        epoch,
                         &mut stop,
                     )
                     .await;
                     let shutdown = *stop.borrow() || matches!(&result, Ok(HostExit::Shutdown));
                     let idle = matches!(&result, Ok(HostExit::Idle));
-                    if !idle {
+                    if idle {
+                        shared.parked(id);
+                    } else {
                         shared.down(id, shutdown);
                     }
                     if let Err(error) = stack.reset().await {
@@ -148,6 +191,7 @@ impl HostWorker {
             tracing::debug!(host_id = id, %endpoint, ?delay, "waiting before VPN host retry");
             tokio::select! {
                 _ = time::sleep(delay) => {}
+                _ = enabled.changed() => {}
                 _ = stop.changed() => break,
             }
             delay = delay.saturating_mul(2).min(MAX_RETRY_DELAY);
@@ -155,6 +199,58 @@ impl HostWorker {
         shared.down(id, true);
         tracing::debug!(host_id = id, address = %candidate.address, "VPN host worker stopped");
     }
+}
+
+pub(super) async fn benchmark_host(
+    id: usize,
+    candidate: &HostCandidate,
+    profile: &Profile,
+    username: &str,
+    password: &str,
+    dns_override: Option<Ipv4Addr>,
+) -> Result<(SocketAddr, LatencyScore)> {
+    let host_started = Instant::now();
+    let connect_timeout = profile
+        .handshake_window
+        .saturating_add(CONTROL_SETUP_ALLOWANCE);
+    let mut last_error = None;
+    for &endpoint in &candidate.endpoints {
+        let started = Instant::now();
+        let connection = time::timeout(
+            connect_timeout,
+            connect_host(endpoint, profile, username, password, dns_override),
+        )
+        .await;
+        let (mut session, stack, mut outbound) = match connection {
+            Ok(Ok(connection)) => connection,
+            Ok(Err(error)) => {
+                tracing::warn!(host_id = id, %endpoint, %error, "VPN baseline connection failed");
+                last_error = Some(error);
+                continue;
+            }
+            Err(_) => {
+                tracing::warn!(host_id = id, %endpoint, ?connect_timeout, "VPN baseline connection timed out");
+                last_error = Some(anyhow!("VPN baseline connection timed out"));
+                continue;
+            }
+        };
+        let setup_elapsed = started.elapsed();
+        let score = measure_with_session(&mut session, &stack, &mut outbound).await;
+        if let Err(error) = stack.reset().await {
+            tracing::warn!(host_id = id, %endpoint, %error, "VPN baseline stack reset failed");
+        }
+        match score {
+            Ok(score) => {
+                tracing::info!(host_id = id, %endpoint, ?setup_elapsed, latency_score = ?score.median, score_elapsed = ?score.elapsed, total_elapsed = ?host_started.elapsed(), successful_samples = score.successful_samples, "VPN baseline latency score measured");
+                return Ok((endpoint, score));
+            }
+            Err(error) => {
+                tracing::warn!(host_id = id, %endpoint, ?setup_elapsed, total_elapsed = ?started.elapsed(), %error, "VPN baseline probe failed");
+                last_error = Some(error);
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| anyhow!("VPN host has no endpoints")))
 }
 
 async fn connect_host(
@@ -217,14 +313,22 @@ async fn drive_host(
     stack: &Stack,
     mut session: Session,
     mut outbound: mpsc::Receiver<Vec<u8>>,
-    shared: &Shared,
-    demand: &mut watch::Receiver<UsageState>,
+    shared: &Arc<Shared>,
+    enabled: &mut watch::Receiver<HostActivation>,
+    epoch: u64,
     stop: &mut watch::Receiver<bool>,
 ) -> Result<HostExit> {
     let started = Instant::now();
     let stack_id = stack.id();
     let mut status = time::interval(HOST_STATUS_INTERVAL);
     status.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+    let stagger = Duration::from_secs(PROBE_STAGGER_SECONDS * (id as u64 % PROBE_STAGGER_SLOTS));
+    let mut probe_interval = time::interval_at(
+        time::Instant::now() + PROBE_INTERVAL + stagger,
+        PROBE_INTERVAL,
+    );
+    probe_interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+    let mut probe_task: Option<tokio::task::JoinHandle<()>> = None;
     let mut sent_packets = 0_u64;
     let mut received_packets = 0_u64;
     let mut sent_bytes = 0_u64;
@@ -238,15 +342,21 @@ async fn drive_host(
             if !stack.is_ready() {
                 bail!("VPN packet stack stopped");
             }
-            let idle_deadline = demand.borrow().idle_since.map(|since| since + VPN_IDLE_TIMEOUT);
             tokio::select! {
                 _ = stop.changed() => return Ok(HostExit::Shutdown),
-                changed = demand.changed() => {
-                    changed.context("VPN host demand channel closed")?;
+                changed = enabled.changed() => {
+                    changed.context("VPN host activation channel closed")?;
+                    if *enabled.borrow() != HostActivation::Active(epoch) { return Ok(HostExit::Idle); }
                 }
-                _ = wait_until_idle(idle_deadline) => {
-                    if shared.park_if_idle(id, VPN_IDLE_TIMEOUT)? {
-                        return Ok(HostExit::Idle);
+                _ = probe_interval.tick() => {
+                    if probe_task.as_ref().is_none_or(tokio::task::JoinHandle::is_finished) {
+                        let stack = stack.clone();
+                        let shared = Arc::clone(shared);
+                        probe_task = Some(tokio::spawn(async move {
+                            let started = Instant::now();
+                            let result = measure(&stack).await;
+                            shared.record_probe(id, stack.id(), result, started.elapsed());
+                        }));
                     }
                 }
                 packet = outbound.recv() => {
@@ -278,14 +388,10 @@ async fn drive_host(
             }
         }
     }.await;
+    if let Some(task) = probe_task {
+        task.abort();
+        let _ = task.await;
+    }
     tracing::debug!(host_id = id, %endpoint, stack_id, elapsed = ?started.elapsed(), sent_packets, received_packets, sent_bytes, received_bytes, outcome = match &result { Ok(HostExit::Idle) => "idle", Ok(HostExit::Shutdown) => "shutdown", Err(_) => "error" }, "VPN host traffic summary");
     result
-}
-
-async fn wait_until_idle(deadline: Option<Instant>) {
-    if let Some(deadline) = deadline {
-        time::sleep_until(time::Instant::from_std(deadline)).await;
-    } else {
-        std::future::pending().await
-    }
 }

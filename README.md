@@ -1,6 +1,6 @@
 # Rootless OpenVPN SOCKS5 proxy
 
-This Rust workspace is a userspace OpenVPN SOCKS5 proof of concept. An application connects to its SOCKS5 listener, and the proxy carries that application's TCP traffic through a selected OpenVPN server. It creates no TUN device, changes no system routes, and needs no root permissions. Earlier tunnel and proxy behavior was tested with a real VPN profile on Linux; the current lazy-host changes still need an app build and live test. macOS also needs a build and live test.
+This Rust workspace is a userspace OpenVPN SOCKS5 app. An application connects to its SOCKS5 listener, and the proxy carries that application's TCP traffic through a selected OpenVPN server. It creates no TUN device, changes no system routes, and needs no root permissions. The current host selection and routing behavior has been built and exercised with a real VPN profile on Linux. Idle shutdown and failover still need live tests. macOS also needs a build and live test.
 
 ## The networking model
 
@@ -40,9 +40,11 @@ The dependency direction is `app → profile/client/netstack/socks5` and `socks5
 
 ### Connection manager and sticky routing
 
-The app resolves every profile `remote` to IPv4 endpoints, deduplicates them, and groups ports under each server IP. The SOCKS listener starts with all VPN hosts dormant. A request selects a host and wakes its worker; concurrent requests for that host share the same connection attempt. The worker tries the host's ports in turn, establishes a VPN session and packet stack, then monitors the tunnel. Up to `max_active_vpn_hosts` tunnels may be active at once (default: 16). A failed host is retried with bounded exponential backoff while requests need it.
+The app resolves every profile `remote` to IPv4 endpoints, deduplicates them, and groups ports under each server IP. Before opening the SOCKS listener, it probes every candidate with at most four probes running concurrently. Each baseline tunnel closes after measurement. The fastest healthy `max_active_vpn_hosts` (default: 16) become the selected pool; the remaining scored hosts stay dormant as failover candidates. The first client request wakes all selected hosts together. Each worker tries its host's ports in turn, establishes a VPN session and packet stack, obtains a fresh tunneled score, then becomes available for routing. A failed selected host yields its slot to a dormant candidate, preferring candidates that have not failed during the current wake. If none remains, the failed host retries with bounded exponential backoff.
 
-For a SOCKS hostname, the handler asks the manager for a route **before DNS**. The manager uses the Public Suffix List to group a registrable domain and its subdomains: `abc.com` and `xyz.abc.com` get the same assignment, while `example.co.uk` is handled correctly. A direct IP request uses its address as the sticky key. A new group chooses the lowest-cost eligible host, balancing active requests against the cost of opening a dormant tunnel. IPv6 requests use a host only after its tunnel confirms a matching IPv6 route; a dormant host may need to connect before that can be checked. The assignment stays fixed until that host fails; changing load does not move an established group. On failure, the manager removes that host's assignments and resets its stack, closing existing proxied TCP connections. A later request can choose another healthy host. After the last request lease closes, an idle host keeps its tunnel for 30 minutes, then closes it; its sticky assignments remain for the next request.
+The initial score is the median of three tunneled TCP connection times to `1.1.1.1:443`; at least two must succeed. Logs report tunnel setup time, time spent obtaining the score, and total time for each host. Connected hosts refresh the score every minute on staggered schedules, smoothing new samples with the previous score; probes do not count as client activity. A dormant replacement gets a fresh score before receiving traffic. Scores remain in memory only and are measured again on app restart.
+
+For a SOCKS hostname, the handler asks the manager for a route **before DNS**. The manager uses the Public Suffix List to group a registrable domain and its subdomains: `abc.com` and `xyz.abc.com` share an assignment for the same client source IP. Direct IP requests use `(source IP, destination IP)` as the sticky key. A new group chooses among ready selected hosts using latency and current connection count. IPv6 requests require a matching IPv6 route on the selected tunnel. Existing assignments remain fixed until their host fails or they have no TCP connections for 30 minutes. On failure, the manager removes that host's assignments and resets its stack, closing existing proxied TCP connections. When the entire pool has no client routes for 30 minutes, all VPN sessions close and sticky state clears. The next request reopens the selected pool.
 
 The sticky table is bounded. If it fills, new groups fail closed rather than silently losing their assignment. DNS for a hostname runs through its assigned host's packet stack, so DNS and TCP use the same VPN.
 
@@ -63,7 +65,7 @@ The control channel establishes trust and derives data keys. The data channel ca
 
 ## Startup sequence
 
-The listener opens after profile validation and VPN host discovery. VPN sessions start when requests arrive.
+The listener opens after profile validation, VPN host discovery, and a baseline measurement round. Baseline tunnels close after measurement; serving tunnels start when requests arrive.
 
 ```mermaid
 sequenceDiagram
@@ -75,12 +77,14 @@ sequenceDiagram
     App->>Profile: Read config.toml and parse .ovpn
     Profile-->>App: Remotes, CA, keys, options
     App->>Manager: Resolve all remotes; group endpoints by server IP
-    Manager-->>App: Dormant host pool ready
+    Manager->>Manager: Probe all candidates, four at a time
+    Manager->>Manager: Rank healthy hosts; select configured active limit
+    Manager-->>App: Scored host pool ready; tunnels dormant
     App->>Listener: Bind socks5_address
     Listener-->>App: Accept SOCKS5 clients
 ```
 
-Profile or host discovery errors prevent startup. The manager does not benchmark throughput or refresh remote DNS records after startup yet.
+Profile or host discovery errors prevent startup. A candidate that fails its baseline probe is ineligible; startup fails if none pass. The manager does not benchmark throughput or refresh remote DNS records after startup yet.
 
 ## One proxied HTTPS request
 
@@ -98,11 +102,11 @@ sequenceDiagram
     participant Site as Website
 
     Client->>Socks: Local TCP; SOCKS5 CONNECT example.com:443
-    Socks->>Manager: Select sticky host for example.com
-    Manager->>VPN: Wake selected worker; start OpenVPN session if dormant
+    Socks->>Manager: Select sticky host for (source IP, example.com)
+    Manager->>VPN: Wake selected pool; start sessions if dormant
     VPN->>Server: Protected reset, TLS handshake, credentials, PUSH_REQUEST
     Server-->>VPN: Tunnel settings
-    VPN-->>Manager: Session established; activate packet stack
+    VPN-->>Manager: Session established; activate stack and probe latency
     Manager-->>Socks: Lease for one ready host and its stack
     opt Destination is a hostname
         Socks->>Stack: Resolve A or AAAA record
@@ -141,7 +145,7 @@ sequenceDiagram
     end
 ```
 
-The app's serving loop accepts SOCKS clients and handles shutdown. Each accepted client gets an async task. Each VPN host worker separately multiplexes outbound stack packets, inbound OpenVPN packets, keepalive/status work, idle timeout, and shutdown. Each packet stack has one owning task for its TCP and DNS state.
+The app's serving loop accepts SOCKS clients and handles shutdown. Each accepted client gets an async task. Each active VPN host worker multiplexes outbound stack packets, inbound OpenVPN packets, keepalive/status work, probes, and shutdown. A pool coordinator handles the shared idle timeout and sticky expiry. Each packet stack has one owning task for its TCP and DNS state.
 
 ## Key rotation and failure behavior
 
@@ -149,9 +153,9 @@ OpenVPN may request a new data key, or the client may start renegotiation when i
 
 The design fails closed for **traffic handled by this proxy**:
 
-- The SOCKS listener can start before a VPN connects. A request waits for a selected host up to the profile handshake window plus 30 seconds for control setup (60 seconds with the default 30-second handshake window). A failed host clears its assignment so the request can try another eligible host within the same deadline. If no host becomes ready, the proxy returns a SOCKS5 network failure. A profile's `hand-window` setting overrides the default handshake window and also limits key renegotiation.
+- The SOCKS listener starts after baseline probing but before serving tunnels connect. A request waits for a selected host up to the profile handshake window plus 30 seconds for control setup (60 seconds with the default 30-second handshake window). A failed host clears its assignment; a scored standby may take its slot after a fresh probe. If no host becomes ready, the proxy returns a SOCKS5 network failure. A profile's `hand-window` setting overrides the default handshake window and also limits key renegotiation.
 - During a session, SOCKS requests can select only a ready host. A VPN or stack error marks that host unhealthy, clears its sticky assignments, resets its stack, and closes its client connections. Other hosts continue serving. Full queues mark the affected stack failed instead of bypassing it.
-- There is no direct-to-destination fallback in the SOCKS or stack crates. If every host is unavailable, new requests fail. The manager retries failed hosts and tries their alternate ports; automatic DNS rediscovery and migration of existing TCP connections are not implemented.
+- There is no direct-to-destination fallback in the SOCKS or stack crates. If every selected host is unavailable, new requests fail. The manager can activate a scored standby, retries failed hosts when no standby remains, and tries alternate ports; automatic DNS rediscovery and migration of existing TCP connections are not implemented.
 
 This guarantee applies only to traffic sent to the proxy. An application that ignores its proxy setting can still use the ordinary network connection.
 

@@ -77,6 +77,7 @@ pub trait RouteProvider: Clone + Send + Sync + 'static {
 
     fn select(
         &self,
+        source: IpAddr,
         destination: DestinationHost,
     ) -> impl Future<Output = Option<Self::Lease>> + Send;
 }
@@ -84,11 +85,12 @@ pub trait RouteProvider: Clone + Send + Sync + 'static {
 /// Serves one unauthenticated SOCKS5 TCP connection through a VPN route.
 pub async fn handle<R: RouteProvider>(mut stream: TcpStream, router: R) -> Result<()> {
     let started = Instant::now();
+    let source = stream.peer_addr()?.ip();
     let Some((destination, port)) = read_request(&mut stream).await? else {
         return Ok(());
     };
     let route_started = Instant::now();
-    let Some(route) = router.select(destination.clone()).await else {
+    let Some(route) = router.select(source, destination.clone()).await else {
         tracing::warn!(
             ?destination,
             "SOCKS5 request rejected: no VPN host with a route to the destination"

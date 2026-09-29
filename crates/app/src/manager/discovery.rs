@@ -11,6 +11,7 @@ const MAX_PROFILE_REMOTES: usize = 64;
 pub(super) const MAX_ENDPOINTS: usize = 64;
 const REMOTE_DNS_TIMEOUT: Duration = Duration::from_secs(8);
 
+#[derive(Clone)]
 pub(super) struct HostCandidate {
     pub(super) address: Ipv4Addr,
     pub(super) endpoints: Vec<SocketAddr>,

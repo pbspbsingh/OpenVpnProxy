@@ -16,10 +16,10 @@ const PROBE_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 pub(super) const PROBE_INTERVAL: Duration = Duration::from_secs(60);
 
 pub(super) struct LatencyScore {
-    pub(super) median: Duration,
-    pub(super) elapsed: Duration,
-    pub(super) successful_samples: usize,
-    pub(super) measured_at: Instant,
+    pub median: Duration,
+    pub elapsed: Duration,
+    pub successful_samples: usize,
+    pub measured_at: Instant,
 }
 
 pub(super) async fn measure(stack: &Stack) -> Result<LatencyScore> {

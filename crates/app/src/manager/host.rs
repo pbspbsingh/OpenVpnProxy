@@ -24,17 +24,17 @@ const PROBE_STAGGER_SECONDS: u64 = 3;
 const PROBE_STAGGER_SLOTS: u64 = 20;
 
 pub(super) struct HostWorker {
-    pub(super) id: usize,
-    pub(super) candidate: HostCandidate,
-    pub(super) profile: Arc<Profile>,
-    pub(super) username: Arc<str>,
-    pub(super) password: Arc<str>,
-    pub(super) dns_override: Option<Ipv4Addr>,
-    pub(super) permits: Arc<Semaphore>,
-    pub(super) enabled: watch::Receiver<HostActivation>,
-    pub(super) traffic: Arc<HostTraffic>,
-    pub(super) shared: Arc<Shared>,
-    pub(super) stop: watch::Receiver<bool>,
+    pub id: usize,
+    pub candidate: HostCandidate,
+    pub profile: Arc<Profile>,
+    pub username: Arc<str>,
+    pub password: Arc<str>,
+    pub dns_override: Option<Ipv4Addr>,
+    pub permits: Arc<Semaphore>,
+    pub enabled: watch::Receiver<HostActivation>,
+    pub traffic: Arc<HostTraffic>,
+    pub shared: Arc<Shared>,
+    pub stop: watch::Receiver<bool>,
 }
 
 enum HostExit {

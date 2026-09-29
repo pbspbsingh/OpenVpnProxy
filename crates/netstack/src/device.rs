@@ -4,8 +4,8 @@ use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::time::Instant;
 
 pub(crate) struct PacketDevice {
-    pub(crate) inbound: VecDeque<Vec<u8>>,
-    pub(crate) outbound: VecDeque<Vec<u8>>,
+    pub inbound: VecDeque<Vec<u8>>,
+    pub outbound: VecDeque<Vec<u8>>,
     mtu: usize,
 }
 

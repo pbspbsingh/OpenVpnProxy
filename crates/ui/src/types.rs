@@ -102,23 +102,23 @@ pub enum HostPhase {
 /// One WebSocket message: current status plus one hour of minute buckets.
 #[derive(Serialize)]
 pub(crate) struct DashboardFrame {
-    pub(crate) snapshot: DashboardSnapshot,
-    pub(crate) history: Vec<MinuteSample>,
+    pub snapshot: DashboardSnapshot,
+    pub history: Vec<MinuteSample>,
 }
 
 #[derive(Serialize)]
 pub(crate) struct MinuteSample {
-    pub(crate) minute_start_ms: u64,
-    pub(crate) tx_bytes: u64,
-    pub(crate) rx_bytes: u64,
-    pub(crate) average_latency_ms: Option<f64>,
-    pub(crate) hosts: Vec<HostMinuteSample>,
+    pub minute_start_ms: u64,
+    pub tx_bytes: u64,
+    pub rx_bytes: u64,
+    pub average_latency_ms: Option<f64>,
+    pub hosts: Vec<HostMinuteSample>,
 }
 
 #[derive(Serialize)]
 pub(crate) struct HostMinuteSample {
-    pub(crate) host_id: usize,
-    pub(crate) tx_bytes: u64,
-    pub(crate) rx_bytes: u64,
-    pub(crate) average_latency_ms: Option<f64>,
+    pub host_id: usize,
+    pub tx_bytes: u64,
+    pub rx_bytes: u64,
+    pub average_latency_ms: Option<f64>,
 }

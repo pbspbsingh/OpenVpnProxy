@@ -12,14 +12,14 @@ const MAX_DASHBOARD_LOG_CAPACITY: usize = 20_000;
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct AppConfig {
-    pub(crate) profile_path: PathBuf,
-    pub(crate) username: String,
-    pub(crate) password: String,
-    pub(crate) socks5_address: SocketAddr,
-    pub(crate) webui_address: Option<SocketAddr>,
-    pub(crate) dashboard_log_capacity: Option<NonZeroUsize>,
-    pub(crate) dns_override: Option<Ipv4Addr>,
-    pub(crate) max_active_vpn_hosts: Option<NonZeroUsize>,
+    pub profile_path: PathBuf,
+    pub username: String,
+    pub password: String,
+    pub socks5_address: SocketAddr,
+    pub webui_address: Option<SocketAddr>,
+    pub dashboard_log_capacity: Option<NonZeroUsize>,
+    pub dns_override: Option<Ipv4Addr>,
+    pub max_active_vpn_hosts: Option<NonZeroUsize>,
 }
 
 impl AppConfig {

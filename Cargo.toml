@@ -33,6 +33,10 @@ smoltcp = { version = "0.14.0", default-features = false, features = ["std", "me
 serde = { version = "1.0", features = ["derive"] }
 toml = "1.1.6"
 
+# Registrable-domain routing
+psl = "2.1.238"
+idna = "1.1.0"
+
 # Async I/O and task scheduling
 tokio = { version = "1.53.1", features = ["rt", "macros", "net", "time", "sync", "io-util", "signal", "fs"] }
 

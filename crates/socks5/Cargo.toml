@@ -8,6 +8,9 @@ publish.workspace = true
 # Userspace TCP and DNS transport
 ovpn-netstack.workspace = true
 
+# Canonical destination names for DNS and sticky routing
+idna.workspace = true
+
 # Async SOCKS5 sockets
 tokio.workspace = true
 

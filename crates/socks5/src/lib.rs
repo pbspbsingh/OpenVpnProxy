@@ -47,6 +47,22 @@ pub enum SocksError {
 
 type Result<T> = std::result::Result<T, SocksError>;
 
+#[derive(Clone, Debug)]
+pub enum DestinationHost {
+    Domain(String),
+    Ipv4(Ipv4Addr),
+}
+
+pub trait RouteLease: Send {
+    fn stack(&self) -> &Stack;
+}
+
+pub trait RouteProvider: Clone + Send + Sync + 'static {
+    type Lease: RouteLease;
+
+    fn select(&self, destination: &DestinationHost) -> Option<Self::Lease>;
+}
+
 async fn reply(stream: &mut TcpStream, code: u8) -> Result<()> {
     let mut response = [0; SOCKS_REPLY_BYTES];
     response[VERSION_INDEX] = SOCKS_VERSION;
@@ -63,7 +79,7 @@ async fn read_exact(stream: &mut TcpStream, buf: &mut [u8]) -> Result<()> {
     Ok(())
 }
 
-pub async fn handle(mut stream: TcpStream, stack: Stack) -> Result<()> {
+pub async fn handle<R: RouteProvider>(mut stream: TcpStream, router: R) -> Result<()> {
     tracing::debug!("SOCKS5 handshake started");
     let mut greeting = [0; GREETING_BYTES];
     read_exact(&mut stream, &mut greeting).await?;
@@ -97,17 +113,11 @@ pub async fn handle(mut stream: TcpStream, stack: Stack) -> Result<()> {
         reply(&mut stream, REPLY_COMMAND).await?;
         return Ok(());
     }
-    if !stack.is_ready() {
-        tracing::warn!("SOCKS5 request rejected because VPN is down");
-        reply(&mut stream, REPLY_NETWORK).await?;
-        return Ok(());
-    }
-
-    let address = match request[ADDRESS_TYPE_INDEX] {
+    let destination = match request[ADDRESS_TYPE_INDEX] {
         IPV4_ADDRESS_TYPE => {
             let mut raw = [0; IPV4_ADDRESS_BYTES];
             read_exact(&mut stream, &mut raw).await?;
-            Ipv4Addr::from(raw)
+            DestinationHost::Ipv4(Ipv4Addr::from(raw))
         }
         DOMAIN_ADDRESS_TYPE => {
             let mut length = [0; 1];
@@ -119,26 +129,20 @@ pub async fn handle(mut stream: TcpStream, stack: Stack) -> Result<()> {
             }
             let mut raw = vec![0; length[0] as usize];
             read_exact(&mut stream, &mut raw).await?;
-            let host = match String::from_utf8(raw) {
-                Ok(host) => host,
-                Err(_) => {
-                    tracing::debug!("SOCKS5 client sent a non-UTF-8 domain");
+            let host = match String::from_utf8(raw)
+                .ok()
+                .and_then(|host| idna::domain_to_ascii(&host).ok())
+                .map(|host| host.trim_end_matches('.').to_ascii_lowercase())
+                .filter(|host| !host.is_empty())
+            {
+                Some(host) => host,
+                None => {
+                    tracing::debug!("SOCKS5 client sent an invalid domain");
                     reply(&mut stream, REPLY_ADDRESS).await?;
                     return Ok(());
                 }
             };
-            tracing::debug!(%host, "resolving SOCKS5 destination through VPN");
-            match stack.resolve(&host).await {
-                Ok(address) => {
-                    tracing::debug!(%host, %address, "SOCKS5 destination resolved");
-                    address
-                }
-                Err(error) => {
-                    tracing::warn!(%host, %error, "SOCKS5 destination lookup failed");
-                    reply(&mut stream, REPLY_HOST).await?;
-                    return Ok(());
-                }
-            }
+            DestinationHost::Domain(host)
         }
         _ => {
             tracing::debug!(
@@ -157,11 +161,34 @@ pub async fn handle(mut stream: TcpStream, stack: Stack) -> Result<()> {
         reply(&mut stream, REPLY_ADDRESS).await?;
         return Ok(());
     }
+    let Some(route) = router.select(&destination) else {
+        tracing::warn!(?destination, "SOCKS5 request rejected: no healthy VPN host");
+        reply(&mut stream, REPLY_NETWORK).await?;
+        return Ok(());
+    };
+    let stack = route.stack();
     if !stack.is_ready() {
         tracing::warn!("SOCKS5 request rejected because VPN went down");
         reply(&mut stream, REPLY_NETWORK).await?;
         return Ok(());
     }
+    let address = match destination {
+        DestinationHost::Ipv4(address) => address,
+        DestinationHost::Domain(host) => {
+            tracing::debug!(%host, "resolving SOCKS5 destination through assigned VPN");
+            match stack.resolve(&host).await {
+                Ok(address) => {
+                    tracing::debug!(%host, %address, "SOCKS5 destination resolved");
+                    address
+                }
+                Err(error) => {
+                    tracing::warn!(%host, %error, "SOCKS5 destination lookup failed");
+                    reply(&mut stream, REPLY_HOST).await?;
+                    return Ok(());
+                }
+            }
+        }
+    };
     let destination = SocketAddrV4::new(address, port);
     tracing::debug!(%destination, "connecting SOCKS5 destination through VPN");
     let (id, mut events) = match stack.connect(destination).await {

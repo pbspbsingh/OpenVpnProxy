@@ -5,6 +5,8 @@ username = ""
 password = ""
 # Listen on all IPv4 interfaces so other machines can use the proxy.
 socks5_address = "0.0.0.0:1080"
+# The default is 16. Set this lower if your provider restricts concurrent sessions.
+max_active_vpn_hosts = 16
 
 # Set this only when the VPN server does not provide a usable DNS server.
 # dns_override = "1.1.1.1"

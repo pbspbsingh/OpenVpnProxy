@@ -1,90 +1,33 @@
-use std::net::SocketAddr;
-
 use anyhow::{Context, Result, bail};
-use ovpn_client::{ClientConfig, Session};
-use ovpn_netstack::{Stack, TunnelConfig};
 use ovpn_profile::Profile;
 use tokio::net::TcpListener;
-use tokio::sync::mpsc;
 
 use crate::config::{config_path, load_config};
+use crate::manager::{ConnectionManager, RouterHandle};
 
-const TUNNEL_PACKET_QUEUE_CAPACITY: usize = 1024;
-
-async fn resolve_vpn_endpoint(profile: &Profile) -> Result<SocketAddr> {
-    let mut last_error = None;
-    for (host, port) in &profile.remotes {
-        tracing::debug!(host, port, "resolving VPN remote");
-        match tokio::net::lookup_host((host.as_str(), *port)).await {
-            Ok(mut addresses) => {
-                if let Some(address) = addresses.find(SocketAddr::is_ipv4) {
-                    tracing::info!(host, %address, "selected VPN remote");
-                    return Ok(address);
-                }
-                tracing::warn!(host, port, "VPN remote has no IPv4 address");
+async fn serve_socks(listener: TcpListener, router: RouterHandle) -> Result<()> {
+    tracing::info!(address = %listener.local_addr()?, "SOCKS5 listening");
+    loop {
+        tokio::select! {
+            signal = tokio::signal::ctrl_c() => {
+                signal?;
+                tracing::info!("shutdown requested");
+                return Ok(());
             }
-            Err(error) => {
-                tracing::warn!(host, port, %error, "VPN remote lookup failed");
-                last_error = Some(error);
-            }
-        }
-    }
-    if let Some(error) = last_error {
-        return Err(error).context("could not resolve a VPN server endpoint");
-    }
-    bail!("no VPN server has an IPv4 endpoint")
-}
-
-async fn serve_socks(
-    listener: TcpListener,
-    stack: Stack,
-    mut session: Session,
-    mut outbound: mpsc::Receiver<Vec<u8>>,
-) -> Result<()> {
-    stack.activate()?;
-    tracing::info!(address = %listener.local_addr()?, "VPN ready; SOCKS5 listening");
-    let result = async {
-        loop {
-            if !stack.is_ready() {
-                bail!("packet stack stopped while VPN was active");
-            }
-            tokio::select! {
-                signal = tokio::signal::ctrl_c() => {
-                    signal?;
-                    tracing::info!("shutdown requested");
-                    return Ok(());
-                }
-                accepted = listener.accept() => {
-                    let (stream, peer) = accepted?;
-                    tracing::debug!(%peer, "SOCKS5 client accepted");
-                    let stack = stack.clone();
-                    tokio::spawn(async move {
-                        if let Err(error) = ovpn_socks5::handle(stream, stack).await {
-                            tracing::debug!(%peer, %error, "SOCKS5 client ended with error");
-                        } else {
-                            tracing::debug!(%peer, "SOCKS5 handler finished");
-                        }
-                    });
-                }
-                packet = outbound.recv() => {
-                    let packet = packet.context("tunnel packet output channel closed")?;
-                    tracing::trace!(bytes = packet.len(), "sending VPN data packet");
-                    session.send_packet(&packet).await?;
-                }
-                received = session.step() => {
-                    if let Some(packet) = received? {
-                        tracing::trace!(bytes = packet.len(), "received VPN data packet");
-                        stack.packet(&packet)?;
+            accepted = listener.accept() => {
+                let (stream, peer) = accepted?;
+                tracing::debug!(%peer, "SOCKS5 client accepted");
+                let router = router.clone();
+                tokio::spawn(async move {
+                    if let Err(error) = ovpn_socks5::handle(stream, router).await {
+                        tracing::debug!(%peer, %error, "SOCKS5 client ended with error");
+                    } else {
+                        tracing::debug!(%peer, "SOCKS5 handler finished");
                     }
-                }
+                });
             }
         }
     }
-    .await;
-    if let Err(error) = stack.reset().await {
-        tracing::error!(%error, "packet stack reset failed");
-    }
-    result
 }
 
 pub(crate) async fn run() -> Result<()> {
@@ -101,35 +44,22 @@ pub(crate) async fn run() -> Result<()> {
     if profile.needs_credentials && (config.username.is_empty() || config.password.is_empty()) {
         bail!("username and password are required by this profile");
     }
-    tracing::info!("connecting to VPN server");
-    let client_config = ClientConfig {
-        endpoint: resolve_vpn_endpoint(&profile).await?,
-        ca_pem: &profile.ca_pem,
-        tls_crypt_key: &profile.tls_crypt_key,
-        require_server_certificate_purpose: profile.require_server_certificate_purpose,
-        renegotiate_after: profile.renegotiate_after,
-        handshake_window: profile.handshake_window,
-        transition_window: profile.transition_window,
-    };
-    let session = Session::connect(&client_config, &config.username, &config.password)
-        .await
-        .context("OpenVPN connection failed")?;
-    let settings = &session.config().tunnel;
-    let dns = config
-        .dns_override
-        .map(|address| vec![address])
-        .unwrap_or_else(|| settings.dns.clone());
-    let tunnel = TunnelConfig::new(settings.local, settings.gateway, dns, settings.mtu)
-        .context("invalid VPN tunnel settings")?;
-    tracing::info!(local = %tunnel.local, gateway = %tunnel.gateway, mtu = tunnel.mtu, dns_servers = tunnel.dns.len(), "VPN tunnel configured");
-    let stack = Stack::start();
-    let (packet_tx, packet_rx) = mpsc::channel(TUNNEL_PACKET_QUEUE_CAPACITY);
-    stack
-        .configure(tunnel, packet_tx)
-        .await
-        .context("packet stack setup failed")?;
-    let listener = TcpListener::bind(config.socks5_address)
-        .await
-        .with_context(|| format!("cannot bind SOCKS5 listener on {}", config.socks5_address))?;
-    serve_socks(listener, stack, session, packet_rx).await
+    let manager = ConnectionManager::start(
+        profile,
+        config.username,
+        config.password,
+        config.dns_override,
+        config.max_active_vpn_hosts,
+    )
+    .await?;
+    let result = async {
+        manager.wait_ready().await?;
+        let listener = TcpListener::bind(config.socks5_address)
+            .await
+            .with_context(|| format!("cannot bind SOCKS5 listener on {}", config.socks5_address))?;
+        serve_socks(listener, manager.router()).await
+    }
+    .await;
+    manager.shutdown().await;
+    result
 }

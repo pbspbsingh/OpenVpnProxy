@@ -1,5 +1,6 @@
 mod app;
 mod config;
+mod manager;
 
 use std::env;
 

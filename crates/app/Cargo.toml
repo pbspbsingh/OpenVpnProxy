@@ -15,6 +15,9 @@ ovpn-socks5.workspace = true
 serde.workspace = true
 toml.workspace = true
 
+# Registrable-domain routing
+psl.workspace = true
+
 # Async networking and orchestration
 tokio.workspace = true
 

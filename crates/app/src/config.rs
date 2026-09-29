@@ -1,5 +1,6 @@
 use std::env;
 use std::net::{Ipv4Addr, SocketAddr};
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -13,6 +14,7 @@ pub(crate) struct AppConfig {
     pub(crate) password: String,
     pub(crate) socks5_address: SocketAddr,
     pub(crate) dns_override: Option<Ipv4Addr>,
+    pub(crate) max_active_vpn_hosts: Option<NonZeroUsize>,
 }
 
 pub(crate) fn config_path() -> Result<PathBuf> {

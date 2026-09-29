@@ -66,26 +66,31 @@ The control channel establishes trust and derives data keys. The data channel ca
 
 ## Startup sequence
 
-The listener opens after profile validation, VPN host discovery, and a baseline measurement round. Baseline tunnels close after measurement; serving tunnels start when requests arrive.
+When configured, the dashboard binds first and remains available during profile loading and host probing. The SOCKS listener binds after profile validation, but accepts clients only after host discovery and baseline probing. Baseline tunnels close after measurement; serving tunnels start when requests arrive.
 
 ```mermaid
 sequenceDiagram
     participant App as App
     participant Profile as Profile parser
     participant Manager as Connection manager
+    participant Dashboard as Web dashboard
     participant Listener as SOCKS listener
 
-    App->>Profile: Read config.toml and parse .ovpn
+    App->>App: Read config.toml
+    opt webui_address configured
+        App->>Dashboard: Bind and start read-only status server
+    end
+    App->>Profile: Read and parse .ovpn
     Profile-->>App: Remotes, CA, keys, options
+    App->>Listener: Bind socks5_address
     App->>Manager: Resolve all remotes; group endpoints by server IP
     Manager->>Manager: Probe all candidates, four at a time
     Manager->>Manager: Rank healthy hosts; select configured active limit
     Manager-->>App: Scored host pool ready; tunnels dormant
-    App->>Listener: Bind socks5_address
-    Listener-->>App: Accept SOCKS5 clients
+    App->>Listener: Begin accepting SOCKS5 clients
 ```
 
-Profile or host discovery errors prevent startup. A candidate that fails its baseline probe is ineligible; startup fails if none pass. The manager does not benchmark throughput or refresh remote DNS records after startup yet.
+Profile or host discovery errors prevent proxy serving; an enabled dashboard remains available to show the failure. A candidate that fails its baseline probe is ineligible; proxy startup fails if none pass. The manager does not benchmark throughput or refresh remote DNS records after startup yet.
 
 ## One proxied HTTPS request
 
@@ -154,7 +159,7 @@ OpenVPN may request a new data key, or the client may start renegotiation when i
 
 The design fails closed for **traffic handled by this proxy**:
 
-- The SOCKS listener starts after baseline probing but before serving tunnels connect. A request waits for a selected host up to the profile handshake window plus 30 seconds for control setup (60 seconds with the default 30-second handshake window). A failed host clears its assignment; a scored standby may take its slot after a fresh probe. If no host becomes ready, the proxy returns a SOCKS5 network failure. A profile's `hand-window` setting overrides the default handshake window and also limits key renegotiation.
+- The SOCKS listener begins accepting after baseline probing but before serving tunnels connect. A request waits for a selected host up to the profile handshake window plus 30 seconds for control setup (60 seconds with the default 30-second handshake window). A failed host clears its assignment; a scored standby may take its slot after a fresh probe. If no host becomes ready, the proxy returns a SOCKS5 network failure. A profile's `hand-window` setting overrides the default handshake window and also limits key renegotiation.
 - During a session, SOCKS requests can select only a ready host. A VPN or stack error marks that host unhealthy, clears its sticky assignments, resets its stack, and closes its client connections. Other hosts continue serving. Full queues mark the affected stack failed instead of bypassing it.
 - There is no direct-to-destination fallback in the SOCKS or stack crates. If every selected host is unavailable, new requests fail. The manager can activate a scored standby, retries failed hosts when no standby remains, and tries alternate ports; automatic DNS rediscovery and migration of existing TCP connections are not implemented.
 
@@ -178,7 +183,11 @@ curl --socks5-hostname 127.0.0.1:1080 https://example.com
 RUST_LOG=debug cargo run --release -p openvpn-proxy-app
 ```
 
-With `webui_address = "127.0.0.1:8080"`, open `http://127.0.0.1:8080` for the read-only dashboard. Overview, Hosts, and Routing status update through a WebSocket every five seconds. System and per-host TX/RX and latency charts show the latest 60 one-minute buckets. The Hosts tab shows the selected host's assigned groups in a panel with its own scrollbar; entries load in pages and show source IP, destination group, and active or idle state. Assignment changes reach a separate dashboard copy through an async channel, so group counts and pages can briefly trail routing without making route selection wait for dashboard scans. The Profile tab shows loaded remotes, authentication policy, certificate checks, IPv6 policy, and timing settings. The Logs tab shows recent tracing events and receives new events immediately through its own WebSocket, which is open only while that tab is selected. `dashboard_log_capacity` sets the number of retained entries (default 1000, maximum 100000); each message is capped at 4096 bytes. History loads in batches, and the tab initially renders the latest 2000 matching rows; use Show older to view more. Under heavy logging, a full input queue drops log events and the tab reports the drop count rather than blocking traffic. The current chart minute is partial; history, counters, and buffered logs reset when the app restarts. The dashboard is read-only and has no authentication; it binds only to loopback when configured with a loopback address. Logs can contain destination names and other operational details, so restrict dashboard access accordingly.
+With `webui_address = "127.0.0.1:8080"`, open `http://127.0.0.1:8080` for the read-only dashboard. Overview, Hosts, and Routing status update through a WebSocket every five seconds. System and per-host TX/RX and latency charts show the latest 60 one-minute buckets. The Hosts tab shows the selected host's assigned groups in a panel with its own scrollbar; entries load in pages and show source IP, destination group, and active or idle state. Assignment changes reach a separate dashboard copy through an async channel, so group counts and pages can briefly trail routing without making route selection wait for dashboard scans. The Profile tab shows loaded remotes, authentication policy, certificate checks, IPv6 policy, and timing settings.
+
+The Logs tab shows recent tracing events and receives new events immediately through its own WebSocket, which is open only while that tab is selected. `dashboard_log_capacity` sets the number of retained entries (default 1000, maximum 20000); each message is capped at 4096 bytes. History loads in batches, and the tab initially renders the latest 2000 matching rows; use Show older to view more. The Minimum level filter includes the selected severity and all more severe events: INFO includes WARN and ERROR. Under heavy logging, a full input queue drops log events and the tab reports the drop count rather than blocking traffic.
+
+The current chart minute is partial; history, counters, and buffered logs reset when the app restarts. The dashboard is read-only and has no authentication; it binds only to loopback when configured with a loopback address. Logs can contain destination names and other operational details, so restrict dashboard access accordingly.
 
 `RUST_LOG=info` shows discovered hosts, connection attempts, ready/down transitions, idle closures, and new domain assignments. `RUST_LOG=debug` adds route requests, retries, and per-host activity. `RUST_LOG=trace` adds packet flow details. `socks5_address = "0.0.0.0:1080"` accepts clients from other machines. The proxy has **no SOCKS authentication**, so choose the bind address and network exposure accordingly. `config.toml` contains credentials; it and `*.ovpn` are ignored by Git.
 

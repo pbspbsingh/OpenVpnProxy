@@ -13,11 +13,11 @@ const GCM_NONCE_BYTES: usize = 12;
 const PEER_ID_BYTES: usize = 3;
 const REKEY_PACKET_ID_THRESHOLD: u32 = 0xff00_0000;
 
-pub const PING: [u8; 16] = [
+pub(crate) const PING: [u8; 16] = [
     0x2a, 0x18, 0x7b, 0xf3, 0x64, 0x1e, 0xb4, 0xcb, 0x07, 0xed, 0x2d, 0x0a, 0x98, 0x1f, 0xc7, 0x48,
 ];
 
-pub struct DataChannel {
+pub(crate) struct DataChannel {
     send: Aes256Gcm,
     recv: Aes256Gcm,
     send_iv: [u8; IV_BYTES],
@@ -30,20 +30,24 @@ pub struct DataChannel {
 }
 
 impl DataChannel {
-    pub fn key_id(&self) -> u8 {
+    pub(crate) fn key_id(&self) -> u8 {
         self.key_id
     }
 
-    pub fn peer_id(&self) -> u32 {
+    pub(crate) fn peer_id(&self) -> u32 {
         self.peer_id
     }
 
-    pub fn needs_rekey(&self) -> bool {
+    pub(crate) fn needs_rekey(&self) -> bool {
         self.next_id >= REKEY_PACKET_ID_THRESHOLD
             || self.highest_received >= REKEY_PACKET_ID_THRESHOLD
     }
 
-    pub fn new(key: &[u8; DATA_KEY_MATERIAL_BYTES], peer_id: u32, key_id: u8) -> Result<Self> {
+    pub(crate) fn new(
+        key: &[u8; DATA_KEY_MATERIAL_BYTES],
+        peer_id: u32,
+        key_id: u8,
+    ) -> Result<Self> {
         require(key_id <= MAX_KEY_ID, "invalid data key ID")?;
         let mut send_iv = [0; IV_BYTES];
         let mut recv_iv = [0; IV_BYTES];
@@ -68,7 +72,7 @@ impl DataChannel {
         })
     }
 
-    pub fn encrypt(&mut self, plain: &[u8]) -> Result<Vec<u8>> {
+    pub(crate) fn encrypt(&mut self, plain: &[u8]) -> Result<Vec<u8>> {
         self.next_id = self
             .next_id
             .checked_add(1)
@@ -97,7 +101,7 @@ impl DataChannel {
         Ok(wire)
     }
 
-    pub fn decrypt(&mut self, wire: &[u8]) -> Result<Vec<u8>> {
+    pub(crate) fn decrypt(&mut self, wire: &[u8]) -> Result<Vec<u8>> {
         require(
             wire.len() >= DATA_HEADER_BYTES + GCM_TAG_BYTES
                 && wire[0] == (DATA_V2_OPCODE << crate::protocol::OPCODE_SHIFT) | self.key_id,

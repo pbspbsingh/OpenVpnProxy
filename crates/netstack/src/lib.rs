@@ -1,3 +1,5 @@
+//! An asynchronous userspace TCP/IP stack fed by VPN tunnel packets.
+
 mod device;
 mod engine;
 mod error;

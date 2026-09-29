@@ -28,6 +28,106 @@ const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const TCP_READ_BUFFER_BYTES: usize = 4096;
 const STACK_STATUS_INTERVAL: Duration = Duration::from_secs(10);
 
+pub(crate) async fn run(
+    id: u64,
+    mut rx: mpsc::Receiver<Command>,
+    phase: Arc<AtomicU8>,
+    wake: Arc<Notify>,
+) {
+    let started = Clock::now();
+    let mut engine: Option<Engine> = None;
+    let mut status = time::interval(STACK_STATUS_INTERVAL);
+    status.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+    loop {
+        let delay = engine.as_mut().and_then(|active| {
+            let elapsed = started.elapsed().as_millis().min(i64::MAX as u128) as i64;
+            active.next_delay(Instant::from_millis(elapsed))
+        });
+        let timer_started = Clock::now();
+        let event = tokio::select! {
+            command = rx.recv() => Wake::Command(command),
+            _ = wait_for_timer(delay) => Wake::Timer,
+            _ = wake.notified() => Wake::Consumer,
+            _ = status.tick() => {
+                if let Some(active) = &mut engine {
+                    active.log_status();
+                }
+                continue;
+            }
+        };
+        if let Some(active) = &mut engine {
+            match &event {
+                Wake::Command(_) => active.stats.command_wakeups += 1,
+                Wake::Timer => {
+                    active.stats.timer_wakeups += 1;
+                    if let Some(delay) = delay {
+                        active.stats.max_timer_lateness = active
+                            .stats
+                            .max_timer_lateness
+                            .max(timer_started.elapsed().saturating_sub(delay));
+                    }
+                }
+                Wake::Consumer => active.stats.consumer_wakeups += 1,
+            }
+        }
+        match event {
+            Wake::Command(Some(Command::Configure(config, io, reply))) => {
+                phase.store(StackPhase::Offline as u8, Ordering::Release);
+                if let Some(old) = engine.take() {
+                    old.shutdown();
+                }
+                match Engine::new(id, config, io) {
+                    Ok(new) => {
+                        engine = Some(new);
+                        phase.store(StackPhase::Configured as u8, Ordering::Release);
+                        tracing::debug!("userspace packet stack configured");
+                        let _ = reply.send(Ok(()));
+                    }
+                    Err(error) => {
+                        tracing::error!(%error, "userspace packet stack configuration failed");
+                        let _ = reply.send(Err(error));
+                    }
+                }
+            }
+            Wake::Command(Some(Command::Reset)) => {
+                tracing::debug!("resetting userspace packet stack");
+                phase.store(StackPhase::Offline as u8, Ordering::Release);
+                if let Some(old) = engine.take() {
+                    old.shutdown();
+                }
+            }
+            Wake::Command(Some(command)) => {
+                if let Some(engine) = &mut engine {
+                    engine.handle(command);
+                } else {
+                    reject_without_tunnel(command);
+                }
+            }
+            Wake::Command(None) => break,
+            Wake::Timer | Wake::Consumer => {}
+        }
+        if phase.load(Ordering::Acquire) == StackPhase::Failed as u8
+            && let Some(old) = engine.take()
+        {
+            old.shutdown();
+        }
+        if let Some(active) = &mut engine {
+            let elapsed = started.elapsed().as_millis().min(i64::MAX as u128) as i64;
+            if let Err(error) = active.tick(Instant::from_millis(elapsed)) {
+                tracing::error!(%error, "packet stack stopped");
+                phase.store(StackPhase::Failed as u8, Ordering::Release);
+                if let Some(old) = engine.take() {
+                    old.shutdown();
+                }
+            }
+        }
+    }
+    phase.store(StackPhase::Offline as u8, Ordering::Release);
+    if let Some(old) = engine {
+        old.shutdown();
+    }
+}
+
 #[derive(Default)]
 struct StackStats {
     polls: u64,
@@ -473,106 +573,6 @@ async fn wait_for_timer(delay: Option<Duration>) {
     match delay {
         Some(delay) => time::sleep(delay).await,
         None => std::future::pending().await,
-    }
-}
-
-pub(crate) async fn run(
-    id: u64,
-    mut rx: mpsc::Receiver<Command>,
-    phase: Arc<AtomicU8>,
-    wake: Arc<Notify>,
-) {
-    let started = Clock::now();
-    let mut engine: Option<Engine> = None;
-    let mut status = time::interval(STACK_STATUS_INTERVAL);
-    status.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
-    loop {
-        let delay = engine.as_mut().and_then(|active| {
-            let elapsed = started.elapsed().as_millis().min(i64::MAX as u128) as i64;
-            active.next_delay(Instant::from_millis(elapsed))
-        });
-        let timer_started = Clock::now();
-        let event = tokio::select! {
-            command = rx.recv() => Wake::Command(command),
-            _ = wait_for_timer(delay) => Wake::Timer,
-            _ = wake.notified() => Wake::Consumer,
-            _ = status.tick() => {
-                if let Some(active) = &mut engine {
-                    active.log_status();
-                }
-                continue;
-            }
-        };
-        if let Some(active) = &mut engine {
-            match &event {
-                Wake::Command(_) => active.stats.command_wakeups += 1,
-                Wake::Timer => {
-                    active.stats.timer_wakeups += 1;
-                    if let Some(delay) = delay {
-                        active.stats.max_timer_lateness = active
-                            .stats
-                            .max_timer_lateness
-                            .max(timer_started.elapsed().saturating_sub(delay));
-                    }
-                }
-                Wake::Consumer => active.stats.consumer_wakeups += 1,
-            }
-        }
-        match event {
-            Wake::Command(Some(Command::Configure(config, io, reply))) => {
-                phase.store(StackPhase::Offline as u8, Ordering::Release);
-                if let Some(old) = engine.take() {
-                    old.shutdown();
-                }
-                match Engine::new(id, config, io) {
-                    Ok(new) => {
-                        engine = Some(new);
-                        phase.store(StackPhase::Configured as u8, Ordering::Release);
-                        tracing::debug!("userspace packet stack configured");
-                        let _ = reply.send(Ok(()));
-                    }
-                    Err(error) => {
-                        tracing::error!(%error, "userspace packet stack configuration failed");
-                        let _ = reply.send(Err(error));
-                    }
-                }
-            }
-            Wake::Command(Some(Command::Reset)) => {
-                tracing::debug!("resetting userspace packet stack");
-                phase.store(StackPhase::Offline as u8, Ordering::Release);
-                if let Some(old) = engine.take() {
-                    old.shutdown();
-                }
-            }
-            Wake::Command(Some(command)) => {
-                if let Some(engine) = &mut engine {
-                    engine.handle(command);
-                } else {
-                    reject_without_tunnel(command);
-                }
-            }
-            Wake::Command(None) => break,
-            Wake::Timer | Wake::Consumer => {}
-        }
-        if phase.load(Ordering::Acquire) == StackPhase::Failed as u8
-            && let Some(old) = engine.take()
-        {
-            old.shutdown();
-        }
-        if let Some(active) = &mut engine {
-            let elapsed = started.elapsed().as_millis().min(i64::MAX as u128) as i64;
-            if let Err(error) = active.tick(Instant::from_millis(elapsed)) {
-                tracing::error!(%error, "packet stack stopped");
-                phase.store(StackPhase::Failed as u8, Ordering::Release);
-                if let Some(old) = engine.take() {
-                    old.shutdown();
-                }
-            }
-        }
-    }
-    phase.store(StackPhase::Offline as u8, Ordering::Release);
-    if let Some(old) = engine {
-        old.shutdown();
     }
 }
 

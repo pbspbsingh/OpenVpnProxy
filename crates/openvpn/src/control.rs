@@ -39,21 +39,7 @@ const BASE_RETRY_SECONDS: u64 = 1;
 const UDP_RECEIVE_BUFFER_BYTES: usize = 2048;
 const UDP_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
-struct Pending {
-    opcode: u8,
-    body: Vec<u8>,
-    last_sent: Instant,
-    attempts: u8,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ControlPhase {
-    AwaitingServerReset,
-    TlsHandshake,
-    ApplicationData,
-}
-
-pub struct Link {
+pub(crate) struct Link {
     socket: Arc<UdpSocket>,
     tls_config: Arc<ClientConfig>,
     static_key: [u8; STATIC_KEY_BYTES],
@@ -74,8 +60,22 @@ pub struct Link {
     last_received: Instant,
 }
 
+struct Pending {
+    opcode: u8,
+    body: Vec<u8>,
+    last_sent: Instant,
+    attempts: u8,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ControlPhase {
+    AwaitingServerReset,
+    TlsHandshake,
+    ApplicationData,
+}
+
 impl Link {
-    pub async fn new(
+    pub(crate) async fn new(
         socket: UdpSocket,
         key: &[u8; STATIC_KEY_BYTES],
         tls: ClientConnection,
@@ -108,6 +108,129 @@ impl Link {
         Ok(link)
     }
 
+    pub(crate) async fn step(&mut self) -> Result<Option<Vec<u8>>> {
+        self.advance_outbound().await?;
+        if let Some(next) = &mut self.next {
+            next.advance_outbound().await?;
+        }
+        let mut buffer = [0; UDP_RECEIVE_BUFFER_BYTES];
+        match time::timeout(UDP_POLL_INTERVAL, self.socket.recv(&mut buffer)).await {
+            Ok(Ok(n)) if n > 0 => {
+                if buffer[0] >> OPCODE_SHIFT == DATA_V2_OPCODE {
+                    tracing::trace!(bytes = n, "received OpenVPN data datagram");
+                    return Ok(Some(buffer[..n].to_vec()));
+                }
+                let key_id = buffer[0] & KEY_ID_MASK;
+                if key_id == self.key_id {
+                    self.receive_control(&buffer[..n])?;
+                } else if self.next.as_ref().is_some_and(|next| next.key_id == key_id) {
+                    if let Some(next) = &mut self.next {
+                        next.receive_control(&buffer[..n])?;
+                    }
+                } else if buffer[0] >> OPCODE_SHIFT == SOFT_RESET
+                    && key_id == next_key_id(self.key_id)
+                    && self.next.is_none()
+                {
+                    let mut next = self.renegotiated(key_id)?;
+                    next.receive_control(&buffer[..n])?;
+                    next.queue(SOFT_RESET, &[]).await?;
+                    self.next = Some(Box::new(next));
+                    tracing::info!(key_id, "OpenVPN key renegotiation started");
+                } else {
+                    tracing::debug!(key_id, "discarded control packet for inactive key");
+                }
+            }
+            Ok(Ok(_)) | Err(_) => {}
+            Ok(Err(error)) => return Err(Error::Io(error)),
+        }
+        Ok(None)
+    }
+
+    pub(crate) fn next(&mut self) -> Option<&mut Link> {
+        self.next.as_deref_mut()
+    }
+
+    pub(crate) async fn begin_renegotiation(&mut self) -> Result<()> {
+        ensure!(
+            self.next.is_none(),
+            "OpenVPN key renegotiation already in progress"
+        );
+        let key_id = next_key_id(self.key_id);
+        let mut next = self.renegotiated(key_id)?;
+        next.queue(SOFT_RESET, &[]).await?;
+        self.next = Some(Box::new(next));
+        tracing::info!(key_id, "OpenVPN key renegotiation requested");
+        Ok(())
+    }
+
+    pub(crate) fn promote_next(&mut self) -> Result<()> {
+        let next = self
+            .next
+            .take()
+            .ok_or(Error::Protocol("no negotiated key to promote"))?;
+        *self = *next;
+        Ok(())
+    }
+
+    pub(crate) fn key_id(&self) -> u8 {
+        self.key_id
+    }
+
+    pub(crate) fn control_synchronized(&self) -> bool {
+        self.pending.is_empty() && self.acks.is_empty() && self.unsent_tls.is_empty()
+    }
+
+    pub(crate) fn activate_tls(&mut self) -> Result<()> {
+        ensure!(
+            self.phase == ControlPhase::TlsHandshake && !self.tls.is_handshaking(),
+            "OpenVPN TLS is not ready"
+        );
+        self.phase = ControlPhase::ApplicationData;
+        Ok(())
+    }
+
+    pub(crate) async fn handshake(&mut self, window: Duration) -> Result<()> {
+        tracing::debug!("waiting for OpenVPN TLS handshake");
+        let deadline = Instant::now()
+            .checked_add(window)
+            .ok_or(Error::Protocol("invalid OpenVPN handshake window"))?;
+        while self.tls.is_handshaking() {
+            if Instant::now() >= deadline {
+                return Err(Error::Timeout("TLS handshake"));
+            }
+            self.step().await?;
+        }
+        self.activate_tls()?;
+        tracing::debug!("OpenVPN TLS handshake completed");
+        Ok(())
+    }
+
+    pub(crate) async fn write_app(&mut self, bytes: &[u8]) -> Result<()> {
+        ensure!(
+            self.phase == ControlPhase::ApplicationData,
+            "TLS application data before handshake"
+        );
+        self.tls.writer().write_all(bytes)?;
+        self.flush_tls().await
+    }
+
+    pub(crate) fn application_data(&mut self) -> &mut Vec<u8> {
+        &mut self.app
+    }
+    pub(crate) fn tls(&self) -> &ClientConnection {
+        &self.tls
+    }
+    pub(crate) fn socket(&self) -> &UdpSocket {
+        &self.socket
+    }
+    pub(crate) fn last_received(&self) -> Instant {
+        self.next.as_ref().map_or(self.last_received, |next| {
+            self.last_received.max(next.last_received)
+        })
+    }
+}
+
+impl Link {
     fn renegotiated(&self, key_id: u8) -> Result<Self> {
         let tls = new_tls_connection(&self.tls_config)?;
         Ok(Self {
@@ -398,127 +521,6 @@ impl Link {
             self.send_wrapped(ACK, &payload).await?;
         }
         Ok(())
-    }
-
-    pub async fn step(&mut self) -> Result<Option<Vec<u8>>> {
-        self.advance_outbound().await?;
-        if let Some(next) = &mut self.next {
-            next.advance_outbound().await?;
-        }
-        let mut buffer = [0; UDP_RECEIVE_BUFFER_BYTES];
-        match time::timeout(UDP_POLL_INTERVAL, self.socket.recv(&mut buffer)).await {
-            Ok(Ok(n)) if n > 0 => {
-                if buffer[0] >> OPCODE_SHIFT == DATA_V2_OPCODE {
-                    tracing::trace!(bytes = n, "received OpenVPN data datagram");
-                    return Ok(Some(buffer[..n].to_vec()));
-                }
-                let key_id = buffer[0] & KEY_ID_MASK;
-                if key_id == self.key_id {
-                    self.receive_control(&buffer[..n])?;
-                } else if self.next.as_ref().is_some_and(|next| next.key_id == key_id) {
-                    if let Some(next) = &mut self.next {
-                        next.receive_control(&buffer[..n])?;
-                    }
-                } else if buffer[0] >> OPCODE_SHIFT == SOFT_RESET
-                    && key_id == next_key_id(self.key_id)
-                    && self.next.is_none()
-                {
-                    let mut next = self.renegotiated(key_id)?;
-                    next.receive_control(&buffer[..n])?;
-                    next.queue(SOFT_RESET, &[]).await?;
-                    self.next = Some(Box::new(next));
-                    tracing::info!(key_id, "OpenVPN key renegotiation started");
-                } else {
-                    tracing::debug!(key_id, "discarded control packet for inactive key");
-                }
-            }
-            Ok(Ok(_)) | Err(_) => {}
-            Ok(Err(error)) => return Err(Error::Io(error)),
-        }
-        Ok(None)
-    }
-
-    pub fn next(&mut self) -> Option<&mut Link> {
-        self.next.as_deref_mut()
-    }
-
-    pub async fn begin_renegotiation(&mut self) -> Result<()> {
-        ensure!(
-            self.next.is_none(),
-            "OpenVPN key renegotiation already in progress"
-        );
-        let key_id = next_key_id(self.key_id);
-        let mut next = self.renegotiated(key_id)?;
-        next.queue(SOFT_RESET, &[]).await?;
-        self.next = Some(Box::new(next));
-        tracing::info!(key_id, "OpenVPN key renegotiation requested");
-        Ok(())
-    }
-
-    pub fn promote_next(&mut self) -> Result<()> {
-        let next = self
-            .next
-            .take()
-            .ok_or(Error::Protocol("no negotiated key to promote"))?;
-        *self = *next;
-        Ok(())
-    }
-
-    pub fn key_id(&self) -> u8 {
-        self.key_id
-    }
-
-    pub fn control_synchronized(&self) -> bool {
-        self.pending.is_empty() && self.acks.is_empty() && self.unsent_tls.is_empty()
-    }
-
-    pub fn activate_tls(&mut self) -> Result<()> {
-        ensure!(
-            self.phase == ControlPhase::TlsHandshake && !self.tls.is_handshaking(),
-            "OpenVPN TLS is not ready"
-        );
-        self.phase = ControlPhase::ApplicationData;
-        Ok(())
-    }
-
-    pub async fn handshake(&mut self, window: Duration) -> Result<()> {
-        tracing::debug!("waiting for OpenVPN TLS handshake");
-        let deadline = Instant::now()
-            .checked_add(window)
-            .ok_or(Error::Protocol("invalid OpenVPN handshake window"))?;
-        while self.tls.is_handshaking() {
-            if Instant::now() >= deadline {
-                return Err(Error::Timeout("TLS handshake"));
-            }
-            self.step().await?;
-        }
-        self.activate_tls()?;
-        tracing::debug!("OpenVPN TLS handshake completed");
-        Ok(())
-    }
-
-    pub async fn write_app(&mut self, bytes: &[u8]) -> Result<()> {
-        ensure!(
-            self.phase == ControlPhase::ApplicationData,
-            "TLS application data before handshake"
-        );
-        self.tls.writer().write_all(bytes)?;
-        self.flush_tls().await
-    }
-
-    pub fn application_data(&mut self) -> &mut Vec<u8> {
-        &mut self.app
-    }
-    pub fn tls(&self) -> &ClientConnection {
-        &self.tls
-    }
-    pub fn socket(&self) -> &UdpSocket {
-        &self.socket
-    }
-    pub fn last_received(&self) -> Instant {
-        self.next.as_ref().map_or(self.last_received, |next| {
-            self.last_received.max(next.last_received)
-        })
     }
 }
 

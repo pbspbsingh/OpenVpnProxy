@@ -10,6 +10,17 @@ use tokio::sync::watch;
 
 const MAX_STICKY_GROUPS: usize = 100_000;
 
+#[derive(Clone)]
+pub(crate) struct RouterHandle {
+    pub(super) shared: Arc<Shared>,
+}
+
+pub(crate) struct HostLease {
+    stack: Stack,
+    active: Arc<AtomicUsize>,
+    host_id: usize,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum HostPhase {
     Waiting,
@@ -99,17 +110,6 @@ impl Shared {
             }
         }
     }
-}
-
-#[derive(Clone)]
-pub(crate) struct RouterHandle {
-    pub(super) shared: Arc<Shared>,
-}
-
-pub(crate) struct HostLease {
-    stack: Stack,
-    active: Arc<AtomicUsize>,
-    host_id: usize,
 }
 
 impl RouteLease for HostLease {

@@ -24,7 +24,7 @@ const CIPHERTEXT_START: usize = AUTH_TAG_START + AUTH_TAG_BYTES;
 type AesCtr = ctr::Ctr128BE<Aes256>;
 type HmacSha256 = Hmac<Sha256>;
 
-pub struct TlsCrypt {
+pub(crate) struct TlsCrypt {
     send_cipher: [u8; AES_KEY_BYTES],
     send_mac: [u8; HMAC_KEY_BYTES],
     recv_cipher: [u8; AES_KEY_BYTES],
@@ -35,7 +35,7 @@ pub struct TlsCrypt {
 }
 
 impl TlsCrypt {
-    pub fn client(key: &[u8; STATIC_KEY_BYTES]) -> Self {
+    pub(crate) fn client(key: &[u8; STATIC_KEY_BYTES]) -> Self {
         let mut send_cipher = [0; AES_KEY_BYTES];
         let mut send_mac = [0; HMAC_KEY_BYTES];
         let mut recv_cipher = [0; AES_KEY_BYTES];
@@ -59,7 +59,7 @@ impl TlsCrypt {
         }
     }
 
-    pub fn wrap(&mut self, opcode: u8, session_id: u64, plain: &[u8]) -> Result<Vec<u8>> {
+    pub(crate) fn wrap(&mut self, opcode: u8, session_id: u64, plain: &[u8]) -> Result<Vec<u8>> {
         self.next_packet_id = self
             .next_packet_id
             .checked_add(1)
@@ -86,7 +86,7 @@ impl TlsCrypt {
         Ok(packet)
     }
 
-    pub fn unwrap(&mut self, packet: &[u8]) -> Result<(u8, u64, Vec<u8>)> {
+    pub(crate) fn unwrap(&mut self, packet: &[u8]) -> Result<(u8, u64, Vec<u8>)> {
         if packet.len() < CIPHERTEXT_START {
             return Err(Error::Protocol("tls-crypt packet too short"));
         }

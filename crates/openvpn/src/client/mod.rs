@@ -21,6 +21,7 @@ const MIN_RESTART_INTERVAL: Duration = Duration::from_secs(15);
 const MIN_PING_INTERVAL: Duration = Duration::from_secs(5);
 const PEER_KEY_GRACE: Duration = Duration::from_secs(5);
 
+/// Credentials and profile settings needed to open an OpenVPN session.
 pub struct ClientConfig<'a> {
     pub endpoint: SocketAddr,
     pub ca_pem: &'a str,
@@ -31,10 +32,12 @@ pub struct ClientConfig<'a> {
     pub transition_window: Duration,
 }
 
+/// Settings negotiated with the VPN server for one session.
 pub struct SessionConfig {
     pub tunnel: TunnelSettings,
 }
 
+/// IP settings pushed by the VPN server.
 #[derive(Clone, Debug)]
 pub struct TunnelSettings {
     pub local: Ipv4Addr,
@@ -44,6 +47,7 @@ pub struct TunnelSettings {
     pub ipv6: Option<Ipv6TunnelSettings>,
 }
 
+/// IPv6 address and routes pushed by the VPN server.
 #[derive(Clone, Debug)]
 pub struct Ipv6TunnelSettings {
     pub local: Ipv6Addr,
@@ -51,6 +55,7 @@ pub struct Ipv6TunnelSettings {
     pub routes: Vec<Ipv6Route>,
 }
 
+/// IPv6 route pushed by the VPN server.
 #[derive(Clone, Debug)]
 pub struct Ipv6Route {
     pub network: Ipv6Addr,
@@ -58,6 +63,7 @@ pub struct Ipv6Route {
     pub gateway: Ipv6Addr,
 }
 
+/// One encrypted OpenVPN control and data session.
 pub struct Session {
     link: Link,
     data: DataChannel,
@@ -109,6 +115,7 @@ impl RekeyState {
 }
 
 impl Session {
+    /// Connects to the configured VPN endpoint and negotiates tunnel settings.
     pub async fn connect(
         profile: &ClientConfig<'_>,
         username: &str,
@@ -167,10 +174,12 @@ impl Session {
         })
     }
 
+    /// Returns settings negotiated with the VPN server.
     pub fn config(&self) -> &SessionConfig {
         &self.config
     }
 
+    /// Encrypts and sends an IP packet through the VPN session.
     pub async fn send_packet(&mut self, packet: &[u8]) -> Result<()> {
         self.progress_rekey().await?;
         let wire = self.data.encrypt(packet)?;
@@ -183,6 +192,7 @@ impl Session {
         require(sent == wire.len(), "short VPN UDP send")
     }
 
+    /// Advances the session and returns a decrypted IP packet when available.
     pub async fn step(&mut self) -> Result<Option<Vec<u8>>> {
         self.progress_rekey().await?;
         if self.link.last_received().max(self.last_data).elapsed()

@@ -1,3 +1,5 @@
+//! SOCKS5 TCP CONNECT handling over an assigned userspace VPN stack.
+
 use std::collections::VecDeque;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::{Duration, Instant};
@@ -41,6 +43,7 @@ const READY_CHECK_INTERVAL: Duration = Duration::from_millis(250);
 const TRANSFER_STATUS_INTERVAL: Duration = Duration::from_secs(10);
 const TRANSFER_BUFFER_BYTES: usize = 8192;
 
+/// Errors while serving a SOCKS5 connection.
 #[derive(Debug, Error)]
 pub enum SocksError {
     #[error("SOCKS socket I/O failed: {0}")]
@@ -51,8 +54,10 @@ pub enum SocksError {
     Stack(#[from] StackError),
 }
 
-type Result<T> = std::result::Result<T, SocksError>;
+/// Result returned by the SOCKS5 handler.
+pub type Result<T> = std::result::Result<T, SocksError>;
 
+/// Destination supplied by a SOCKS5 client.
 #[derive(Clone, Debug)]
 pub enum DestinationHost {
     Domain(String),
@@ -60,126 +65,24 @@ pub enum DestinationHost {
     Ipv6(Ipv6Addr),
 }
 
+/// A lease that tracks use of the VPN stack assigned to a request.
 pub trait RouteLease: Send {
     fn stack(&self) -> &Stack;
 }
 
+/// Chooses a VPN stack for a SOCKS5 destination.
 pub trait RouteProvider: Clone + Send + Sync + 'static {
     type Lease: RouteLease;
 
     fn select(&self, destination: &DestinationHost) -> Option<Self::Lease>;
 }
 
-async fn reply(stream: &mut TcpStream, code: u8) -> Result<()> {
-    let mut response = [0; SOCKS_REPLY_BYTES];
-    response[VERSION_INDEX] = SOCKS_VERSION;
-    response[REPLY_CODE_INDEX] = code;
-    response[ADDRESS_TYPE_INDEX] = IPV4_ADDRESS_TYPE;
-    stream.write_all(&response).await?;
-    Ok(())
-}
-
-async fn read_exact(stream: &mut TcpStream, buf: &mut [u8]) -> Result<()> {
-    time::timeout(SOCKET_IO_TIMEOUT, stream.read_exact(buf))
-        .await
-        .map_err(|_| SocksError::SocketTimeout)??;
-    Ok(())
-}
-
+/// Serves one unauthenticated SOCKS5 TCP connection through a VPN route.
 pub async fn handle<R: RouteProvider>(mut stream: TcpStream, router: R) -> Result<()> {
     let started = Instant::now();
-    tracing::debug!("SOCKS5 handshake started");
-    let mut greeting = [0; GREETING_BYTES];
-    read_exact(&mut stream, &mut greeting).await?;
-    if greeting[VERSION_INDEX] != SOCKS_VERSION || greeting[GREETING_METHOD_COUNT_INDEX] == 0 {
-        tracing::debug!("SOCKS5 client sent an invalid greeting");
+    let Some((destination, port)) = read_request(&mut stream).await? else {
         return Ok(());
-    }
-    let mut methods = vec![0; greeting[GREETING_METHOD_COUNT_INDEX] as usize];
-    read_exact(&mut stream, &mut methods).await?;
-    if !methods.contains(&NO_AUTH_METHOD) {
-        tracing::debug!("SOCKS5 client does not support no-authentication method");
-        stream
-            .write_all(&[SOCKS_VERSION, NO_ACCEPTABLE_METHOD])
-            .await?;
-        return Ok(());
-    }
-    stream.write_all(&[SOCKS_VERSION, NO_AUTH_METHOD]).await?;
-
-    let mut request = [0; REQUEST_HEADER_BYTES];
-    read_exact(&mut stream, &mut request).await?;
-    if request[VERSION_INDEX] != SOCKS_VERSION || request[REQUEST_RESERVED_INDEX] != 0 {
-        tracing::debug!("SOCKS5 client sent an invalid request");
-        reply(&mut stream, REPLY_FAILURE).await?;
-        return Ok(());
-    }
-    if request[REQUEST_COMMAND_INDEX] != CONNECT_COMMAND {
-        tracing::debug!(
-            command = request[REQUEST_COMMAND_INDEX],
-            "SOCKS5 command is unsupported"
-        );
-        reply(&mut stream, REPLY_COMMAND).await?;
-        return Ok(());
-    }
-    let destination = match request[ADDRESS_TYPE_INDEX] {
-        IPV4_ADDRESS_TYPE => {
-            let mut raw = [0; IPV4_ADDRESS_BYTES];
-            read_exact(&mut stream, &mut raw).await?;
-            DestinationHost::Ipv4(Ipv4Addr::from(raw))
-        }
-        DOMAIN_ADDRESS_TYPE => {
-            let mut length = [0; 1];
-            read_exact(&mut stream, &mut length).await?;
-            if length[0] == 0 {
-                tracing::debug!("SOCKS5 client sent an empty domain");
-                reply(&mut stream, REPLY_ADDRESS).await?;
-                return Ok(());
-            }
-            let mut raw = vec![0; length[0] as usize];
-            read_exact(&mut stream, &mut raw).await?;
-            let host = match String::from_utf8(raw)
-                .ok()
-                .and_then(|host| idna::domain_to_ascii(&host).ok())
-                .map(|host| host.trim_end_matches('.').to_ascii_lowercase())
-                .filter(|host| !host.is_empty())
-            {
-                Some(host) => host,
-                None => {
-                    tracing::debug!("SOCKS5 client sent an invalid domain");
-                    reply(&mut stream, REPLY_ADDRESS).await?;
-                    return Ok(());
-                }
-            };
-            DestinationHost::Domain(host)
-        }
-        IPV6_ADDRESS_TYPE => {
-            let mut raw = [0; IPV6_ADDRESS_BYTES];
-            read_exact(&mut stream, &mut raw).await?;
-            let address = Ipv6Addr::from(raw);
-            if address.is_unspecified() || address.is_multicast() {
-                tracing::debug!(%address, "SOCKS5 client requested an invalid IPv6 destination");
-                reply(&mut stream, REPLY_ADDRESS).await?;
-                return Ok(());
-            }
-            DestinationHost::Ipv6(address)
-        }
-        _ => {
-            tracing::debug!(
-                address_type = request[ADDRESS_TYPE_INDEX],
-                "SOCKS5 address type is unsupported"
-            );
-            reply(&mut stream, REPLY_ADDRESS).await?;
-            return Ok(());
-        }
     };
-    let mut port = [0; PORT_BYTES];
-    read_exact(&mut stream, &mut port).await?;
-    let port = u16::from_be_bytes(port);
-    if port == 0 {
-        tracing::debug!("SOCKS5 client requested port zero");
-        reply(&mut stream, REPLY_ADDRESS).await?;
-        return Ok(());
-    }
     let route_started = Instant::now();
     let Some(route) = router.select(&destination) else {
         tracing::warn!(
@@ -197,6 +100,155 @@ pub async fn handle<R: RouteProvider>(mut stream: TcpStream, router: R) -> Resul
         reply(&mut stream, REPLY_NETWORK).await?;
         return Ok(());
     }
+    let Some(resolution) = resolve_destination(&mut stream, stack, destination).await? else {
+        return Ok(());
+    };
+    let dns_elapsed = resolution.elapsed;
+    let Some(connection) = connect_destination(&mut stream, stack, resolution, port).await? else {
+        return Ok(());
+    };
+    tracing::debug!(id = connection.id, destination = %connection.destination, stack_id, ?route_elapsed, ?dns_elapsed, connect_elapsed = ?connection.elapsed, "SOCKS5 tunnel connected");
+    if let Err(error) = reply(&mut stream, REPLY_OK).await {
+        if let Err(close_error) = stack.close(connection.id) {
+            tracing::debug!(id = connection.id, %close_error, "SOCKS tunnel cleanup failed");
+        }
+        return Err(error);
+    }
+    transfer(
+        stream,
+        stack,
+        connection,
+        TransferTiming {
+            started,
+            route_elapsed,
+            dns_elapsed,
+            stack_id,
+        },
+    )
+    .await
+}
+
+struct Resolution {
+    addresses: VecDeque<IpAddr>,
+    delayed_ipv4: Option<String>,
+    elapsed: Option<Duration>,
+}
+
+struct Connection {
+    destination: SocketAddr,
+    id: u64,
+    events: ovpn_netstack::StreamEvents,
+    elapsed: Duration,
+}
+
+struct TransferTiming {
+    started: Instant,
+    route_elapsed: Duration,
+    dns_elapsed: Option<Duration>,
+    stack_id: u64,
+}
+
+async fn read_request(stream: &mut TcpStream) -> Result<Option<(DestinationHost, u16)>> {
+    tracing::debug!("SOCKS5 handshake started");
+    let mut greeting = [0; GREETING_BYTES];
+    read_exact(stream, &mut greeting).await?;
+    if greeting[VERSION_INDEX] != SOCKS_VERSION || greeting[GREETING_METHOD_COUNT_INDEX] == 0 {
+        tracing::debug!("SOCKS5 client sent an invalid greeting");
+        return Ok(None);
+    }
+    let mut methods = vec![0; greeting[GREETING_METHOD_COUNT_INDEX] as usize];
+    read_exact(stream, &mut methods).await?;
+    if !methods.contains(&NO_AUTH_METHOD) {
+        tracing::debug!("SOCKS5 client does not support no-authentication method");
+        stream
+            .write_all(&[SOCKS_VERSION, NO_ACCEPTABLE_METHOD])
+            .await?;
+        return Ok(None);
+    }
+    stream.write_all(&[SOCKS_VERSION, NO_AUTH_METHOD]).await?;
+
+    let mut request = [0; REQUEST_HEADER_BYTES];
+    read_exact(stream, &mut request).await?;
+    if request[VERSION_INDEX] != SOCKS_VERSION || request[REQUEST_RESERVED_INDEX] != 0 {
+        tracing::debug!("SOCKS5 client sent an invalid request");
+        reply(stream, REPLY_FAILURE).await?;
+        return Ok(None);
+    }
+    if request[REQUEST_COMMAND_INDEX] != CONNECT_COMMAND {
+        tracing::debug!(
+            command = request[REQUEST_COMMAND_INDEX],
+            "SOCKS5 command is unsupported"
+        );
+        reply(stream, REPLY_COMMAND).await?;
+        return Ok(None);
+    }
+    let destination = match request[ADDRESS_TYPE_INDEX] {
+        IPV4_ADDRESS_TYPE => {
+            let mut raw = [0; IPV4_ADDRESS_BYTES];
+            read_exact(stream, &mut raw).await?;
+            DestinationHost::Ipv4(Ipv4Addr::from(raw))
+        }
+        DOMAIN_ADDRESS_TYPE => {
+            let mut length = [0; 1];
+            read_exact(stream, &mut length).await?;
+            if length[0] == 0 {
+                tracing::debug!("SOCKS5 client sent an empty domain");
+                reply(stream, REPLY_ADDRESS).await?;
+                return Ok(None);
+            }
+            let mut raw = vec![0; length[0] as usize];
+            read_exact(stream, &mut raw).await?;
+            let host = match String::from_utf8(raw)
+                .ok()
+                .and_then(|host| idna::domain_to_ascii(&host).ok())
+                .map(|host| host.trim_end_matches('.').to_ascii_lowercase())
+                .filter(|host| !host.is_empty())
+            {
+                Some(host) => host,
+                None => {
+                    tracing::debug!("SOCKS5 client sent an invalid domain");
+                    reply(stream, REPLY_ADDRESS).await?;
+                    return Ok(None);
+                }
+            };
+            DestinationHost::Domain(host)
+        }
+        IPV6_ADDRESS_TYPE => {
+            let mut raw = [0; IPV6_ADDRESS_BYTES];
+            read_exact(stream, &mut raw).await?;
+            let address = Ipv6Addr::from(raw);
+            if address.is_unspecified() || address.is_multicast() {
+                tracing::debug!(%address, "SOCKS5 client requested an invalid IPv6 destination");
+                reply(stream, REPLY_ADDRESS).await?;
+                return Ok(None);
+            }
+            DestinationHost::Ipv6(address)
+        }
+        _ => {
+            tracing::debug!(
+                address_type = request[ADDRESS_TYPE_INDEX],
+                "SOCKS5 address type is unsupported"
+            );
+            reply(stream, REPLY_ADDRESS).await?;
+            return Ok(None);
+        }
+    };
+    let mut port = [0; PORT_BYTES];
+    read_exact(stream, &mut port).await?;
+    let port = u16::from_be_bytes(port);
+    if port == 0 {
+        tracing::debug!("SOCKS5 client requested port zero");
+        reply(stream, REPLY_ADDRESS).await?;
+        return Ok(None);
+    }
+    Ok(Some((destination, port)))
+}
+
+async fn resolve_destination(
+    stream: &mut TcpStream,
+    stack: &Stack,
+    destination: DestinationHost,
+) -> Result<Option<Resolution>> {
     let mut dns_elapsed = None;
     let mut delayed_ipv4 = None;
     let addresses = match destination {
@@ -241,16 +293,33 @@ pub async fn handle<R: RouteProvider>(mut stream: TcpStream, router: R) -> Resul
             dns_elapsed = Some(dns_started.elapsed());
             if addresses.is_empty() {
                 tracing::warn!(%host, ?dns_elapsed, "SOCKS5 destination lookup returned no routable address");
-                reply(&mut stream, REPLY_HOST).await?;
-                return Ok(());
+                reply(stream, REPLY_HOST).await?;
+                return Ok(None);
             }
             tracing::debug!(%host, ?addresses, ?dns_elapsed, "SOCKS5 destination resolved");
             addresses
         }
     };
+    Ok(Some(Resolution {
+        addresses: addresses.into(),
+        delayed_ipv4,
+        elapsed: dns_elapsed,
+    }))
+}
+
+async fn connect_destination(
+    stream: &mut TcpStream,
+    stack: &Stack,
+    resolution: Resolution,
+    port: u16,
+) -> Result<Option<Connection>> {
     let mut connected = None;
     let connect_phase_started = Instant::now();
-    let mut addresses: VecDeque<_> = addresses.into();
+    let Resolution {
+        mut addresses,
+        mut delayed_ipv4,
+        ..
+    } = resolution;
     loop {
         let address = if let Some(address) = addresses.pop_front() {
             address
@@ -300,13 +369,36 @@ pub async fn handle<R: RouteProvider>(mut stream: TcpStream, router: R) -> Resul
             tracing::debug!(id, %error, "SOCKS tunnel cleanup failed");
         }
     }
-    let Some((destination, id, mut events, connect_elapsed)) = connected else {
-        reply(&mut stream, REPLY_HOST).await?;
-        return Ok(());
+    let Some((destination, id, events, connect_elapsed)) = connected else {
+        reply(stream, REPLY_HOST).await?;
+        return Ok(None);
     };
-    tracing::debug!(id, %destination, stack_id, ?route_elapsed, ?dns_elapsed, ?connect_elapsed, "SOCKS5 tunnel connected");
-    reply(&mut stream, REPLY_OK).await?;
+    Ok(Some(Connection {
+        destination,
+        id,
+        events,
+        elapsed: connect_elapsed,
+    }))
+}
 
+async fn transfer(
+    stream: TcpStream,
+    stack: &Stack,
+    connection: Connection,
+    timing: TransferTiming,
+) -> Result<()> {
+    let Connection {
+        destination,
+        id,
+        mut events,
+        elapsed: connect_elapsed,
+    } = connection;
+    let TransferTiming {
+        started,
+        route_elapsed,
+        dns_elapsed,
+        stack_id,
+    } = timing;
     let (mut reader, mut writer) = stream.into_split();
     let transfer_started = Instant::now();
     let mut client_bytes = 0_u64;
@@ -390,5 +482,21 @@ pub async fn handle<R: RouteProvider>(mut stream: TcpStream, router: R) -> Resul
     transfer?;
     close_result?;
     shutdown_result?;
+    Ok(())
+}
+
+async fn reply(stream: &mut TcpStream, code: u8) -> Result<()> {
+    let mut response = [0; SOCKS_REPLY_BYTES];
+    response[VERSION_INDEX] = SOCKS_VERSION;
+    response[REPLY_CODE_INDEX] = code;
+    response[ADDRESS_TYPE_INDEX] = IPV4_ADDRESS_TYPE;
+    stream.write_all(&response).await?;
+    Ok(())
+}
+
+async fn read_exact(stream: &mut TcpStream, buf: &mut [u8]) -> Result<()> {
+    time::timeout(SOCKET_IO_TIMEOUT, stream.read_exact(buf))
+        .await
+        .map_err(|_| SocksError::SocketTimeout)??;
     Ok(())
 }

@@ -1,5 +1,6 @@
 use thiserror::Error;
 
+/// Failures while configuring or using the userspace packet stack.
 #[derive(Debug, Error)]
 pub enum StackError {
     #[error("tunnel MTU must be between 576 and 1400 bytes")]
@@ -38,4 +39,5 @@ pub enum StackError {
     InvalidState,
 }
 
+/// Result returned by the userspace packet stack.
 pub type Result<T> = std::result::Result<T, StackError>;

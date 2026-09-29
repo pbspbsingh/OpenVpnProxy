@@ -2,6 +2,7 @@ use std::io;
 
 use thiserror::Error;
 
+/// Failures while establishing or using an OpenVPN session.
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("VPN I/O failed: {0}")]

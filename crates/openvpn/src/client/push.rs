@@ -225,20 +225,6 @@ pub(super) fn parse_push(push: &str) -> Result<(TunnelSettings, u32, Duration, D
     Ok((tunnel, peer_id, ping, restart))
 }
 
-fn parse_ipv6_cidr(value: &str) -> Result<(Ipv6Addr, u8)> {
-    let (address, prefix) = value
-        .split_once('/')
-        .ok_or(Error::PushInvalidAddress("IPv6 CIDR"))?;
-    let address = address
-        .parse::<Ipv6Addr>()
-        .map_err(|_| Error::PushInvalidAddress("IPv6 CIDR address"))?;
-    let prefix = prefix
-        .parse::<u8>()
-        .map_err(|_| Error::PushInvalidAddress("IPv6 CIDR prefix"))?;
-    require(prefix <= 128, "IPv6 prefix length exceeds 128")?;
-    Ok((address, prefix))
-}
-
 pub(super) fn pushed_auth_token(push: &str) -> Result<Option<(String, Option<String>)>> {
     let mut token = None;
     let mut user = None;
@@ -275,6 +261,20 @@ pub(super) fn pushed_auth_token(push: &str) -> Result<Option<(String, Option<Str
         "auth token username without token",
     )?;
     Ok(token.map(|token| (token, user)))
+}
+
+fn parse_ipv6_cidr(value: &str) -> Result<(Ipv6Addr, u8)> {
+    let (address, prefix) = value
+        .split_once('/')
+        .ok_or(Error::PushInvalidAddress("IPv6 CIDR"))?;
+    let address = address
+        .parse::<Ipv6Addr>()
+        .map_err(|_| Error::PushInvalidAddress("IPv6 CIDR address"))?;
+    let prefix = prefix
+        .parse::<u8>()
+        .map_err(|_| Error::PushInvalidAddress("IPv6 CIDR prefix"))?;
+    require(prefix <= 128, "IPv6 prefix length exceeds 128")?;
+    Ok((address, prefix))
 }
 
 #[cfg(test)]

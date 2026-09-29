@@ -16,17 +16,6 @@ const IV_PROTOCOL_FLAGS: u32 = 15;
 const IV_NCP_VERSION: u8 = 2;
 const IV_MTU_BYTES: usize = 1500;
 
-fn field(output: &mut Vec<u8>, value: &str) -> Result<()> {
-    require(
-        !value.contains('\0') && value.len() < u16::MAX as usize,
-        "invalid control field",
-    )?;
-    output.extend_from_slice(&((value.len() + 1) as u16).to_be_bytes());
-    output.extend_from_slice(value.as_bytes());
-    output.push(0);
-    Ok(())
-}
-
 pub(super) fn client_km2(username: &str, password: &str) -> Result<Vec<u8>> {
     let mut message = KM2_PREFIX.to_vec();
     let mut random = [0; CLIENT_RANDOM_BYTES];
@@ -53,6 +42,42 @@ pub(super) fn client_km2(username: &str, password: &str) -> Result<Vec<u8>> {
     )?;
     random.fill(0);
     Ok(message)
+}
+
+pub(super) fn take_server_km2(link: &mut Link) -> Result<bool> {
+    if link.application_data().starts_with(b"AUTH_FAILED") {
+        return Err(Error::AuthenticationFailed);
+    }
+    if let Some(len) = server_km2_len(link.application_data())? {
+        link.application_data().drain(..len);
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
+pub(super) async fn read_server_km2(link: &mut Link) -> Result<()> {
+    let deadline = Instant::now() + KEY_METHOD_TIMEOUT;
+    loop {
+        if take_server_km2(link)? {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(Error::Timeout("server KEY_METHOD 2"));
+        }
+        link.step().await?;
+    }
+}
+
+fn field(output: &mut Vec<u8>, value: &str) -> Result<()> {
+    require(
+        !value.contains('\0') && value.len() < u16::MAX as usize,
+        "invalid control field",
+    )?;
+    output.extend_from_slice(&((value.len() + 1) as u16).to_be_bytes());
+    output.extend_from_slice(value.as_bytes());
+    output.push(0);
+    Ok(())
 }
 
 fn read_field(buffer: &[u8], offset: &mut usize) -> Result<Option<()>> {
@@ -93,31 +118,6 @@ fn server_km2_len(buffer: &[u8]) -> Result<Option<usize>> {
         }
     }
     Ok(Some(offset))
-}
-
-pub(super) fn take_server_km2(link: &mut Link) -> Result<bool> {
-    if link.application_data().starts_with(b"AUTH_FAILED") {
-        return Err(Error::AuthenticationFailed);
-    }
-    if let Some(len) = server_km2_len(link.application_data())? {
-        link.application_data().drain(..len);
-        Ok(true)
-    } else {
-        Ok(false)
-    }
-}
-
-pub(super) async fn read_server_km2(link: &mut Link) -> Result<()> {
-    let deadline = Instant::now() + KEY_METHOD_TIMEOUT;
-    loop {
-        if take_server_km2(link)? {
-            return Ok(());
-        }
-        if Instant::now() >= deadline {
-            return Err(Error::Timeout("server KEY_METHOD 2"));
-        }
-        link.step().await?;
-    }
 }
 
 #[cfg(test)]

@@ -5,31 +5,6 @@ use tokio::net::TcpListener;
 use crate::config::{config_path, load_config};
 use crate::manager::{ConnectionManager, RouterHandle};
 
-async fn serve_socks(listener: TcpListener, router: RouterHandle) -> Result<()> {
-    tracing::info!(address = %listener.local_addr()?, "SOCKS5 listening");
-    loop {
-        tokio::select! {
-            signal = tokio::signal::ctrl_c() => {
-                signal?;
-                tracing::info!("shutdown requested");
-                return Ok(());
-            }
-            accepted = listener.accept() => {
-                let (stream, peer) = accepted?;
-                tracing::debug!(%peer, "SOCKS5 client accepted");
-                let router = router.clone();
-                tokio::spawn(async move {
-                    if let Err(error) = ovpn_socks5::handle(stream, router).await {
-                        tracing::debug!(%peer, %error, "SOCKS5 client ended with error");
-                    } else {
-                        tracing::debug!(%peer, "SOCKS5 handler finished");
-                    }
-                });
-            }
-        }
-    }
-}
-
 pub(crate) async fn run() -> Result<()> {
     let config = load_config(&config_path()?).await?;
     let content = tokio::fs::read_to_string(&config.profile_path)
@@ -62,4 +37,29 @@ pub(crate) async fn run() -> Result<()> {
     .await;
     manager.shutdown().await;
     result
+}
+
+async fn serve_socks(listener: TcpListener, router: RouterHandle) -> Result<()> {
+    tracing::info!(address = %listener.local_addr()?, "SOCKS5 listening");
+    loop {
+        tokio::select! {
+            signal = tokio::signal::ctrl_c() => {
+                signal?;
+                tracing::info!("shutdown requested");
+                return Ok(());
+            }
+            accepted = listener.accept() => {
+                let (stream, peer) = accepted?;
+                tracing::debug!(%peer, "SOCKS5 client accepted");
+                let router = router.clone();
+                tokio::spawn(async move {
+                    if let Err(error) = ovpn_socks5::handle(stream, router).await {
+                        tracing::debug!(%peer, %error, "SOCKS5 client ended with error");
+                    } else {
+                        tracing::debug!(%peer, "SOCKS5 handler finished");
+                    }
+                });
+            }
+        }
+    }
 }

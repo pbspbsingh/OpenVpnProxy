@@ -1,3 +1,5 @@
+//! Parsing and validation for supported OpenVPN profiles.
+
 use std::time::Duration;
 
 use thiserror::Error;
@@ -10,6 +12,7 @@ const TLS_CRYPT_KEY_BYTES: usize = 256;
 const HEX_CHARACTERS_PER_BYTE: usize = 2;
 const HEX_RADIX: u32 = 16;
 
+/// An unsupported or malformed OpenVPN profile setting.
 #[derive(Debug, Error)]
 pub enum ProfileError {
     #[error("unsupported inline profile block")]
@@ -46,6 +49,7 @@ pub enum ProfileError {
     InvalidTlsCryptKey,
 }
 
+/// Validated settings read from an OpenVPN profile.
 pub struct Profile {
     pub remotes: Vec<(String, u16)>,
     pub ca_pem: String,
@@ -59,6 +63,7 @@ pub struct Profile {
 }
 
 impl Profile {
+    /// Parses a supported OpenVPN profile from its text.
     pub fn parse(content: &str) -> Result<Self, ProfileError> {
         let mut ca = String::new();
         let mut static_key = String::new();

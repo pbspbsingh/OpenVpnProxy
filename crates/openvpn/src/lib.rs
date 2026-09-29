@@ -1,3 +1,5 @@
+//! OpenVPN client sessions for transporting IP packets over UDP.
+
 mod client;
 mod control;
 mod data;

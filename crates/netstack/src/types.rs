@@ -8,12 +8,14 @@ pub(crate) const MIN_IPV6_MTU: usize = 1280;
 const MAX_IPV6_ROUTES: usize = 3;
 const MAX_DNS_SERVERS: usize = 4;
 
+/// Address family used for a tunneled DNS lookup.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum IpVersion {
     V4,
     V6,
 }
 
+/// A route installed in the userspace IPv6 stack.
 #[derive(Clone, Debug)]
 pub struct Ipv6Route {
     pub network: Ipv6Addr,
@@ -22,7 +24,11 @@ pub struct Ipv6Route {
 }
 
 impl Ipv6Route {
+    /// Returns whether the route covers an IPv6 address.
     pub fn contains(&self, address: Ipv6Addr) -> bool {
+        if self.prefix_len > 128 {
+            return false;
+        }
         let mask = if self.prefix_len == 0 {
             0
         } else {
@@ -32,6 +38,7 @@ impl Ipv6Route {
     }
 }
 
+/// IPv6 address and routes assigned by the VPN server.
 #[derive(Clone, Debug)]
 pub struct Ipv6Config {
     pub local: Ipv6Addr,
@@ -39,16 +46,18 @@ pub struct Ipv6Config {
     pub routes: Vec<Ipv6Route>,
 }
 
+/// Validated IP settings used to configure a VPN packet stack.
 #[derive(Clone, Debug)]
 pub struct TunnelConfig {
-    pub local: Ipv4Addr,
-    pub gateway: Ipv4Addr,
-    pub dns: Vec<IpAddr>,
-    pub mtu: usize,
-    pub ipv6: Option<Ipv6Config>,
+    pub(crate) local: Ipv4Addr,
+    pub(crate) gateway: Ipv4Addr,
+    pub(crate) dns: Vec<IpAddr>,
+    pub(crate) mtu: usize,
+    pub(crate) ipv6: Option<Ipv6Config>,
 }
 
 impl TunnelConfig {
+    /// Validates the tunnel settings and removes DNS servers without a route.
     pub fn new(
         local: Ipv4Addr,
         gateway: Ipv4Addr,
@@ -109,6 +118,7 @@ impl TunnelConfig {
     }
 }
 
+/// An event emitted by a virtual TCP connection.
 #[derive(Debug)]
 pub enum StreamEvent {
     Connected,
@@ -116,6 +126,7 @@ pub enum StreamEvent {
     Closed,
 }
 
+/// Lifecycle state of a VPN packet stack.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
 pub enum StackPhase {
@@ -161,6 +172,11 @@ mod tests {
             ..route
         };
         assert!(default.contains("fe80::1".parse().unwrap()));
+        let invalid = Ipv6Route {
+            prefix_len: 129,
+            ..default
+        };
+        assert!(!invalid.contains("fe80::1".parse().unwrap()));
     }
 
     #[test]

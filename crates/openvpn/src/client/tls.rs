@@ -16,6 +16,37 @@ use x509_parser::prelude::{FromDer, X509Certificate};
 use super::ClientConfig;
 use crate::error::{Error, Result};
 
+pub(crate) fn new_tls_connection(config: &Arc<TlsClientConfig>) -> Result<ClientConnection> {
+    let name = ServerName::try_from("openvpn.invalid")
+        .map_err(|_| Error::Protocol("invalid internal TLS server name"))?;
+    Ok(ClientConnection::new(Arc::clone(config), name)?)
+}
+
+pub(super) fn tls_client(profile: &ClientConfig<'_>) -> Result<Arc<TlsClientConfig>> {
+    let mut reader = Cursor::new(profile.ca_pem.as_bytes());
+    let certs: Vec<_> = rustls_pemfile::certs(&mut reader).collect::<std::io::Result<_>>()?;
+    if certs.is_empty() {
+        return Err(Error::MissingCa);
+    }
+    let mut roots = RootCertStore::empty();
+    for cert in certs {
+        roots.add(cert).map_err(Error::InvalidCa)?;
+    }
+    let provider: CryptoProvider = rustls::crypto::aws_lc_rs::default_provider();
+    let verifier = OpenVpnVerifier {
+        roots,
+        algorithms: provider.signature_verification_algorithms,
+        require_server_certificate_purpose: profile.require_server_certificate_purpose,
+    };
+    let mut config = TlsClientConfig::builder_with_provider(Arc::new(provider))
+        .with_safe_default_protocol_versions()?
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(verifier))
+        .with_no_client_auth();
+    config.enable_sni = false;
+    Ok(Arc::new(config))
+}
+
 #[derive(Debug)]
 struct OpenVpnVerifier {
     roots: RootCertStore,
@@ -94,35 +125,4 @@ fn verify_server_certificate_purpose(
         ));
     }
     Ok(())
-}
-
-pub(super) fn tls_client(profile: &ClientConfig<'_>) -> Result<Arc<TlsClientConfig>> {
-    let mut reader = Cursor::new(profile.ca_pem.as_bytes());
-    let certs: Vec<_> = rustls_pemfile::certs(&mut reader).collect::<std::io::Result<_>>()?;
-    if certs.is_empty() {
-        return Err(Error::MissingCa);
-    }
-    let mut roots = RootCertStore::empty();
-    for cert in certs {
-        roots.add(cert).map_err(Error::InvalidCa)?;
-    }
-    let provider: CryptoProvider = rustls::crypto::aws_lc_rs::default_provider();
-    let verifier = OpenVpnVerifier {
-        roots,
-        algorithms: provider.signature_verification_algorithms,
-        require_server_certificate_purpose: profile.require_server_certificate_purpose,
-    };
-    let mut config = TlsClientConfig::builder_with_provider(Arc::new(provider))
-        .with_safe_default_protocol_versions()?
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(verifier))
-        .with_no_client_auth();
-    config.enable_sni = false;
-    Ok(Arc::new(config))
-}
-
-pub(crate) fn new_tls_connection(config: &Arc<TlsClientConfig>) -> Result<ClientConnection> {
-    let name = ServerName::try_from("openvpn.invalid")
-        .map_err(|_| Error::Protocol("invalid internal TLS server name"))?;
-    Ok(ClientConnection::new(Arc::clone(config), name)?)
 }

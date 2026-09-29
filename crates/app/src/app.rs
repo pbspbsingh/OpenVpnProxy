@@ -15,6 +15,7 @@ async fn resolve_vpn_endpoint(profile: &Profile) -> Result<SocketAddr> {
         match tokio::net::lookup_host((host.as_str(), *port)).await {
             Ok(mut addresses) => {
                 if let Some(address) = addresses.find(SocketAddr::is_ipv4) {
+                    tracing::info!("VPN address host: {address:?}");
                     return Ok(address);
                 }
             }

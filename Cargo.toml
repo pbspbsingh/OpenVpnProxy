@@ -43,3 +43,8 @@ ovpn-profile = { path = "crates/profile" }
 ovpn-client = { path = "crates/openvpn" }
 ovpn-netstack = { path = "crates/netstack" }
 ovpn-socks5 = { path = "crates/socks5" }
+
+
+[profile.release]
+lto = true
+strip = true

@@ -5,6 +5,8 @@ username = ""
 password = ""
 # Listen on all IPv4 interfaces so other machines can use the proxy.
 socks5_address = "0.0.0.0:1080"
+# Uncomment to enable the read-only dashboard. Bind another address for remote access.
+# webui_address = "127.0.0.1:8080"
 # The default is 16. Set this lower if your provider restricts concurrent sessions.
 max_active_vpn_hosts = 16
 

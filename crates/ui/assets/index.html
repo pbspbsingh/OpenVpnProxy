@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>OpenVPN Proxy · Status</title>
+  <link rel="icon" type="image/svg+xml" href="/favicon.svg">
+  <link rel="stylesheet" href="/style.css">
+  <script defer src="/app.js"></script>
+</head>
+<body>
+  <div class="shell">
+    <header class="topbar">
+      <div class="brand">
+        <div class="brand-mark" aria-hidden="true"><span></span><span></span><span></span></div>
+        <div><div class="eyebrow">NETWORK OPERATIONS</div><h1>OpenVPN Proxy</h1></div>
+      </div>
+      <div class="topbar-right">
+        <div id="feed-status" class="feed-status connecting"><span class="status-dot"></span><span id="feed-label">Connecting</span></div>
+        <div class="topbar-time"><span>Last update</span><strong id="last-update">—</strong></div>
+      </div>
+    </header>
+
+    <nav class="tabs" role="tablist" aria-label="Dashboard sections">
+      <button class="tab active" type="button" role="tab" aria-selected="true" aria-controls="overview" data-tab="overview">Overview</button>
+      <button class="tab" type="button" role="tab" aria-selected="false" aria-controls="hosts" data-tab="hosts">Hosts</button>
+      <button class="tab" type="button" role="tab" aria-selected="false" aria-controls="routing" data-tab="routing">Routing</button>
+      <button class="tab" type="button" role="tab" aria-selected="false" aria-controls="profile" data-tab="profile">Profile</button>
+    </nav>
+
+    <main>
+      <section id="overview" class="tab-panel" role="tabpanel">
+        <div class="section-heading"><div><div class="eyebrow">LIVE SYSTEM VIEW</div><h2>Overview</h2></div><div class="range-pill">Last 60 minutes <span>·</span> 1 min buckets</div></div>
+        <div class="metric-grid">
+          <article class="metric-card"><div class="metric-label">Pool status</div><div id="pool-phase" class="metric-value status-text">Waiting</div><div id="pool-detail" class="metric-detail" aria-live="polite">Waiting for first snapshot</div></article>
+          <article class="metric-card"><div class="metric-label">Active routes</div><div id="active-routes" class="metric-value">—</div><div class="metric-detail">Client routes in use</div></article>
+          <article class="metric-card"><div class="metric-label">Download</div><div id="system-rx-rate" class="metric-value">—</div><div id="system-rx-total" class="metric-detail">Total —</div></article>
+          <article class="metric-card"><div class="metric-label">Upload</div><div id="system-tx-rate" class="metric-value">—</div><div id="system-tx-total" class="metric-detail">Total —</div></article>
+        </div>
+        <div class="chart-grid">
+          <article class="panel chart-panel"><div class="panel-heading"><div><div class="eyebrow">TUNNEL THROUGHPUT</div><h3>System traffic</h3></div><div class="legend"><span class="legend-item"><i class="swatch rx"></i> Download</span><span class="legend-item"><i class="swatch tx"></i> Upload</span></div></div><div class="chart-wrap"><canvas id="system-traffic-chart" aria-label="System traffic per minute for the last hour"></canvas></div><div class="chart-foot">Bytes through VPN tunnels, grouped into one-minute buckets. Current minute is partial.</div></article>
+          <article class="panel chart-panel"><div class="panel-heading"><div><div class="eyebrow">TUNNEL RESPONSIVENESS</div><h3>System latency</h3></div><div class="legend"><span class="legend-item"><i class="swatch latency"></i> Selected host mean</span></div></div><div class="chart-wrap"><canvas id="system-latency-chart" aria-label="Average selected host latency per minute for the last hour"></canvas></div><div class="chart-foot">Mean of selected hosts' tunneled TCP probe scores.</div></article>
+        </div>
+        <div class="panel overview-strip"><div><span class="strip-label">Hosts online</span><strong id="hosts-ready">—</strong></div><div><span class="strip-label">Sticky groups</span><strong id="sticky-count">—</strong></div><div><span class="strip-label">Candidates</span><strong id="candidate-count">—</strong></div><div><span class="strip-label">Active limit</span><strong id="active-limit">—</strong></div></div>
+      </section>
+
+      <section id="hosts" class="tab-panel" role="tabpanel" hidden>
+        <div class="section-heading"><div><div class="eyebrow">TUNNEL INVENTORY</div><h2>Hosts</h2></div><div class="range-pill">Last 60 minutes <span>·</span> 1 min buckets</div></div>
+        <div class="host-layout">
+          <div id="host-list" class="host-list" aria-label="VPN hosts"></div>
+          <div class="host-detail">
+            <article class="panel host-detail-header"><div><div class="eyebrow">SELECTED HOST</div><h3 id="selected-host-name">Choose a host</h3><div id="selected-host-endpoint" class="muted">—</div></div><div id="selected-host-badge" class="phase-badge">—</div><div id="selected-host-stats" class="host-detail-stats"></div></article>
+            <div class="host-chart-grid">
+              <article class="panel chart-panel"><div class="panel-heading"><div><div class="eyebrow">TUNNEL THROUGHPUT</div><h3>Host traffic</h3></div><div class="legend"><span class="legend-item"><i class="swatch rx"></i> Download</span><span class="legend-item"><i class="swatch tx"></i> Upload</span></div></div><div class="chart-wrap"><canvas id="host-traffic-chart" aria-label="Selected host traffic per minute for the last hour"></canvas></div><div class="chart-foot">One-minute buckets for the selected VPN host.</div></article>
+              <article class="panel chart-panel"><div class="panel-heading"><div><div class="eyebrow">TUNNEL RESPONSIVENESS</div><h3>Host latency</h3></div><div class="legend"><span class="legend-item"><i class="swatch latency"></i> Probe score</span></div></div><div class="chart-wrap"><canvas id="host-latency-chart" aria-label="Selected host latency per minute for the last hour"></canvas></div><div class="chart-foot">Median TCP probe latency, smoothed by the connection manager.</div></article>
+            </div>
+            <article id="assigned-groups" class="panel groups-panel">
+              <div class="groups-heading"><span>Assigned groups <strong id="assigned-group-count">0</strong></span><span id="groups-status" aria-live="polite">Waiting for host selection</span><button id="groups-more" type="button" hidden>Load more</button><button id="groups-refresh" type="button">Refresh</button></div>
+              <div class="groups-table-wrap"><table class="groups-table"><thead><tr><th>Source IP</th><th>Destination group</th><th>Connections / idle</th></tr></thead><tbody id="groups-rows"></tbody></table></div>
+            </article>
+          </div>
+        </div>
+      </section>
+
+      <section id="routing" class="tab-panel" role="tabpanel" hidden>
+        <div class="section-heading"><div><div class="eyebrow">ASSIGNMENT STATE</div><h2>Routing</h2></div><div class="range-pill">Live status</div></div>
+        <div class="routing-grid">
+          <article class="panel routing-summary"><div class="eyebrow">POOL CAPACITY</div><h3>Host selection</h3><div class="routing-row"><span>Profile candidates</span><strong id="routing-candidates">—</strong></div><div class="routing-row"><span>Selected hosts</span><strong id="routing-selected">—</strong></div><div class="routing-row"><span>Ready tunnels</span><strong id="routing-ready">—</strong></div><div class="routing-row"><span>Configured active limit</span><strong id="routing-limit">—</strong></div><div class="routing-row"><span>Idle shutdown</span><strong id="routing-idle">—</strong></div></article>
+          <article class="panel routing-summary"><div class="eyebrow">STICKY ROUTING</div><h3>Current assignments</h3><div class="routing-row"><span>Sticky groups</span><strong id="routing-sticky">—</strong></div><div class="routing-row"><span>Active client routes</span><strong id="routing-routes">—</strong></div><p class="muted routing-note">A client source IP and destination group stay on the same VPN host while the assignment is active. Idle groups expire after 30 minutes.</p></article>
+        </div>
+        <article class="panel table-panel"><div class="panel-heading"><div><div class="eyebrow">BY VPN SERVER</div><h3>Assignment distribution</h3></div></div><div class="table-scroll"><table><thead><tr><th>Host</th><th>State</th><th>Sticky groups</th><th>Active routes</th><th>Latency</th><th>Download total</th></tr></thead><tbody id="routing-hosts"></tbody></table></div></article>
+      </section>
+
+      <section id="profile" class="tab-panel" role="tabpanel" hidden>
+        <div class="section-heading"><div><div class="eyebrow">LOADED VPN SETTINGS</div><h2>Profile</h2></div><div class="range-pill">Read-only summary</div></div>
+        <div class="profile-grid">
+          <article class="panel routing-summary"><div class="eyebrow">CONNECTION</div><h3>Protocol and timing</h3><div class="routing-row"><span>Transport</span><strong>UDP over IPv4</strong></div><div class="routing-row"><span>Profile remotes</span><strong id="profile-remote-count">—</strong></div><div class="routing-row"><span>Handshake window</span><strong id="profile-handshake">—</strong></div><div class="routing-row"><span>Transition window</span><strong id="profile-transition">—</strong></div><div class="routing-row"><span>Key renegotiation</span><strong id="profile-renegotiation">—</strong></div></article>
+          <article class="panel routing-summary"><div class="eyebrow">POLICY</div><h3>Authentication and routes</h3><div class="routing-row"><span>Username/password</span><strong id="profile-credentials">—</strong></div><div class="routing-row"><span>Certificate authority</span><strong>Inline CA required</strong></div><div class="routing-row"><span>Server certificate purpose</span><strong id="profile-server-purpose">—</strong></div><div class="routing-row"><span>Control protection</span><strong>tls-crypt v1</strong></div><div class="routing-row"><span>IPv6 policy</span><strong id="profile-ipv6">—</strong></div></article>
+        </div>
+        <article class="panel table-panel"><div class="panel-heading"><div><div class="eyebrow">PROFILE DIRECTIVES</div><h3>VPN remotes</h3></div><span id="profile-status" class="muted">Loading profile summary…</span></div><div class="table-scroll"><table><thead><tr><th>#</th><th>Hostname or IP</th><th>Port</th></tr></thead><tbody id="profile-remotes"></tbody></table></div></article>
+      </section>
+    </main>
+    <footer>Read-only dashboard <span>·</span> Live status via WebSocket <span>·</span> Counters and chart history reset when the app restarts</footer>
+  </div>
+</body>
+</html>

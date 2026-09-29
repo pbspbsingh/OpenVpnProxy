@@ -2,6 +2,7 @@ mod discovery;
 mod host;
 mod probe;
 mod routing;
+mod telemetry;
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::num::NonZeroUsize;
@@ -10,6 +11,9 @@ use std::time::Instant;
 
 use anyhow::{Result, anyhow, bail};
 use ovpn_profile::Profile;
+use ovpn_ui::{
+    DashboardSnapshot, GroupError, GroupPage, ProfileRemote, ProfileSummary, SnapshotSource,
+};
 use tokio::sync::{Semaphore, watch};
 use tokio::task::JoinSet;
 
@@ -26,6 +30,7 @@ pub(crate) use self::routing::RouterHandle;
 
 pub(crate) struct ConnectionManager {
     shared: Arc<Shared>,
+    profile_summary: Arc<ProfileSummary>,
     stop: watch::Sender<bool>,
     workers: JoinSet<()>,
 }
@@ -37,7 +42,9 @@ impl ConnectionManager {
         password: String,
         dns_override: Option<Ipv4Addr>,
         max_active_vpn_hosts: Option<NonZeroUsize>,
+        dashboard_enabled: bool,
     ) -> Result<Self> {
+        let profile_summary = Arc::new(summarize_profile(&profile));
         let mut candidates = resolve_candidates(&profile).await?;
         let max_active_vpn_hosts = max_active_vpn_hosts
             .map(NonZeroUsize::get)
@@ -109,13 +116,28 @@ impl ConnectionManager {
             })
             .collect::<Result<Vec<_>>>()?;
         let enabled: Vec<_> = hosts.iter().map(Host::activation).collect();
+        let traffic: Vec<_> = hosts.iter().map(Host::traffic).collect();
         let acquire_timeout = profile
             .handshake_window
             .saturating_add(CONTROL_SETUP_ALLOWANCE);
-        let shared = Shared::new(hosts, acquire_timeout, max_active_vpn_hosts);
+        let (shared, assignment_events) = Shared::new(
+            hosts,
+            acquire_timeout,
+            max_active_vpn_hosts,
+            dashboard_enabled,
+        );
         let (stop, _) = watch::channel(false);
         let mut workers = JoinSet::new();
-        for (id, (candidate, enabled)) in candidates.into_iter().zip(enabled).enumerate() {
+        if let Some(assignment_events) = assignment_events {
+            let shared = Arc::clone(&shared);
+            let stop = stop.subscribe();
+            workers.spawn(async move {
+                routing::maintain_assignments(shared, assignment_events, stop).await;
+            });
+        }
+        for (id, ((candidate, enabled), traffic)) in
+            candidates.into_iter().zip(enabled).zip(traffic).enumerate()
+        {
             workers.spawn(
                 HostWorker {
                     id,
@@ -126,6 +148,7 @@ impl ConnectionManager {
                     dns_override,
                     permits: Arc::clone(&permits),
                     enabled,
+                    traffic,
                     shared: Arc::clone(&shared),
                     stop: stop.subscribe(),
                 }
@@ -147,6 +170,7 @@ impl ConnectionManager {
         );
         Ok(Self {
             shared,
+            profile_summary,
             stop,
             workers,
         })
@@ -155,6 +179,7 @@ impl ConnectionManager {
     pub(crate) fn router(&self) -> RouterHandle {
         RouterHandle {
             shared: Arc::clone(&self.shared),
+            profile_summary: Arc::clone(&self.profile_summary),
         }
     }
 
@@ -166,6 +191,44 @@ impl ConnectionManager {
             }
         }
         tracing::info!("VPN host pool stopped");
+    }
+}
+
+pub(crate) fn summarize_profile(profile: &Profile) -> ProfileSummary {
+    ProfileSummary {
+        remotes: profile
+            .remotes
+            .iter()
+            .map(|(host, port)| ProfileRemote {
+                host: host.clone(),
+                port: *port,
+            })
+            .collect(),
+        credentials_required: profile.needs_credentials,
+        ipv6_blocked: profile.block_ipv6,
+        server_certificate_purpose_required: profile.require_server_certificate_purpose,
+        renegotiate_after_seconds: profile.renegotiate_after.map(|duration| duration.as_secs()),
+        handshake_window_seconds: profile.handshake_window.as_secs(),
+        transition_window_seconds: profile.transition_window.as_secs(),
+    }
+}
+
+impl SnapshotSource for RouterHandle {
+    fn snapshot(&self) -> DashboardSnapshot {
+        self.dashboard_snapshot()
+    }
+
+    fn group_page(
+        &self,
+        host_id: usize,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Option<GroupPage>, GroupError> {
+        self.dashboard_group_page(host_id, offset, limit)
+    }
+
+    fn profile(&self) -> ProfileSummary {
+        (*self.profile_summary).clone()
     }
 }
 

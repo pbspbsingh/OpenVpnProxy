@@ -33,6 +33,10 @@ smoltcp = { version = "0.14.0", default-features = false, features = ["std", "me
 serde = { version = "1.0", features = ["derive"] }
 toml = "1.1.6"
 
+# Read-only dashboard and WebSocket updates
+axum = { version = "0.8.9", features = ["ws"] }
+serde_json = "1.0"
+
 # Registrable-domain routing
 psl = "2.1.238"
 idna = "1.1.0"
@@ -49,6 +53,7 @@ ovpn-profile = { path = "crates/profile" }
 ovpn-client = { path = "crates/openvpn" }
 ovpn-netstack = { path = "crates/netstack" }
 ovpn-socks5 = { path = "crates/socks5" }
+ovpn-ui = { path = "crates/ui" }
 
 
 [profile.release]

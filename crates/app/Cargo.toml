@@ -10,6 +10,7 @@ ovpn-client.workspace = true
 ovpn-netstack.workspace = true
 ovpn-profile.workspace = true
 ovpn-socks5.workspace = true
+ovpn-ui.workspace = true
 
 # TOML configuration
 serde.workspace = true

@@ -12,6 +12,7 @@ use tokio::time;
 use super::discovery::HostCandidate;
 use super::probe::{LatencyScore, PROBE_INTERVAL, measure, measure_with_session};
 use super::routing::{HostActivation, HostPhase, Shared};
+use super::telemetry::HostTraffic;
 
 const TUNNEL_PACKET_QUEUE_CAPACITY: usize = 1024;
 pub(super) const CONTROL_SETUP_ALLOWANCE: Duration = Duration::from_secs(30);
@@ -31,6 +32,7 @@ pub(super) struct HostWorker {
     pub(super) dns_override: Option<Ipv4Addr>,
     pub(super) permits: Arc<Semaphore>,
     pub(super) enabled: watch::Receiver<HostActivation>,
+    pub(super) traffic: Arc<HostTraffic>,
     pub(super) shared: Arc<Shared>,
     pub(super) stop: watch::Receiver<bool>,
 }
@@ -51,6 +53,7 @@ impl HostWorker {
             dns_override,
             permits,
             mut enabled,
+            traffic,
             shared,
             mut stop,
         } = self;
@@ -152,6 +155,7 @@ impl HostWorker {
                         session,
                         outbound,
                         &shared,
+                        &traffic,
                         &mut enabled,
                         epoch,
                         &mut stop,
@@ -314,6 +318,7 @@ async fn drive_host(
     mut session: Session,
     mut outbound: mpsc::Receiver<Vec<u8>>,
     shared: &Arc<Shared>,
+    traffic: &HostTraffic,
     enabled: &mut watch::Receiver<HostActivation>,
     epoch: u64,
     stop: &mut watch::Receiver<bool>,
@@ -364,6 +369,7 @@ async fn drive_host(
                     tracing::trace!(host_id = id, %endpoint, bytes = packet.len(), "sending VPN packet");
                     let send_started = Instant::now();
                     session.send_packet(&packet).await?;
+                    traffic.add_tx(packet.len());
                     max_send_time = max_send_time.max(send_started.elapsed());
                     sent_packets += 1;
                     sent_bytes += packet.len() as u64;
@@ -372,6 +378,7 @@ async fn drive_host(
                     if let Some(packet) = received? {
                         tracing::trace!(host_id = id, %endpoint, bytes = packet.len(), "received VPN packet");
                         stack.packet(&packet)?;
+                        traffic.add_rx(packet.len());
                         received_packets += 1;
                         received_bytes += packet.len() as u64;
                     }

@@ -1,20 +1,26 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex, RwLock, TryLockError};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ovpn_netstack::Stack;
 use ovpn_socks5::{DestinationHost, RouteLease, RouteProvider};
-use tokio::sync::watch;
+use ovpn_ui::{
+    DashboardSnapshot, GroupError, GroupPage, GroupSnapshot, HostPhase as UiHostPhase,
+    HostSnapshot, PoolPhase, PoolSnapshot, ProfileSummary,
+};
+use tokio::sync::{mpsc, watch};
 use tokio::time;
 
 use super::probe::LatencyScore;
+use super::telemetry::HostTraffic;
 
 const MAX_STICKY_GROUPS: usize = 100_000;
 const STICKY_IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const STICKY_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
+const MIRROR_WRITE_RETRY: Duration = Duration::from_millis(1);
 const LOAD_SCORE_SCALE: u128 = 8;
 const LATENCY_HISTORY_WEIGHT: u32 = 3;
 const LATENCY_SAMPLE_WEIGHT: u32 = 1;
@@ -22,6 +28,7 @@ const LATENCY_SAMPLE_WEIGHT: u32 = 1;
 #[derive(Clone)]
 pub(crate) struct RouterHandle {
     pub(super) shared: Arc<Shared>,
+    pub(super) profile_summary: Arc<ProfileSummary>,
 }
 
 pub(crate) struct HostLease {
@@ -71,6 +78,7 @@ pub(super) struct Host {
     phase: HostPhase,
     stack: Option<Stack>,
     usage: Arc<HostUsage>,
+    traffic: Arc<HostTraffic>,
     enabled: watch::Sender<HostActivation>,
     selected: bool,
     unhealthy: bool,
@@ -114,8 +122,32 @@ struct RoutingState {
     next_pool_epoch: u64,
 }
 
+struct AssignmentMirror {
+    groups: HashMap<StickyKey, MirrorEntry>,
+    counts: Vec<usize>,
+}
+
+#[derive(Clone, Copy)]
+struct MirrorEntry {
+    host_id: usize,
+    active: usize,
+    idle_since: Option<Instant>,
+}
+
+enum AssignmentEvent {
+    Upsert(StickyKey, MirrorEntry),
+    Remove(StickyKey),
+    ClearHost(usize),
+    ClearAll,
+    Sweep(Instant),
+}
+
+pub(super) struct AssignmentEvents(mpsc::UnboundedReceiver<AssignmentEvent>);
+
 pub(super) struct Shared {
     state: Mutex<RoutingState>,
+    assignments: RwLock<AssignmentMirror>,
+    assignment_events: Option<mpsc::UnboundedSender<AssignmentEvent>>,
     ready: watch::Sender<usize>,
     pool_updates: watch::Sender<PoolUsage>,
     acquire_timeout: Duration,
@@ -130,6 +162,7 @@ impl Host {
             phase: HostPhase::Dormant,
             stack: None,
             usage: HostUsage::new(),
+            traffic: Arc::new(HostTraffic::default()),
             enabled,
             selected,
             unhealthy: false,
@@ -141,6 +174,10 @@ impl Host {
 
     pub(super) fn activation(&self) -> watch::Receiver<HostActivation> {
         self.enabled.subscribe()
+    }
+
+    pub(super) fn traffic(&self) -> Arc<HostTraffic> {
+        Arc::clone(&self.traffic)
     }
 }
 
@@ -195,21 +232,117 @@ impl RoutingState {
     }
 }
 
+impl AssignmentMirror {
+    fn apply(&mut self, event: AssignmentEvent) {
+        match event {
+            AssignmentEvent::Upsert(key, entry) => {
+                if let Some(previous) = self.groups.insert(key, entry) {
+                    if previous.host_id != entry.host_id {
+                        self.counts[previous.host_id] -= 1;
+                        self.counts[entry.host_id] += 1;
+                    }
+                } else {
+                    self.counts[entry.host_id] += 1;
+                }
+            }
+            AssignmentEvent::Remove(key) => {
+                if let Some(previous) = self.groups.remove(&key) {
+                    self.counts[previous.host_id] -= 1;
+                }
+            }
+            AssignmentEvent::ClearHost(host_id) => {
+                self.groups.retain(|_, entry| entry.host_id != host_id);
+                self.counts[host_id] = 0;
+            }
+            AssignmentEvent::ClearAll => {
+                self.groups.clear();
+                self.counts.fill(0);
+            }
+            AssignmentEvent::Sweep(at) => {
+                let counts = &mut self.counts;
+                self.groups.retain(|_, entry| {
+                    let expired = entry.active == 0
+                        && entry.idle_since.is_some_and(|since| {
+                            at.saturating_duration_since(since) >= STICKY_IDLE_TIMEOUT
+                        });
+                    if expired {
+                        counts[entry.host_id] -= 1;
+                    }
+                    !expired
+                });
+            }
+        }
+    }
+}
+
+pub(super) async fn maintain_assignments(
+    shared: Arc<Shared>,
+    mut events: AssignmentEvents,
+    mut stop: watch::Receiver<bool>,
+) {
+    loop {
+        tokio::select! {
+            changed = stop.changed() => if changed.is_err() || *stop.borrow() { break; },
+            event = events.0.recv() => {
+                let Some(event) = event else { break; };
+                loop {
+                    match shared.assignments.try_write() {
+                        Ok(mut mirror) => {
+                            mirror.apply(event);
+                            break;
+                        }
+                        Err(TryLockError::WouldBlock) => {}
+                        Err(TryLockError::Poisoned(_)) => {
+                            tracing::error!("dashboard assignment mirror lock poisoned");
+                            return;
+                        }
+                    }
+                    time::sleep(MIRROR_WRITE_RETRY).await;
+                }
+            }
+        }
+    }
+}
+
 impl Shared {
     pub(super) fn new(
         hosts: Vec<Host>,
         acquire_timeout: Duration,
         max_active_vpn_hosts: usize,
-    ) -> Arc<Self> {
+        dashboard_enabled: bool,
+    ) -> (Arc<Self>, Option<AssignmentEvents>) {
         let (ready, _) = watch::channel(0);
         let (pool_updates, _) = watch::channel(PoolUsage::default());
-        Arc::new(Self {
-            state: Mutex::new(RoutingState::new(hosts)),
-            ready,
-            pool_updates,
-            acquire_timeout,
-            max_active_vpn_hosts,
-        })
+        let (assignment_events, receiver) = if dashboard_enabled {
+            let (sender, receiver) = mpsc::unbounded_channel();
+            (Some(sender), Some(AssignmentEvents(receiver)))
+        } else {
+            (None, None)
+        };
+        let assignments = RwLock::new(AssignmentMirror {
+            groups: HashMap::new(),
+            counts: vec![0; hosts.len()],
+        });
+        (
+            Arc::new(Self {
+                state: Mutex::new(RoutingState::new(hosts)),
+                assignments,
+                assignment_events,
+                ready,
+                pool_updates,
+                acquire_timeout,
+                max_active_vpn_hosts,
+            }),
+            receiver,
+        )
+    }
+
+    fn publish_assignment(&self, event: impl FnOnce() -> AssignmentEvent) {
+        if let Some(sender) = &self.assignment_events
+            && sender.send(event()).is_err()
+        {
+            tracing::error!("dashboard assignment mirror unavailable");
+        }
     }
 
     fn reserve_pool(self: &Arc<Self>) -> Option<PoolReservation> {
@@ -290,6 +423,7 @@ impl Shared {
         }
         state.pool_epoch = None;
         state.sticky.clear();
+        self.publish_assignment(|| AssignmentEvent::ClearAll);
         state.pool_usage.idle_since = None;
         self.notify_ready(&state);
         self.pool_updates.send_replace(state.pool_usage);
@@ -301,9 +435,13 @@ impl Shared {
             return;
         };
         let before = state.sticky.len();
-        state.sticky.retain(|_, entry| !sticky_expired(entry));
+        let swept_at = Instant::now();
+        state
+            .sticky
+            .retain(|_, entry| !sticky_expired_at(entry, swept_at));
         let removed = before - state.sticky.len();
         if removed > 0 {
+            self.publish_assignment(|| AssignmentEvent::Sweep(swept_at));
             tracing::debug!(
                 removed,
                 remaining = state.sticky.len(),
@@ -409,6 +547,9 @@ impl Shared {
         let before = state.sticky.len();
         state.sticky.retain(|_, entry| entry.host_id != id);
         let cleared = before - state.sticky.len();
+        if cleared > 0 {
+            self.publish_assignment(|| AssignmentEvent::ClearHost(id));
+        }
         if !shutdown && state.pool_usage.active > 0 && state.hosts[id].selected {
             let replacement = state
                 .hosts
@@ -471,6 +612,16 @@ impl Shared {
             if entry.active == 0 {
                 entry.idle_since = Some(Instant::now());
             }
+            self.publish_assignment(|| {
+                AssignmentEvent::Upsert(
+                    key.clone(),
+                    MirrorEntry {
+                        host_id: entry.host_id,
+                        active: entry.active,
+                        idle_since: entry.idle_since,
+                    },
+                )
+            });
         }
     }
 }
@@ -500,6 +651,165 @@ impl Drop for PoolReservation {
     }
 }
 
+impl RouterHandle {
+    pub(super) fn dashboard_snapshot(&self) -> DashboardSnapshot {
+        let sampled_at_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
+            .unwrap_or_default();
+        let Ok(state) = self.shared.state.lock() else {
+            tracing::error!("VPN routing state lock poisoned while sampling dashboard");
+            return DashboardSnapshot {
+                version: 1,
+                sampled_at_ms,
+                message: Some("VPN routing state unavailable".into()),
+                pool: PoolSnapshot {
+                    phase: PoolPhase::Unavailable,
+                    candidate_hosts: 0,
+                    selected_hosts: 0,
+                    ready_hosts: 0,
+                    max_active_hosts: self.shared.max_active_vpn_hosts,
+                    active_routes: 0,
+                    sticky_groups: 0,
+                    idle_remaining_seconds: None,
+                    tx_bytes: 0,
+                    rx_bytes: 0,
+                },
+                hosts: Vec::new(),
+            };
+        };
+        let mut tx_bytes = 0_u64;
+        let mut rx_bytes = 0_u64;
+        let mut ready_hosts = 0;
+        let mut selected_hosts = 0;
+        let mut active_routes = 0_usize;
+        let hosts = state
+            .hosts
+            .iter()
+            .enumerate()
+            .map(|(id, host)| {
+                let (tx, rx) = host.traffic.snapshot();
+                tx_bytes = tx_bytes.saturating_add(tx);
+                rx_bytes = rx_bytes.saturating_add(rx);
+                ready_hosts += usize::from(
+                    host.phase == HostPhase::Ready
+                        && host.stack.as_ref().is_some_and(Stack::is_ready),
+                );
+                selected_hosts += usize::from(host.selected);
+                let host_routes = host.usage.snapshot().active;
+                active_routes = active_routes.saturating_add(host_routes);
+                HostSnapshot {
+                    id,
+                    endpoint: host.endpoint.to_string(),
+                    phase: match host.phase {
+                        HostPhase::Dormant => UiHostPhase::Dormant,
+                        HostPhase::Connecting => UiHostPhase::Connecting,
+                        HostPhase::Ready => UiHostPhase::Ready,
+                        HostPhase::Backoff => UiHostPhase::Backoff,
+                        HostPhase::Stopped => UiHostPhase::Stopped,
+                    },
+                    selected: host.selected,
+                    active_routes: host_routes,
+                    sticky_groups: 0,
+                    latency_ms: host.latency_score.map(|score| score.as_secs_f64() * 1000.0),
+                    score_age_seconds: host.score_measured_at.map(|at| at.elapsed().as_secs()),
+                    ipv6: host.stack.as_ref().is_some_and(Stack::supports_ipv6),
+                    tx_bytes: tx,
+                    rx_bytes: rx,
+                }
+            })
+            .collect();
+        let phase = if state.pool_epoch.is_none() {
+            PoolPhase::Dormant
+        } else if state.pool_usage.active == 0 {
+            PoolPhase::Idle
+        } else if ready_hosts == 0 {
+            PoolPhase::Waking
+        } else if ready_hosts < selected_hosts {
+            PoolPhase::Degraded
+        } else {
+            PoolPhase::Ready
+        };
+        let mut snapshot = DashboardSnapshot {
+            version: 1,
+            sampled_at_ms,
+            message: None,
+            pool: PoolSnapshot {
+                phase,
+                candidate_hosts: state.hosts.len(),
+                selected_hosts,
+                ready_hosts,
+                max_active_hosts: self.shared.max_active_vpn_hosts,
+                active_routes,
+                sticky_groups: 0,
+                idle_remaining_seconds: state
+                    .pool_usage
+                    .idle_since
+                    .map(|since| POOL_IDLE_TIMEOUT.saturating_sub(since.elapsed()).as_secs()),
+                tx_bytes,
+                rx_bytes,
+            },
+            hosts,
+        };
+        drop(state);
+        match self.shared.assignments.read() {
+            Ok(assignments) => {
+                snapshot.pool.sticky_groups = assignments.groups.len();
+                for host in &mut snapshot.hosts {
+                    host.sticky_groups = assignments.counts[host.id];
+                }
+            }
+            Err(_) => tracing::error!("dashboard assignment mirror lock poisoned while sampling"),
+        }
+        snapshot
+    }
+
+    pub(super) fn dashboard_group_page(
+        &self,
+        host_id: usize,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Option<GroupPage>, GroupError> {
+        let mut groups = {
+            let assignments = self
+                .shared
+                .assignments
+                .read()
+                .map_err(|_| GroupError::Unavailable)?;
+            if host_id >= assignments.counts.len() {
+                return Ok(None);
+            }
+            assignments
+                .groups
+                .iter()
+                .filter(|(_, entry)| entry.host_id == host_id)
+                .map(|(key, entry)| GroupSnapshot {
+                    source: key.source.to_string(),
+                    destination: match &key.destination {
+                        StickyDestination::Ip(ip) => ip.to_string(),
+                        StickyDestination::Domain(domain) => domain.clone(),
+                    },
+                    active_connections: entry.active,
+                    idle_remaining_seconds: entry.idle_since.map(|since| {
+                        STICKY_IDLE_TIMEOUT
+                            .saturating_sub(since.elapsed())
+                            .as_secs()
+                    }),
+                })
+                .collect::<Vec<_>>()
+        };
+        groups.sort_unstable_by(|left, right| {
+            (&left.destination, &left.source).cmp(&(&right.destination, &right.source))
+        });
+        let total = groups.len();
+        Ok(Some(GroupPage {
+            total,
+            offset,
+            groups: groups.into_iter().skip(offset).take(limit).collect(),
+        }))
+    }
+}
+
 impl RouteProvider for RouterHandle {
     type Lease = HostLease;
 
@@ -521,10 +831,14 @@ impl RouteProvider for RouterHandle {
                     };
                     if state.sticky.get(&key).is_some_and(sticky_expired) {
                         state.sticky.remove(&key);
+                        self.shared
+                            .publish_assignment(|| AssignmentEvent::Remove(key.clone()));
                     }
                     let sticky_id = state.sticky.get(&key).map(|entry| entry.host_id);
                     if sticky_id.is_some_and(|id| !host_eligible(&state.hosts[id], &destination)) {
                         state.sticky.remove(&key);
+                        self.shared
+                            .publish_assignment(|| AssignmentEvent::Remove(key.clone()));
                     }
                     if !state.sticky.contains_key(&key) && state.sticky.len() >= MAX_STICKY_GROUPS {
                         tracing::warn!(
@@ -553,6 +867,17 @@ impl RouteProvider for RouterHandle {
                             tracing::info!(source = %source, destination = ?key.destination, host_id = id, endpoint = %state.hosts[id].endpoint, latency_score = ?state.hosts[id].latency_score, score_age = ?state.hosts[id].score_measured_at.map(|at| at.elapsed()), active = state.hosts[id].usage.snapshot().active, "assigned destination group to VPN host");
                             generation
                         };
+                        self.shared.publish_assignment(|| {
+                            let entry = &state.sticky[&key];
+                            AssignmentEvent::Upsert(
+                                key.clone(),
+                                MirrorEntry {
+                                    host_id: entry.host_id,
+                                    active: entry.active,
+                                    idle_since: entry.idle_since,
+                                },
+                            )
+                        });
                         Some((stack, reservation, generation))
                     })
                 };
@@ -611,10 +936,14 @@ async fn wait_for_update(updates: &mut watch::Receiver<usize>, deadline: Instant
 }
 
 fn sticky_expired(entry: &StickyEntry) -> bool {
+    sticky_expired_at(entry, Instant::now())
+}
+
+fn sticky_expired_at(entry: &StickyEntry, at: Instant) -> bool {
     entry.active == 0
         && entry
             .idle_since
-            .is_some_and(|since| since.elapsed() >= STICKY_IDLE_TIMEOUT)
+            .is_some_and(|since| at.saturating_duration_since(since) >= STICKY_IDLE_TIMEOUT)
 }
 
 fn host_eligible(host: &Host, destination: &DestinationHost) -> bool {
@@ -695,6 +1024,39 @@ fn destination_supported(stack: &Stack, destination: &DestinationHost) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn assignment_mirror_tracks_reassignment_and_expiry() {
+        let mut mirror = AssignmentMirror {
+            groups: HashMap::new(),
+            counts: vec![0, 0],
+        };
+        let key = StickyKey {
+            source: IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            destination: StickyDestination::Domain("example.com".into()),
+        };
+        let now = Instant::now();
+        mirror.apply(AssignmentEvent::Upsert(
+            key.clone(),
+            MirrorEntry {
+                host_id: 0,
+                active: 1,
+                idle_since: None,
+            },
+        ));
+        mirror.apply(AssignmentEvent::Upsert(
+            key.clone(),
+            MirrorEntry {
+                host_id: 1,
+                active: 0,
+                idle_since: Some(now),
+            },
+        ));
+        assert_eq!(mirror.counts, [0, 1]);
+        mirror.apply(AssignmentEvent::Sweep(now + STICKY_IDLE_TIMEOUT));
+        assert!(mirror.groups.is_empty());
+        assert_eq!(mirror.counts, [0, 0]);
+    }
 
     #[test]
     fn registrable_domains_share_a_sticky_key_per_source() {

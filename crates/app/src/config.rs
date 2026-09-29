@@ -13,6 +13,7 @@ pub(crate) struct AppConfig {
     pub(crate) username: String,
     pub(crate) password: String,
     pub(crate) socks5_address: SocketAddr,
+    pub(crate) webui_address: Option<SocketAddr>,
     pub(crate) dns_override: Option<Ipv4Addr>,
     pub(crate) max_active_vpn_hosts: Option<NonZeroUsize>,
 }

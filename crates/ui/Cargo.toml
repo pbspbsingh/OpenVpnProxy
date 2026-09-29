@@ -1,0 +1,18 @@
+[package]
+name = "ovpn-ui"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+# HTTP, WebSocket, and JSON
+axum.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+# Async serving and structured diagnostics
+tokio.workspace = true
+tracing.workspace = true
+
+# Typed library errors
+thiserror.workspace = true

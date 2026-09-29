@@ -4,3 +4,4 @@
 *.pem
 .env
 config.toml
+*.log

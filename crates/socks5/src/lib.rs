@@ -1,5 +1,5 @@
 use std::net::{Ipv4Addr, SocketAddrV4};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ovpn_netstack::{Stack, StackError, StreamEvent};
 use thiserror::Error;
@@ -33,6 +33,7 @@ const ADDRESS_TYPE_INDEX: usize = 3;
 const SOCKET_IO_TIMEOUT: Duration = Duration::from_secs(10);
 const TUNNEL_CONNECT_TIMEOUT: Duration = Duration::from_secs(16);
 const READY_CHECK_INTERVAL: Duration = Duration::from_millis(250);
+const TRANSFER_STATUS_INTERVAL: Duration = Duration::from_secs(10);
 const TRANSFER_BUFFER_BYTES: usize = 8192;
 
 #[derive(Debug, Error)]
@@ -80,6 +81,7 @@ async fn read_exact(stream: &mut TcpStream, buf: &mut [u8]) -> Result<()> {
 }
 
 pub async fn handle<R: RouteProvider>(mut stream: TcpStream, router: R) -> Result<()> {
+    let started = Instant::now();
     tracing::debug!("SOCKS5 handshake started");
     let mut greeting = [0; GREETING_BYTES];
     read_exact(&mut stream, &mut greeting).await?;
@@ -161,28 +163,34 @@ pub async fn handle<R: RouteProvider>(mut stream: TcpStream, router: R) -> Resul
         reply(&mut stream, REPLY_ADDRESS).await?;
         return Ok(());
     }
+    let route_started = Instant::now();
     let Some(route) = router.select(&destination) else {
         tracing::warn!(?destination, "SOCKS5 request rejected: no healthy VPN host");
         reply(&mut stream, REPLY_NETWORK).await?;
         return Ok(());
     };
+    let route_elapsed = route_started.elapsed();
     let stack = route.stack();
+    let stack_id = stack.id();
     if !stack.is_ready() {
         tracing::warn!("SOCKS5 request rejected because VPN went down");
         reply(&mut stream, REPLY_NETWORK).await?;
         return Ok(());
     }
+    let mut dns_elapsed = None;
     let address = match destination {
         DestinationHost::Ipv4(address) => address,
         DestinationHost::Domain(host) => {
             tracing::debug!(%host, "resolving SOCKS5 destination through assigned VPN");
+            let dns_started = Instant::now();
             match stack.resolve(&host).await {
                 Ok(address) => {
-                    tracing::debug!(%host, %address, "SOCKS5 destination resolved");
+                    dns_elapsed = Some(dns_started.elapsed());
+                    tracing::debug!(%host, %address, ?dns_elapsed, "SOCKS5 destination resolved");
                     address
                 }
                 Err(error) => {
-                    tracing::warn!(%host, %error, "SOCKS5 destination lookup failed");
+                    tracing::warn!(%host, %error, elapsed = ?dns_started.elapsed(), "SOCKS5 destination lookup failed");
                     reply(&mut stream, REPLY_HOST).await?;
                     return Ok(());
                 }
@@ -191,10 +199,11 @@ pub async fn handle<R: RouteProvider>(mut stream: TcpStream, router: R) -> Resul
     };
     let destination = SocketAddrV4::new(address, port);
     tracing::debug!(%destination, "connecting SOCKS5 destination through VPN");
+    let connect_started = Instant::now();
     let (id, mut events) = match stack.connect(destination).await {
         Ok(value) => value,
         Err(error) => {
-            tracing::warn!(%destination, %error, "SOCKS5 tunnel connection failed");
+            tracing::warn!(%destination, %error, elapsed = ?connect_started.elapsed(), "SOCKS5 tunnel connection failed");
             reply(&mut stream, REPLY_NETWORK).await?;
             return Ok(());
         }
@@ -202,15 +211,15 @@ pub async fn handle<R: RouteProvider>(mut stream: TcpStream, router: R) -> Resul
     let connected = match time::timeout(TUNNEL_CONNECT_TIMEOUT, events.recv()).await {
         Ok(Some(StreamEvent::Connected)) => true,
         Ok(Some(StreamEvent::Closed) | None) => {
-            tracing::warn!(id, %destination, "SOCKS5 tunnel closed before connecting");
+            tracing::warn!(id, %destination, elapsed = ?connect_started.elapsed(), "SOCKS5 tunnel closed before connecting");
             false
         }
         Ok(Some(StreamEvent::Data(_))) => {
-            tracing::warn!(id, %destination, "SOCKS5 tunnel sent data before connecting");
+            tracing::warn!(id, %destination, elapsed = ?connect_started.elapsed(), "SOCKS5 tunnel sent data before connecting");
             false
         }
         Err(_) => {
-            tracing::warn!(id, %destination, "SOCKS5 tunnel connect timed out");
+            tracing::warn!(id, %destination, elapsed = ?connect_started.elapsed(), "SOCKS5 tunnel connect timed out");
             false
         }
     };
@@ -220,13 +229,26 @@ pub async fn handle<R: RouteProvider>(mut stream: TcpStream, router: R) -> Resul
         close_result?;
         return Ok(());
     }
-    tracing::debug!(id, %destination, "SOCKS5 tunnel connected");
+    let connect_elapsed = connect_started.elapsed();
+    tracing::debug!(id, %destination, stack_id, ?route_elapsed, ?dns_elapsed, ?connect_elapsed, "SOCKS5 tunnel connected");
     reply(&mut stream, REPLY_OK).await?;
 
     let (mut reader, mut writer) = stream.into_split();
+    let transfer_started = Instant::now();
+    let mut client_bytes = 0_u64;
+    let mut server_bytes = 0_u64;
+    let mut last_client_bytes = 0_u64;
+    let mut last_server_bytes = 0_u64;
+    let mut last_status = Instant::now();
+    let mut first_client_data: Option<Instant> = None;
+    let mut first_response: Option<Duration> = None;
+    let mut request_to_first_response: Option<Duration> = None;
+    let mut end_reason = "error";
     let mut buffer = [0; TRANSFER_BUFFER_BYTES];
     let mut ready_check = time::interval(READY_CHECK_INTERVAL);
     ready_check.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+    let mut status = time::interval(TRANSFER_STATUS_INTERVAL);
+    status.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     let transfer = async {
         loop {
             tokio::select! {
@@ -234,11 +256,14 @@ pub async fn handle<R: RouteProvider>(mut stream: TcpStream, router: R) -> Resul
                     match read {
                         Ok(0) => {
                             tracing::debug!(id, "SOCKS5 client closed its connection");
+                            end_reason = "client_closed";
                             break;
                         }
                         Ok(count) => {
                             tracing::trace!(id, bytes = count, "forwarding SOCKS5 client data into VPN");
                             stack.data(id, buffer[..count].to_vec())?;
+                            first_client_data.get_or_insert_with(Instant::now);
+                            client_bytes += count as u64;
                         }
                         Err(error) => return Err(SocksError::Io(error)),
                     }
@@ -248,22 +273,38 @@ pub async fn handle<R: RouteProvider>(mut stream: TcpStream, router: R) -> Resul
                         tracing::trace!(id, bytes = data.len(), "forwarding VPN data to SOCKS5 client");
                         time::timeout(SOCKET_IO_TIMEOUT, writer.write_all(&data))
                             .await.map_err(|_| SocksError::SocketTimeout)??;
+                        if first_response.is_none() {
+                            first_response = Some(transfer_started.elapsed());
+                            request_to_first_response = first_client_data.map(|when| when.elapsed());
+                        }
+                        server_bytes += data.len() as u64;
                     }
                     Some(StreamEvent::Connected) => {}
                     Some(StreamEvent::Closed) | None => {
                         tracing::debug!(id, "VPN destination closed SOCKS5 connection");
+                        end_reason = "destination_closed";
                         break;
                     }
                 },
                 _ = ready_check.tick() => if !stack.is_ready() {
                     tracing::warn!(id, "VPN went down during SOCKS5 transfer");
+                    end_reason = "vpn_down";
                     break;
                 },
+                _ = status.tick() => {
+                    if client_bytes != last_client_bytes || server_bytes != last_server_bytes {
+                        tracing::debug!(id, %destination, stack_id, window = ?last_status.elapsed(), client_bytes, server_bytes, window_client_bytes = client_bytes - last_client_bytes, window_server_bytes = server_bytes - last_server_bytes, "SOCKS5 transfer activity");
+                    }
+                    last_client_bytes = client_bytes;
+                    last_server_bytes = server_bytes;
+                    last_status = Instant::now();
+                }
             }
         }
         Ok(())
     }
     .await;
+    tracing::debug!(id, %destination, stack_id, outcome = if transfer.is_ok() { end_reason } else { "error" }, elapsed = ?started.elapsed(), transfer_elapsed = ?transfer_started.elapsed(), ?route_elapsed, ?dns_elapsed, ?connect_elapsed, ?first_response, ?request_to_first_response, client_bytes, server_bytes, "SOCKS5 transfer summary");
     let close_result = stack.close(id);
     let shutdown_result = writer.shutdown().await;
     if let Err(error) = &close_result {

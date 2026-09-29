@@ -1,9 +1,9 @@
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::time::Duration;
 
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Notify, mpsc, oneshot};
 use tokio::time;
 
 use crate::engine::run;
@@ -14,6 +14,7 @@ const COMMAND_QUEUE_CAPACITY: usize = 2048;
 const CONNECTION_EVENT_QUEUE_CAPACITY: usize = 32;
 const CONFIGURATION_TIMEOUT: Duration = Duration::from_secs(5);
 const DNS_RESPONSE_TIMEOUT: Duration = Duration::from_secs(12);
+static NEXT_STACK_ID: AtomicU64 = AtomicU64::new(1);
 
 pub(crate) enum Command {
     Configure(
@@ -24,29 +25,66 @@ pub(crate) enum Command {
     Packet(Vec<u8>),
     Reset,
     Resolve(String, oneshot::Sender<Result<Ipv4Addr>>),
-    Connect(u64, SocketAddrV4, mpsc::Sender<StreamEvent>),
+    Connect(
+        u64,
+        SocketAddrV4,
+        mpsc::Sender<StreamEvent>,
+        Arc<AtomicBool>,
+    ),
     Data(u64, Vec<u8>),
     Close(u64),
 }
 
+pub struct StreamEvents {
+    rx: mpsc::Receiver<StreamEvent>,
+    wake: Arc<Notify>,
+    wake_needed: Arc<AtomicBool>,
+}
+
+impl StreamEvents {
+    pub async fn recv(&mut self) -> Option<StreamEvent> {
+        let event = self.rx.recv().await;
+        if event.is_some() && self.wake_needed.swap(false, Ordering::AcqRel) {
+            self.wake.notify_one();
+        }
+        event
+    }
+}
+
+impl Drop for StreamEvents {
+    fn drop(&mut self) {
+        self.wake.notify_one();
+    }
+}
+
 #[derive(Clone)]
 pub struct Stack {
+    id: u64,
     tx: mpsc::Sender<Command>,
     phase: Arc<AtomicU8>,
     next_id: Arc<AtomicU64>,
+    wake: Arc<Notify>,
 }
 
 impl Stack {
     pub fn start() -> Self {
+        let id = NEXT_STACK_ID.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = mpsc::channel(COMMAND_QUEUE_CAPACITY);
         let phase = Arc::new(AtomicU8::new(StackPhase::Offline as u8));
         let worker_phase = phase.clone();
-        tokio::spawn(run(rx, worker_phase));
+        let wake = Arc::new(Notify::new());
+        tokio::spawn(run(id, rx, worker_phase, Arc::clone(&wake)));
         Self {
+            id,
             tx,
             phase,
             next_id: Arc::new(AtomicU64::new(1)),
+            wake,
         }
+    }
+
+    pub fn id(&self) -> u64 {
+        self.id
     }
 
     pub fn is_ready(&self) -> bool {
@@ -122,20 +160,25 @@ impl Stack {
             .map_err(|_| StackError::WorkerStopped)?
     }
 
-    pub async fn connect(
-        &self,
-        address: SocketAddrV4,
-    ) -> Result<(u64, mpsc::Receiver<StreamEvent>)> {
+    pub async fn connect(&self, address: SocketAddrV4) -> Result<(u64, StreamEvents)> {
         if !self.is_ready() {
             return Err(StackError::VpnDown);
         }
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = mpsc::channel(CONNECTION_EVENT_QUEUE_CAPACITY);
+        let wake_needed = Arc::new(AtomicBool::new(false));
         self.tx
-            .send(Command::Connect(id, address, tx))
+            .send(Command::Connect(id, address, tx, Arc::clone(&wake_needed)))
             .await
             .map_err(|_| StackError::WorkerStopped)?;
-        Ok((id, rx))
+        Ok((
+            id,
+            StreamEvents {
+                rx,
+                wake: Arc::clone(&self.wake),
+                wake_needed,
+            },
+        ))
     }
 
     pub fn data(&self, id: u64, data: Vec<u8>) -> Result<()> {

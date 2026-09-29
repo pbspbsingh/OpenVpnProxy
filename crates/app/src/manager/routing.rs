@@ -66,7 +66,7 @@ impl Shared {
             .filter(|host| host.stack.is_some())
             .count();
         self.ready.send_replace(ready);
-        tracing::info!(host_id = id, %endpoint, generation, ?elapsed, ready_hosts = ready, "VPN host ready");
+        tracing::info!(host_id = id, %endpoint, stack_id = stack.id(), generation, ?elapsed, ready_hosts = ready, "VPN host ready");
     }
 
     pub(super) fn down(&self, id: usize, shutdown: bool) {
@@ -147,7 +147,7 @@ impl RouteProvider for RouterHandle {
                 let stack = stack.clone();
                 let active = Arc::clone(&state.hosts[id].active);
                 let count = active.fetch_add(1, Ordering::Relaxed) + 1;
-                tracing::debug!(group = %key, host_id = id, active = count, "reused sticky VPN host");
+                tracing::debug!(group = %key, host_id = id, stack_id = stack.id(), active = count, "reused sticky VPN host");
                 return Some(HostLease {
                     stack,
                     active,
@@ -193,7 +193,7 @@ impl RouteProvider for RouterHandle {
         let stack = host.stack.as_ref()?.clone();
         let active = Arc::clone(&host.active);
         let count = active.fetch_add(1, Ordering::Relaxed) + 1;
-        tracing::info!(group = %key, host_id = id, endpoint = %host.endpoint, generation = host.generation, active = count, ready_hosts = ready.len(), "assigned domain group to VPN host");
+        tracing::info!(group = %key, host_id = id, stack_id = stack.id(), endpoint = %host.endpoint, generation = host.generation, active = count, ready_hosts = ready.len(), "assigned domain group to VPN host");
         Some(HostLease {
             stack,
             active,

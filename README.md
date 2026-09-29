@@ -57,7 +57,7 @@ The control channel establishes trust and derives data keys. The data channel ca
 
 ### Inside the packet stack
 
-`Stack` is a cloneable async handle. Its commands go to one `smoltcp` engine task; callers receive connection events through channels. The engine polls a virtual IP device, runs DNS and TCP state machines, and emits IPv4 packets to the app. The device is an in-memory packet queue, not a TUN interface. The engine uses a Tokio timer for polling, so the app does not need a dedicated OS thread for `smoltcp`.
+`Stack` is a cloneable async handle. Its commands go to one `smoltcp` engine task; callers receive connection events through channels. The engine polls a virtual IP device, runs DNS and TCP state machines, and emits IPv4 packets to the app. The device is an in-memory packet queue, not a TUN interface. The engine wakes for commands, consumed connection events, and the next TCP or application deadline; it does not need a dedicated OS thread for `smoltcp`.
 
 `smoltcp` supplies the TCP behavior a SOCKS client expects: connection setup, sequencing, acknowledgments, retransmission, and teardown. The SOCKS handler works with byte streams and connection events; it does not construct TCP or IP headers.
 
@@ -181,6 +181,8 @@ RUST_LOG=debug cargo run --release -p openvpn-proxy-app
 ```
 
 `RUST_LOG=info` shows discovered hosts, ready/down transitions, and new domain assignments. `RUST_LOG=debug` adds sticky reuse, retries, and per-host activity. `RUST_LOG=trace` adds packet flow details. `socks5_address = "0.0.0.0:1080"` accepts clients from other machines. The proxy has **no SOCKS authentication**, so choose the bind address and network exposure accordingly. `config.toml` contains credentials; it and `*.ovpn` are ignored by Git.
+
+For a browser speed test, run the release build with `RUST_LOG=debug`. `stack_id` links route, SOCKS, VPN host, and packet stack logs. A `SOCKS5 transfer summary` reports route, DNS, TCP connect, and transfer times plus bytes in each direction; `first_response` measures the first tunneled bytes after the SOCKS connection, which may be a TLS handshake. Active transfers and packet stacks also report 10-second traffic windows. `packet stack activity` includes command, timer, and consumer wakeups, timer lateness, time spent per pass, full 4 KiB reads, event queue stalls, and the largest queued TCP write. Share these summaries and the matching `VPN host traffic` lines when investigating a slow request; debug logs also contain destination names.
 
 ## Current scope
 

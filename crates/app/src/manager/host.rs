@@ -17,7 +17,7 @@ pub(super) const CONTROL_SETUP_ALLOWANCE: Duration = Duration::from_secs(50);
 const INITIAL_RETRY_DELAY: Duration = Duration::from_secs(2);
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(60);
 const STABLE_SESSION_WINDOW: Duration = Duration::from_secs(30);
-const HOST_STATUS_INTERVAL: Duration = Duration::from_secs(30);
+const HOST_STATUS_INTERVAL: Duration = Duration::from_secs(10);
 
 pub(super) struct HostWorker {
     pub(super) id: usize,
@@ -161,32 +161,54 @@ async fn drive_host(
     mut outbound: mpsc::Receiver<Vec<u8>>,
     stop: &mut watch::Receiver<bool>,
 ) -> Result<()> {
+    let started = Instant::now();
+    let stack_id = stack.id();
     let mut status = time::interval(HOST_STATUS_INTERVAL);
     status.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     let mut sent_packets = 0_u64;
     let mut received_packets = 0_u64;
-    loop {
-        if !stack.is_ready() {
-            bail!("VPN packet stack stopped");
-        }
-        tokio::select! {
-            _ = stop.changed() => return Ok(()),
-            packet = outbound.recv() => {
-                let packet = packet.context("VPN packet output channel closed")?;
-                tracing::trace!(host_id = id, %endpoint, bytes = packet.len(), "sending VPN packet");
-                session.send_packet(&packet).await?;
-                sent_packets += 1;
+    let mut sent_bytes = 0_u64;
+    let mut received_bytes = 0_u64;
+    let mut last_sent_bytes = 0_u64;
+    let mut last_received_bytes = 0_u64;
+    let mut last_status = Instant::now();
+    let mut max_send_time = Duration::ZERO;
+    let result = async {
+        loop {
+            if !stack.is_ready() {
+                bail!("VPN packet stack stopped");
             }
-            received = session.step() => {
-                if let Some(packet) = received? {
-                    tracing::trace!(host_id = id, %endpoint, bytes = packet.len(), "received VPN packet");
-                    stack.packet(&packet)?;
-                    received_packets += 1;
+            tokio::select! {
+                _ = stop.changed() => return Ok(()),
+                packet = outbound.recv() => {
+                    let packet = packet.context("VPN packet output channel closed")?;
+                    tracing::trace!(host_id = id, %endpoint, bytes = packet.len(), "sending VPN packet");
+                    let send_started = Instant::now();
+                    session.send_packet(&packet).await?;
+                    max_send_time = max_send_time.max(send_started.elapsed());
+                    sent_packets += 1;
+                    sent_bytes += packet.len() as u64;
+                }
+                received = session.step() => {
+                    if let Some(packet) = received? {
+                        tracing::trace!(host_id = id, %endpoint, bytes = packet.len(), "received VPN packet");
+                        stack.packet(&packet)?;
+                        received_packets += 1;
+                        received_bytes += packet.len() as u64;
+                    }
+                }
+                _ = status.tick() => {
+                    if sent_bytes != last_sent_bytes || received_bytes != last_received_bytes {
+                        tracing::debug!(host_id = id, %endpoint, stack_id, window = ?last_status.elapsed(), sent_packets, received_packets, sent_bytes, received_bytes, window_sent_bytes = sent_bytes - last_sent_bytes, window_received_bytes = received_bytes - last_received_bytes, ?max_send_time, "VPN host traffic");
+                    }
+                    last_sent_bytes = sent_bytes;
+                    last_received_bytes = received_bytes;
+                    last_status = Instant::now();
+                    max_send_time = Duration::ZERO;
                 }
             }
-            _ = status.tick() => {
-                tracing::debug!(host_id = id, %endpoint, sent_packets, received_packets, "VPN host activity");
-            }
         }
-    }
+    }.await;
+    tracing::debug!(host_id = id, %endpoint, stack_id, elapsed = ?started.elapsed(), sent_packets, received_packets, sent_bytes, received_bytes, outcome = if result.is_ok() { "shutdown" } else { "error" }, "VPN host traffic summary");
+    result
 }

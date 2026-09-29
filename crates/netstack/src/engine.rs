@@ -1,14 +1,14 @@
 use std::collections::{HashMap, VecDeque};
 use std::net::Ipv4Addr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::time::{Duration, Instant as Clock};
 
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
 use smoltcp::socket::{dns, tcp};
 use smoltcp::time::Instant;
 use smoltcp::wire::{DnsQueryType, HardwareAddress, IpAddress, IpCidr, Ipv4Address};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Notify, mpsc, oneshot};
 use tokio::time;
 
 use crate::device::PacketDevice;
@@ -17,7 +17,8 @@ use crate::stack::Command;
 use crate::types::{StackPhase, StreamEvent, TunnelConfig};
 
 const MAX_QUEUED_WRITE: usize = 256 * 1024;
-const TCP_BUFFER: usize = 32 * 1024;
+const TCP_RECEIVE_BUFFER_BYTES: usize = 256 * 1024;
+const TCP_SEND_BUFFER_BYTES: usize = 32 * 1024;
 const IPV4_HOST_PREFIX_BITS: u8 = 32;
 const EPHEMERAL_PORT_START: u16 = 40_000;
 const EPHEMERAL_PORT_END: u16 = 60_000;
@@ -25,11 +26,31 @@ const MAX_CONNECTIONS: usize = 256;
 const DNS_QUERY_TIMEOUT: Duration = Duration::from_secs(10);
 const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const TCP_READ_BUFFER_BYTES: usize = 4096;
-const ENGINE_TICK_INTERVAL: Duration = Duration::from_millis(10);
+const STACK_STATUS_INTERVAL: Duration = Duration::from_secs(10);
+
+#[derive(Default)]
+struct StackStats {
+    polls: u64,
+    inbound_packets: u64,
+    inbound_bytes: u64,
+    outbound_packets: u64,
+    outbound_bytes: u64,
+    tcp_read_bytes: u64,
+    tcp_write_bytes: u64,
+    full_tcp_reads: u64,
+    event_queue_blocked: u64,
+    max_write_queue_bytes: usize,
+    command_wakeups: u64,
+    timer_wakeups: u64,
+    consumer_wakeups: u64,
+    max_timer_lateness: Duration,
+    max_tick_time: Duration,
+}
 
 struct Connection {
     socket: SocketHandle,
     events: mpsc::Sender<StreamEvent>,
+    wake_needed: Arc<AtomicBool>,
     write_queue: VecDeque<u8>,
     established: bool,
     deadline: Clock,
@@ -43,6 +64,7 @@ struct PendingDns {
 }
 
 struct Engine {
+    id: u64,
     iface: Interface,
     device: PacketDevice,
     sockets: SocketSet<'static>,
@@ -52,10 +74,12 @@ struct Engine {
     connections: HashMap<u64, Connection>,
     next_port: u16,
     io: mpsc::Sender<Vec<u8>>,
+    stats: StackStats,
+    last_status: Clock,
 }
 
 impl Engine {
-    fn new(config: TunnelConfig, io: mpsc::Sender<Vec<u8>>) -> Result<Self> {
+    fn new(id: u64, config: TunnelConfig, io: mpsc::Sender<Vec<u8>>) -> Result<Self> {
         let mut device = PacketDevice::new(config.mtu);
         let mut iface =
             Interface::new(Config::new(HardwareAddress::Ip), &mut device, Instant::ZERO);
@@ -82,6 +106,7 @@ impl Engine {
         let dns_socket = sockets.add(dns::Socket::new(&servers, vec![]));
         tracing::debug!(local = %config.local, gateway = %config.gateway, mtu = config.mtu, dns_servers = servers.len(), "userspace packet stack initialized");
         Ok(Self {
+            id,
             iface,
             device,
             sockets,
@@ -91,12 +116,16 @@ impl Engine {
             connections: HashMap::new(),
             next_port: EPHEMERAL_PORT_START,
             io,
+            stats: StackStats::default(),
+            last_status: Clock::now(),
         })
     }
 
     fn handle(&mut self, command: Command) {
         match command {
             Command::Packet(packet) => {
+                self.stats.inbound_packets += 1;
+                self.stats.inbound_bytes += packet.len() as u64;
                 tracing::trace!(bytes = packet.len(), "packet delivered to userspace stack");
                 self.device.inbound.push_back(packet);
             }
@@ -121,16 +150,16 @@ impl Engine {
                     }
                 }
             }
-            Command::Connect(id, address, events) => {
+            Command::Connect(id, address, events, wake_needed) => {
                 if self.connections.len() >= MAX_CONNECTIONS {
                     tracing::warn!(id, %address, "userspace TCP connection limit reached");
                     let _ = events.try_send(StreamEvent::Closed);
                     return;
                 }
-                tracing::debug!(id, %address, "opening userspace TCP connection");
+                tracing::debug!(id, %address, receive_buffer_bytes = TCP_RECEIVE_BUFFER_BYTES, send_buffer_bytes = TCP_SEND_BUFFER_BYTES, "opening userspace TCP connection");
                 let socket = tcp::Socket::new(
-                    tcp::SocketBuffer::new(vec![0; TCP_BUFFER]),
-                    tcp::SocketBuffer::new(vec![0; TCP_BUFFER]),
+                    tcp::SocketBuffer::new(vec![0; TCP_RECEIVE_BUFFER_BYTES]),
+                    tcp::SocketBuffer::new(vec![0; TCP_SEND_BUFFER_BYTES]),
                 );
                 let handle = self.sockets.add(socket);
                 let port = self.next_port;
@@ -151,6 +180,7 @@ impl Engine {
                             Connection {
                                 socket: handle,
                                 events,
+                                wake_needed,
                                 write_queue: VecDeque::new(),
                                 established: false,
                                 deadline: Clock::now() + TCP_CONNECT_TIMEOUT,
@@ -176,6 +206,10 @@ impl Engine {
                         self.close(id);
                     } else {
                         connection.write_queue.extend(data);
+                        self.stats.max_write_queue_bytes = self
+                            .stats
+                            .max_write_queue_bytes
+                            .max(connection.write_queue.len());
                     }
                 }
             }
@@ -193,8 +227,12 @@ impl Engine {
     }
 
     fn tick(&mut self, now: Instant) -> Result<()> {
+        let started = Clock::now();
+        self.stats.polls += 1;
         self.iface.poll(now, &mut self.device, &mut self.sockets);
         while let Some(packet) = self.device.outbound.pop_front() {
+            self.stats.outbound_packets += 1;
+            self.stats.outbound_bytes += packet.len() as u64;
             tracing::trace!(bytes = packet.len(), "userspace stack produced VPN packet");
             self.io
                 .try_send(packet)
@@ -229,6 +267,10 @@ impl Engine {
         let mut close = Vec::new();
         for (&id, connection) in &mut self.connections {
             let socket = self.sockets.get_mut::<tcp::Socket>(connection.socket);
+            if connection.events.is_closed() {
+                close.push(id);
+                continue;
+            }
             if !connection.established && socket.state() == tcp::State::Established {
                 connection.established = true;
                 tracing::debug!(id, "userspace TCP connection established");
@@ -253,6 +295,7 @@ impl Engine {
                     let data = connection.write_queue.make_contiguous();
                     match socket.send_slice(data) {
                         Ok(written) => {
+                            self.stats.tcp_write_bytes += written as u64;
                             tracing::trace!(id, bytes = written, "userspace TCP data queued");
                             connection.write_queue.drain(..written);
                         }
@@ -263,10 +306,18 @@ impl Engine {
                         }
                     }
                 }
+                if socket.can_recv() && connection.events.capacity() == 0 {
+                    self.stats.event_queue_blocked += 1;
+                    connection.wake_needed.store(true, Ordering::Release);
+                }
                 if socket.can_recv() && connection.events.capacity() > 0 {
                     let mut buffer = vec![0; TCP_READ_BUFFER_BYTES];
                     match socket.recv_slice(&mut buffer) {
                         Ok(read) => {
+                            self.stats.tcp_read_bytes += read as u64;
+                            if read == TCP_READ_BUFFER_BYTES {
+                                self.stats.full_tcp_reads += 1;
+                            }
                             tracing::trace!(id, bytes = read, "userspace TCP data received");
                             buffer.truncate(read);
                             if read > 0
@@ -290,10 +341,73 @@ impl Engine {
         for id in close {
             self.close(id);
         }
+        self.stats.max_tick_time = self.stats.max_tick_time.max(started.elapsed());
         Ok(())
     }
 
+    fn next_delay(&mut self, now: Instant) -> Option<Duration> {
+        if self.connections.values().any(|connection| {
+            let socket = self.sockets.get::<tcp::Socket>(connection.socket);
+            connection.events.is_closed()
+                || (socket.can_recv() && connection.events.capacity() > 0)
+                || (!connection.write_queue.is_empty() && socket.can_send())
+        }) {
+            return Some(Duration::ZERO);
+        }
+
+        let current = Clock::now();
+        let application_delay = self
+            .pending_dns
+            .iter()
+            .map(|request| request.deadline.saturating_duration_since(current))
+            .chain(
+                self.connections
+                    .values()
+                    .filter(|connection| !connection.established)
+                    .map(|connection| connection.deadline.saturating_duration_since(current)),
+            )
+            .min();
+        let protocol_delay = self
+            .iface
+            .poll_delay(now, &self.sockets)
+            .map(|delay| Duration::from_millis(delay.total_millis()));
+        protocol_delay.into_iter().chain(application_delay).min()
+    }
+
+    fn log_status(&mut self) {
+        let window = self.last_status.elapsed();
+        self.last_status = Clock::now();
+        let stats = std::mem::take(&mut self.stats);
+        if stats.inbound_packets == 0 && stats.outbound_packets == 0 && self.connections.is_empty()
+        {
+            return;
+        }
+        tracing::debug!(
+            stack_id = self.id,
+            ?window,
+            connections = self.connections.len(),
+            pending_dns = self.pending_dns.len(),
+            polls = stats.polls,
+            inbound_packets = stats.inbound_packets,
+            inbound_bytes = stats.inbound_bytes,
+            outbound_packets = stats.outbound_packets,
+            outbound_bytes = stats.outbound_bytes,
+            tcp_read_bytes = stats.tcp_read_bytes,
+            tcp_write_bytes = stats.tcp_write_bytes,
+            full_tcp_reads = stats.full_tcp_reads,
+            event_queue_blocked = stats.event_queue_blocked,
+            max_write_queue_bytes = stats.max_write_queue_bytes,
+            command_wakeups = stats.command_wakeups,
+            timer_wakeups = stats.timer_wakeups,
+            consumer_wakeups = stats.consumer_wakeups,
+            max_timer_lateness = ?stats.max_timer_lateness,
+            max_tick_time = ?stats.max_tick_time,
+            "packet stack activity"
+        );
+    }
+
     fn shutdown(mut self) {
+        self.log_status();
         tracing::info!(
             connections = self.connections.len(),
             pending_dns = self.pending_dns.len(),
@@ -308,23 +422,68 @@ impl Engine {
     }
 }
 
-pub(crate) async fn run(mut rx: mpsc::Receiver<Command>, phase: Arc<AtomicU8>) {
+enum Wake {
+    Command(Option<Command>),
+    Timer,
+    Consumer,
+}
+
+async fn wait_for_timer(delay: Option<Duration>) {
+    match delay {
+        Some(delay) => time::sleep(delay).await,
+        None => std::future::pending().await,
+    }
+}
+
+pub(crate) async fn run(
+    id: u64,
+    mut rx: mpsc::Receiver<Command>,
+    phase: Arc<AtomicU8>,
+    wake: Arc<Notify>,
+) {
     let started = Clock::now();
     let mut engine: Option<Engine> = None;
-    let mut ticker = time::interval(ENGINE_TICK_INTERVAL);
-    ticker.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+    let mut status = time::interval(STACK_STATUS_INTERVAL);
+    status.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     loop {
-        let command = tokio::select! {
-            command = rx.recv() => Some(command),
-            _ = ticker.tick() => None,
+        let delay = engine.as_mut().and_then(|active| {
+            let elapsed = started.elapsed().as_millis().min(i64::MAX as u128) as i64;
+            active.next_delay(Instant::from_millis(elapsed))
+        });
+        let timer_started = Clock::now();
+        let event = tokio::select! {
+            command = rx.recv() => Wake::Command(command),
+            _ = wait_for_timer(delay) => Wake::Timer,
+            _ = wake.notified() => Wake::Consumer,
+            _ = status.tick() => {
+                if let Some(active) = &mut engine {
+                    active.log_status();
+                }
+                continue;
+            }
         };
-        match command {
-            Some(Some(Command::Configure(config, io, reply))) => {
+        if let Some(active) = &mut engine {
+            match &event {
+                Wake::Command(_) => active.stats.command_wakeups += 1,
+                Wake::Timer => {
+                    active.stats.timer_wakeups += 1;
+                    if let Some(delay) = delay {
+                        active.stats.max_timer_lateness = active
+                            .stats
+                            .max_timer_lateness
+                            .max(timer_started.elapsed().saturating_sub(delay));
+                    }
+                }
+                Wake::Consumer => active.stats.consumer_wakeups += 1,
+            }
+        }
+        match event {
+            Wake::Command(Some(Command::Configure(config, io, reply))) => {
                 phase.store(StackPhase::Offline as u8, Ordering::Release);
                 if let Some(old) = engine.take() {
                     old.shutdown();
                 }
-                match Engine::new(config, io) {
+                match Engine::new(id, config, io) {
                     Ok(new) => {
                         engine = Some(new);
                         phase.store(StackPhase::Configured as u8, Ordering::Release);
@@ -337,22 +496,22 @@ pub(crate) async fn run(mut rx: mpsc::Receiver<Command>, phase: Arc<AtomicU8>) {
                     }
                 }
             }
-            Some(Some(Command::Reset)) => {
+            Wake::Command(Some(Command::Reset)) => {
                 tracing::debug!("resetting userspace packet stack");
                 phase.store(StackPhase::Offline as u8, Ordering::Release);
                 if let Some(old) = engine.take() {
                     old.shutdown();
                 }
             }
-            Some(Some(command)) => {
+            Wake::Command(Some(command)) => {
                 if let Some(engine) = &mut engine {
                     engine.handle(command);
                 } else {
                     reject_without_tunnel(command);
                 }
             }
-            Some(None) => break,
-            None => {}
+            Wake::Command(None) => break,
+            Wake::Timer | Wake::Consumer => {}
         }
         if phase.load(Ordering::Acquire) == StackPhase::Failed as u8
             && let Some(old) = engine.take()
@@ -381,7 +540,7 @@ fn reject_without_tunnel(command: Command) {
         Command::Resolve(_, reply) => {
             let _ = reply.send(Err(StackError::VpnDown));
         }
-        Command::Connect(_, _, events) => {
+        Command::Connect(_, _, events, _) => {
             let _ = events.try_send(StreamEvent::Closed);
         }
         _ => {}

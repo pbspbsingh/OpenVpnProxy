@@ -7,7 +7,10 @@ const WS_STALE_MS = WS_INTERVAL_MS * 4;
 const WS_HEALTH_CHECK_MS = 2_000;
 const MAX_RATE_SAMPLE_GAP_SECONDS = WS_STALE_MS / 1000;
 const COLORS = { rx: "#42d5c8", tx: "#8f9dff", latency: "#f1bd77" };
+const INITIAL_VISIBLE_LOG_ROWS = 2000;
+const LOG_LEVEL_RANK = { TRACE: 0, DEBUG: 1, INFO: 2, WARN: 3, ERROR: 4 };
 const state = { frame: null, previous: null, rates: null, hostRates: new Map(), selectedHostId: null, tab: "overview", socket: null, retryMs: 1000, lastMessageAt: 0, groupHostId: null, groupItems: [], groupTotal: 0, groupRequest: null, profileLoaded: false, profileRequest: false };
+const logState = { socket: null, retryMs: 1000, retryTimer: null, entries: [], head: 0, matchingCount: 0, capacity: 1000, lastSequence: 0, visibleLimit: INITIAL_VISIBLE_LOG_ROWS, pending: [], renderScheduled: false };
 const $ = (id) => document.getElementById(id);
 
 function text(id, value) { $(id).textContent = value; }
@@ -59,6 +62,135 @@ function connect() {
     state.retryMs = Math.min(state.retryMs * 2, 10000);
     window.setTimeout(connect, delay);
   };
+}
+
+function connectLogs() {
+  if (state.tab !== "logs" || logState.socket) return;
+  text("log-status", "Connecting");
+  const scheme = location.protocol === "https:" ? "wss:" : "ws:";
+  const socket = new WebSocket(`${scheme}//${location.host}/ws/logs`);
+  logState.socket = socket;
+  socket.onopen = () => { logState.retryMs = 1000; text("log-status", "Live"); };
+  socket.onmessage = (event) => {
+    let message;
+    try { message = JSON.parse(event.data); } catch { return; }
+    if (message.type === "reset") {
+      logState.capacity = message.capacity;
+      logState.entries = [];
+      logState.head = 0;
+      logState.matchingCount = 0;
+      logState.lastSequence = 0;
+      logState.visibleLimit = INITIAL_VISIBLE_LOG_ROWS;
+      logState.pending = [];
+      updateLogDropped(message.dropped);
+      renderLogs();
+    } else if (message.type === "batch" && Array.isArray(message.entries)) {
+      for (const entry of message.entries) appendLog(entry);
+      scheduleLogRender();
+    } else if (message.type === "entry" && message.entry?.sequence > logState.lastSequence) {
+      appendLog(message.entry);
+      scheduleLogRender();
+    } else if (message.type === "dropped") {
+      updateLogDropped(message.count);
+    }
+  };
+  socket.onerror = () => socket.close();
+  socket.onclose = () => {
+    if (logState.socket !== socket) return;
+    logState.socket = null;
+    if (state.tab !== "logs") return;
+    text("log-status", "Reconnecting");
+    const delay = logState.retryMs;
+    logState.retryMs = Math.min(logState.retryMs * 2, 10000);
+    logState.retryTimer = window.setTimeout(() => { logState.retryTimer = null; connectLogs(); }, delay);
+  };
+}
+
+function disconnectLogs() {
+  if (logState.retryTimer != null) window.clearTimeout(logState.retryTimer);
+  logState.retryTimer = null;
+  const socket = logState.socket;
+  logState.socket = null;
+  if (socket) socket.close();
+  text("log-status", "Paused while tab is closed");
+}
+
+function updateLogDropped(count) {
+  const node = $("log-dropped");
+  node.hidden = !count;
+  node.textContent = count ? `${count.toLocaleString()} dropped during overload` : "";
+}
+
+function logRow(entry) {
+  const row = make("div", "log-row");
+  const timestamp = make("span", "log-time", new Date(entry.timestamp_ms).toLocaleTimeString());
+  const level = make("span", `log-level ${entry.level}`, entry.level);
+  const target = make("span", "log-target", entry.target);
+  target.title = entry.target;
+  row.dataset.sequence = entry.sequence;
+  row.append(timestamp, level, target, make("span", "log-message", entry.message));
+  return row;
+}
+
+function logMatches(entry) {
+  const minimum = $("log-level").value;
+  return minimum === "ALL" || (LOG_LEVEL_RANK[entry.level] ?? -1) >= LOG_LEVEL_RANK[minimum];
+}
+
+function appendLog(entry) {
+  if (entry.sequence <= logState.lastSequence) return;
+  logState.lastSequence = entry.sequence;
+  logState.entries.push(entry);
+  logState.pending.push(entry);
+  if (logMatches(entry)) logState.matchingCount++;
+  if (logState.entries.length - logState.head > logState.capacity) {
+    if (logMatches(logState.entries[logState.head])) logState.matchingCount--;
+    logState.head++;
+  }
+  if (logState.head >= logState.capacity) {
+    logState.entries = logState.entries.slice(logState.head);
+    logState.head = 0;
+  }
+}
+
+function renderLogs() {
+  logState.pending = [];
+  const scroll = $("log-scroll");
+  const follow = scroll.scrollHeight - scroll.scrollTop - scroll.clientHeight < 40;
+  const fragment = document.createDocumentFragment();
+  const matching = logState.entries.slice(logState.head).filter(logMatches);
+  logState.matchingCount = matching.length;
+  for (const entry of matching.slice(-logState.visibleLimit)) fragment.append(logRow(entry));
+  $("log-rows").replaceChildren(fragment);
+  updateLogCount();
+  if (follow) scroll.scrollTop = scroll.scrollHeight;
+}
+
+function updateLogCount() {
+  text("log-count", `${Math.min(logState.matchingCount, logState.visibleLimit).toLocaleString()} of ${logState.matchingCount.toLocaleString()} matching · ${(logState.entries.length - logState.head).toLocaleString()} buffered`);
+  $("logs-older").hidden = logState.matchingCount <= logState.visibleLimit;
+}
+
+function scheduleLogRender() {
+  if (logState.renderScheduled) return;
+  logState.renderScheduled = true;
+  requestAnimationFrame(() => {
+    logState.renderScheduled = false;
+    const pending = logState.pending.splice(0);
+    if (pending.length === 0) return;
+    if (pending.length >= logState.visibleLimit) { renderLogs(); return; }
+    const scroll = $("log-scroll");
+    const follow = scroll.scrollHeight - scroll.scrollTop - scroll.clientHeight < 40;
+    const rows = $("log-rows");
+    const fragment = document.createDocumentFragment();
+    for (const entry of pending) if (logMatches(entry)) fragment.append(logRow(entry));
+    rows.append(fragment);
+    const oldest = logState.entries[logState.head]?.sequence ?? 0;
+    while (rows.firstElementChild && Number(rows.firstElementChild.dataset.sequence) < oldest) rows.firstElementChild.remove();
+    while (rows.childElementCount > logState.visibleLimit) rows.firstElementChild.remove();
+    updateLogCount();
+    if (follow) scroll.scrollTop = scroll.scrollHeight;
+  });
 }
 
 function updateRates(snapshot) {
@@ -376,6 +508,7 @@ function drawChart(canvas, series, unit, sampledAtMs, latencyScale = false) {
 }
 
 document.querySelectorAll(".tab").forEach((button) => button.addEventListener("click", () => {
+  const previousTab = state.tab;
   state.tab = button.dataset.tab;
   document.querySelectorAll(".tab").forEach((tab) => {
     const active = tab === button;
@@ -385,6 +518,8 @@ document.querySelectorAll(".tab").forEach((button) => button.addEventListener("c
   document.querySelectorAll(".tab-panel").forEach((panel) => { panel.hidden = panel.id !== state.tab; });
   if (state.tab === "hosts" && state.selectedHostId != null && state.groupItems.length === 0) loadGroups();
   if (state.tab === "profile" && !state.profileLoaded) loadProfile();
+  if (state.tab === "logs") connectLogs();
+  else if (previousTab === "logs") disconnectLogs();
   requestAnimationFrame(renderCharts);
 }));
 $("host-list").addEventListener("click", (event) => {
@@ -395,6 +530,8 @@ $("host-list").addEventListener("click", (event) => {
 });
 $("groups-refresh").addEventListener("click", () => loadGroups());
 $("groups-more").addEventListener("click", () => loadGroups(true));
+$("log-level").addEventListener("change", renderLogs);
+$("logs-older").addEventListener("click", () => { logState.visibleLimit += INITIAL_VISIBLE_LOG_ROWS; renderLogs(); $("log-scroll").scrollTop = 0; });
 window.setInterval(() => {
   if (state.tab === "hosts" && state.groupItems.length <= 100) loadGroups();
 }, 10000);

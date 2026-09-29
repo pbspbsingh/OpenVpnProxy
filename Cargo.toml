@@ -57,5 +57,8 @@ ovpn-ui = { path = "crates/ui" }
 
 
 [profile.release]
+opt-level = "s"
+panic = "abort"
 lto = true
 strip = true
+codegen-units = 1

@@ -27,6 +27,7 @@
       <button class="tab" type="button" role="tab" aria-selected="false" aria-controls="hosts" data-tab="hosts">Hosts</button>
       <button class="tab" type="button" role="tab" aria-selected="false" aria-controls="routing" data-tab="routing">Routing</button>
       <button class="tab" type="button" role="tab" aria-selected="false" aria-controls="profile" data-tab="profile">Profile</button>
+      <button class="tab" type="button" role="tab" aria-selected="false" aria-controls="logs" data-tab="logs">Logs</button>
     </nav>
 
     <main>
@@ -79,6 +80,14 @@
           <article class="panel routing-summary"><div class="eyebrow">POLICY</div><h3>Authentication and routes</h3><div class="routing-row"><span>Username/password</span><strong id="profile-credentials">—</strong></div><div class="routing-row"><span>Certificate authority</span><strong>Inline CA required</strong></div><div class="routing-row"><span>Server certificate purpose</span><strong id="profile-server-purpose">—</strong></div><div class="routing-row"><span>Control protection</span><strong>tls-crypt v1</strong></div><div class="routing-row"><span>IPv6 policy</span><strong id="profile-ipv6">—</strong></div></article>
         </div>
         <article class="panel table-panel"><div class="panel-heading"><div><div class="eyebrow">PROFILE DIRECTIVES</div><h3>VPN remotes</h3></div><span id="profile-status" class="muted">Loading profile summary…</span></div><div class="table-scroll"><table><thead><tr><th>#</th><th>Hostname or IP</th><th>Port</th></tr></thead><tbody id="profile-remotes"></tbody></table></div></article>
+      </section>
+
+      <section id="logs" class="tab-panel" role="tabpanel" hidden>
+        <div class="section-heading"><div><div class="eyebrow">LIVE DIAGNOSTICS</div><h2>Logs</h2></div><div id="log-status" class="range-pill" aria-live="polite">Opens when this tab is selected</div></div>
+        <article class="panel logs-panel">
+          <div class="logs-toolbar"><span id="log-count">0 recent events</span><button id="logs-older" type="button" hidden>Show older</button><label for="log-level">Minimum level</label><select id="log-level"><option value="ALL">All</option><option value="TRACE">Trace</option><option value="DEBUG">Debug</option><option value="INFO">Info</option><option value="WARN">Warn</option><option value="ERROR">Error</option></select><span id="log-dropped" class="log-dropped" hidden></span></div>
+          <div id="log-scroll" class="logs-scroll" role="log" aria-label="Recent application logs"><div id="log-rows" class="log-rows"></div></div>
+        </article>
       </section>
     </main>
     <footer>Read-only dashboard <span>·</span> Live status via WebSocket <span>·</span> Counters and chart history reset when the app restarts</footer>

@@ -2,23 +2,26 @@ use std::net::SocketAddr;
 
 use anyhow::{Context, Result, anyhow, bail};
 use ovpn_profile::Profile;
+use ovpn_ui::LogHub;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tokio::task::{JoinError, JoinHandle};
 
-use crate::config::{AppConfig, config_path, load_config};
+use crate::config::AppConfig;
 use crate::dashboard::DashboardSource;
 use crate::manager::{ConnectionManager, RouterHandle, summarize_profile};
 
-pub(crate) async fn run() -> Result<()> {
-    let config = load_config(&config_path()?).await?;
+pub(crate) async fn run(config: AppConfig, logs: Option<LogHub>) -> Result<()> {
     match config.webui_address {
-        Some(address) => run_with_dashboard(config, address).await,
+        Some(address) => {
+            let logs = logs.ok_or_else(|| anyhow!("dashboard log buffer unavailable"))?;
+            run_with_dashboard(config, address, logs).await
+        }
         None => run_without_dashboard(config).await,
     }
 }
 
-async fn run_with_dashboard(config: AppConfig, address: SocketAddr) -> Result<()> {
+async fn run_with_dashboard(config: AppConfig, address: SocketAddr, logs: LogHub) -> Result<()> {
     let webui_listener = TcpListener::bind(address)
         .await
         .with_context(|| format!("cannot bind dashboard on {address}"))?;
@@ -28,6 +31,7 @@ async fn run_with_dashboard(config: AppConfig, address: SocketAddr) -> Result<()
         webui_listener,
         source.clone(),
         shutdown.subscribe(),
+        logs,
     ));
 
     let startup = tokio::select! {

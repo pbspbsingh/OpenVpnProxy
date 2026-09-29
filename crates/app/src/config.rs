@@ -6,6 +6,9 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
+const DEFAULT_DASHBOARD_LOG_CAPACITY: usize = 1000;
+const MAX_DASHBOARD_LOG_CAPACITY: usize = 20_000;
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct AppConfig {
@@ -14,8 +17,16 @@ pub(crate) struct AppConfig {
     pub(crate) password: String,
     pub(crate) socks5_address: SocketAddr,
     pub(crate) webui_address: Option<SocketAddr>,
+    pub(crate) dashboard_log_capacity: Option<NonZeroUsize>,
     pub(crate) dns_override: Option<Ipv4Addr>,
     pub(crate) max_active_vpn_hosts: Option<NonZeroUsize>,
+}
+
+impl AppConfig {
+    pub(crate) fn dashboard_log_capacity(&self) -> NonZeroUsize {
+        self.dashboard_log_capacity
+            .unwrap_or(NonZeroUsize::new(DEFAULT_DASHBOARD_LOG_CAPACITY).unwrap())
+    }
 }
 
 pub(crate) fn config_path() -> Result<PathBuf> {
@@ -40,6 +51,9 @@ pub(crate) async fn load_config(path: &Path) -> Result<AppConfig> {
     })?;
     if !config.socks5_address.is_ipv4() {
         bail!("socks5_address must be an IPv4 address");
+    }
+    if config.dashboard_log_capacity().get() > MAX_DASHBOARD_LOG_CAPACITY {
+        bail!("dashboard_log_capacity must be at most {MAX_DASHBOARD_LOG_CAPACITY}");
     }
     if config.profile_path.is_relative() {
         let parent = path

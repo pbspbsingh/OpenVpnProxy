@@ -1,11 +1,14 @@
 mod app;
 mod config;
 mod dashboard;
+mod logging;
 mod manager;
 
 use std::env;
 
 use anyhow::{Context, Result};
+use ovpn_ui::LogHub;
+use tracing_subscriber::prelude::*;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
@@ -16,9 +19,20 @@ async fn main() -> Result<()> {
         }
         Err(_) => (tracing_subscriber::EnvFilter::new("info"), None),
     };
-    tracing_subscriber::fmt().with_env_filter(filter).init();
+    let config = config::load_config(&config::config_path()?).await?;
+    let (logs, log_layer) = if config.webui_address.is_some() {
+        let (hub, input) = LogHub::start(config.dashboard_log_capacity());
+        (Some(hub), Some(logging::DashboardLogLayer::new(input)))
+    } else {
+        (None, None)
+    };
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(tracing_subscriber::fmt::layer())
+        .with(log_layer)
+        .init();
     if let Some(error) = filter_error {
         return Err(error).context("invalid RUST_LOG filter");
     }
-    app::run().await
+    app::run(config, logs).await
 }

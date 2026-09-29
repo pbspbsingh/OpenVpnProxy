@@ -59,6 +59,7 @@ main { min-height: 0; padding-top: 14px; overflow: hidden; }
 #hosts { grid-template-rows: auto minmax(0, 1fr); }
 #routing { grid-template-rows: auto auto minmax(0, 1fr); }
 #profile { grid-template-rows: auto auto minmax(0, 1fr); }
+#logs { grid-template-rows: auto minmax(0, 1fr); }
 .section-heading { display: flex; justify-content: space-between; align-items: flex-end; gap: 20px; }
 .range-pill { border: 1px solid var(--border); border-radius: 999px; padding: 6px 10px; color: var(--muted); font-size: 11px; white-space: nowrap; background: rgba(255,255,255,.02); }
 .range-pill span, footer span { color: var(--faint); padding: 0 4px; }
@@ -147,6 +148,22 @@ td:first-child { color: var(--text); font-weight: 640; }
 .table-state.ready::before { background: var(--good); }.table-state.connecting::before, .table-state.backoff::before { background: var(--warn); }
 footer { margin-top: 9px; padding-top: 8px; border-top: 1px solid var(--border); color: var(--faint); font-size: 11px; }
 
+.logs-panel { min-height: 0; display: flex; flex-direction: column; overflow: hidden; }
+.logs-toolbar { min-height: 43px; display: flex; align-items: center; gap: 12px; padding: 0 15px; border-bottom: 1px solid var(--border); color: var(--muted); font-size: 11px; }
+.logs-toolbar > span:first-child { margin-right: auto; font-variant-numeric: tabular-nums; }
+.logs-toolbar button { color: var(--rx); background: transparent; border: 0; cursor: pointer; font-size: 11px; }
+.logs-toolbar select { color: var(--text); background: var(--surface-raised); border: 1px solid var(--border); border-radius: 6px; padding: 4px 8px; font: inherit; }
+.log-dropped { color: var(--warn); }
+.logs-scroll { flex: 1; min-height: 0; overflow: auto; scrollbar-color: var(--border) transparent; font: 11px/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+.log-rows { min-width: min-content; }
+.log-row { display: grid; grid-template-columns: 88px 52px minmax(160px, 230px) minmax(0, 1fr); gap: 12px; padding: 5px 14px; border-bottom: 1px solid rgba(112,139,164,.08); }
+.log-row:hover { background: rgba(255,255,255,.025); }
+.log-time, .log-target { color: var(--faint); }
+.log-target { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.log-message { color: var(--text); white-space: pre-wrap; overflow-wrap: anywhere; }
+.log-level { font-weight: 700; }
+.log-level.TRACE { color: var(--faint); }.log-level.DEBUG { color: var(--tx); }.log-level.INFO { color: var(--good); }.log-level.WARN { color: var(--warn); }.log-level.ERROR { color: var(--bad); }
+
 @media (max-width: 1050px) {
   .host-layout { grid-template-columns: minmax(205px, 260px) minmax(0, 1fr); }
   .host-detail-header { grid-template-columns: 1fr auto; }
@@ -176,6 +193,7 @@ footer { margin-top: 9px; padding-top: 8px; border-top: 1px solid var(--border);
   .groups-panel { height: 320px; }
   .routing-grid, .profile-grid { margin-bottom: 12px; }
   .table-panel { max-height: 320px; }
+  .logs-panel { height: 65vh; min-height: 320px; }
 }
 @media (max-width: 450px) {
   .host-list { grid-template-columns: 1fr; }.feed-status { padding: 8px 10px; }

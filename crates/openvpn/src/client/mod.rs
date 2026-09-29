@@ -2,7 +2,7 @@ mod key_method;
 mod push;
 mod tls;
 
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::{Duration, Instant};
 
 use tokio::net::UdpSocket;
@@ -39,8 +39,23 @@ pub struct SessionConfig {
 pub struct TunnelSettings {
     pub local: Ipv4Addr,
     pub gateway: Ipv4Addr,
-    pub dns: Vec<Ipv4Addr>,
+    pub dns: Vec<IpAddr>,
     pub mtu: usize,
+    pub ipv6: Option<Ipv6TunnelSettings>,
+}
+
+#[derive(Clone, Debug)]
+pub struct Ipv6TunnelSettings {
+    pub local: Ipv6Addr,
+    pub prefix_len: u8,
+    pub routes: Vec<Ipv6Route>,
+}
+
+#[derive(Clone, Debug)]
+pub struct Ipv6Route {
+    pub network: Ipv6Addr,
+    pub prefix_len: u8,
+    pub gateway: Ipv6Addr,
 }
 
 pub struct Session {
@@ -121,7 +136,7 @@ impl Session {
         let push = read_push(&mut link).await?;
         let (tunnel, peer_id, ping_interval, restart_interval) = parse_push(&push)?;
         let pushed_auth = pushed_auth_token(&push)?;
-        tracing::debug!(peer_id, local = %tunnel.local, gateway = %tunnel.gateway, mtu = tunnel.mtu, dns_servers = tunnel.dns.len(), ?ping_interval, ?restart_interval, "OpenVPN server settings accepted");
+        tracing::debug!(peer_id, local = %tunnel.local, gateway = %tunnel.gateway, mtu = tunnel.mtu, dns_servers = tunnel.dns.len(), ipv6_routes = tunnel.ipv6.as_ref().map_or(0, |ipv6| ipv6.routes.len()), ?ping_interval, ?restart_interval, "OpenVPN server settings accepted");
         let mut key = [0; DATA_KEY_MATERIAL_BYTES];
         link.tls()
             .export_keying_material(&mut key, b"EXPORTER-OpenVPN-datakeys", None)?;

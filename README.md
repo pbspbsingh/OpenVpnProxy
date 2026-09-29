@@ -7,7 +7,7 @@ This Rust workspace is a userspace OpenVPN SOCKS5 proof of concept. An applicati
 There are **two distinct TCP connections** in a proxied HTTPS request:
 
 1. The application opens a normal OS TCP connection to the local SOCKS5 listener. SOCKS5 is a short negotiation in which the application asks the proxy to connect to a destination. The application then sends its ordinary HTTPS bytes over that connection.
-2. `smoltcp` creates a separate, virtual TCP connection to the destination. It turns those bytes into TCP segments inside IPv4 packets. The OpenVPN client encrypts those IP packets and sends them as UDP datagrams to the VPN server. The server forwards them to the destination.
+2. `smoltcp` creates a separate, virtual TCP connection to the destination. It turns those bytes into TCP segments inside IPv4 or IPv6 packets. The OpenVPN client encrypts those IP packets and sends them as UDP datagrams to the VPN server. The server forwards them to the destination.
 
 The OS handles the first TCP connection and the UDP sockets to VPN servers. `smoltcp` handles the destination TCP connection. No OS socket connects directly to the requested website. HTTPS encryption remains between the application and the website; this proxy forwards its bytes and does not terminate HTTPS.
 
@@ -16,7 +16,7 @@ Application ── local TCP / SOCKS5 ──> Proxy
                                       │
                                       ▼
                               smoltcp: DNS + TCP/IP
-                                      │ IPv4 packets
+                                      │ IPv4 or IPv6 packets
                                       ▼
                               OpenVPN data channel
                                       │ encrypted UDP
@@ -31,18 +31,18 @@ Only applications configured to use this SOCKS5 proxy follow this path. The proj
 | Crate | What it owns | Main boundary |
 | --- | --- | --- |
 | `ovpn-profile` | Parses the supported `.ovpn` directives into remotes, CA, `tls-crypt` key, and timing settings. | Profile text in; typed `Profile` out. No network runtime. |
-| `ovpn-client` | OpenVPN UDP session, protected control channel, TLS, authentication exchange, pushed settings, encrypted data packets, keepalives, and key rotation. | Plain IPv4 packets in/out through `Session`; no knowledge of SOCKS5 or `smoltcp`. |
-| `ovpn-netstack` | Virtual IPv4 interface, DNS queries, TCP connections, and IP packet production/consumption using `smoltcp`. | `Stack` commands and `StreamEvent`s for callers; plain IPv4 packets for the app. |
+| `ovpn-client` | OpenVPN UDP session, protected control channel, TLS, authentication exchange, pushed settings, encrypted data packets, keepalives, and key rotation. | Plain IP packets in/out through `Session`; no knowledge of SOCKS5 or `smoltcp`. |
+| `ovpn-netstack` | Virtual IP interface, DNS queries, TCP connections, and IP packet production/consumption using `smoltcp`. | `Stack` commands and `StreamEvent`s for callers; plain IPv4 or IPv6 packets for the app. |
 | `ovpn-socks5` | SOCKS5 negotiation and forwarding between a client socket and its assigned `Stack`. | One async handler per accepted client; it asks a routing provider to select a stack before DNS. No OpenVPN dependency. |
 | `openvpn-proxy-app` | TOML config, host discovery, connection manager, sticky routing, tunnel supervision, SOCKS listener, and shutdown. | Executable and composition root. |
 
-The dependency direction is `app → profile/client/netstack/socks5` and `socks5 → netstack`. The app owns one OpenVPN session and one packet stack **per active VPN host**, and connects their plain IPv4 packet streams. Reusable crates expose typed errors with `thiserror`; the app adds context with `anyhow` and logs through `tracing`.
+The dependency direction is `app → profile/client/netstack/socks5` and `socks5 → netstack`. The app owns one OpenVPN session and one packet stack **per active VPN host**, and connects their plain IP packet streams. Reusable crates expose typed errors with `thiserror`; the app adds context with `anyhow` and logs through `tracing`.
 
 ### Connection manager and sticky routing
 
 The app resolves every profile `remote` to IPv4 endpoints, deduplicates them, and groups ports under each server IP. Each host worker tries its ports in turn, establishes a VPN session and packet stack, then monitors that tunnel. The first ready host lets the SOCKS listener start; other hosts continue connecting in the background. Up to `max_active_vpn_hosts` tunnels may be active at once (default: 16). A failed host is retried with bounded exponential backoff.
 
-For a SOCKS hostname, the handler asks the manager for a route **before DNS**. The manager uses the Public Suffix List to group a registrable domain and its subdomains: `abc.com` and `xyz.abc.com` get the same assignment, while `example.co.uk` is handled correctly. A direct IPv4 request uses its address as the sticky key. A new group chooses the less busy of two rotating healthy hosts. The assignment stays fixed until that host fails; changing load does not move an established group. On failure, the manager removes that host's assignments and resets its stack, closing existing proxied TCP connections. A later request can choose another healthy host.
+For a SOCKS hostname, the handler asks the manager for a route **before DNS**. The manager uses the Public Suffix List to group a registrable domain and its subdomains: `abc.com` and `xyz.abc.com` get the same assignment, while `example.co.uk` is handled correctly. A direct IP request uses its address as the sticky key; IPv6 destinations are assigned only to hosts with a matching VPN route. A new group chooses the less busy of two rotating healthy hosts. The assignment stays fixed until that host fails; changing load does not move an established group. On failure, the manager removes that host's assignments and resets its stack, closing existing proxied TCP connections. A later request can choose another healthy host.
 
 The sticky table is bounded. If it fills, new groups fail closed rather than silently losing their assignment. DNS for a hostname runs through its assigned host's packet stack, so DNS and TCP use the same VPN.
 
@@ -51,13 +51,13 @@ The sticky table is bounded. If it fills, new groups fail closed rather than sil
 - `control.rs` implements reliable OpenVPN control packets over UDP: reset, acknowledgments, ordering, retries, and TLS record transport. `tlscrypt.rs` protects those control packets before TLS sees them.
 - `client/tls.rs` builds `rustls` and validates the certificate against the profile CA. When the profile specifies `remote-cert-tls server`, it also requires an explicit key usage extension and server authentication extended key usage.
 - `client/key_method.rs` exchanges credentials and key method messages inside TLS. `client/push.rs` parses the server's tunnel address, gateway, DNS servers, peer ID, cipher, and keepalive settings.
-- `data.rs` encrypts and authenticates IPv4 packets with AES-256-GCM. It checks packet IDs to reject replays. `client/mod.rs` coordinates the session and rekey states.
+- `data.rs` encrypts and authenticates IP packets with AES-256-GCM. It checks packet IDs to reject replays. `client/mod.rs` coordinates the session and rekey states.
 
 The control channel establishes trust and derives data keys. The data channel carries the actual IP packets. They share one UDP socket, but use different packet types and cryptographic state.
 
 ### Inside the packet stack
 
-`Stack` is a cloneable async handle. Its commands go to one `smoltcp` engine task; callers receive connection events through channels. The engine polls a virtual IP device, runs DNS and TCP state machines, and emits IPv4 packets to the app. The device is an in-memory packet queue, not a TUN interface. The engine wakes for commands, consumed connection events, and the next TCP or application deadline; it does not need a dedicated OS thread for `smoltcp`.
+`Stack` is a cloneable async handle. Its commands go to one `smoltcp` engine task; callers receive connection events through channels. The engine polls a virtual IP device, runs DNS and TCP state machines, and emits IPv4 or IPv6 packets to the app according to the VPN server's routes. The device is an in-memory packet queue, not a TUN interface. The engine wakes for commands, consumed connection events, and the next TCP or application deadline; it does not need a dedicated OS thread for `smoltcp`.
 
 `smoltcp` supplies the TCP behavior a SOCKS client expects: connection setup, sequencing, acknowledgments, retransmission, and teardown. The SOCKS handler works with byte streams and connection events; it does not construct TCP or IP headers.
 
@@ -95,7 +95,7 @@ If no host becomes ready before the startup deadline, startup returns an error a
 
 ## One proxied HTTPS request
 
-This diagram uses `curl --socks5-hostname`, so curl sends the hostname to the proxy. For an IPv4 address request, the DNS step is skipped. The reverse path follows the same components in reverse order.
+This diagram uses `curl --socks5-hostname`, so curl sends the hostname to the proxy. For a direct IP address request, the DNS step is skipped. IPv6 uses the same packet path when the selected VPN host has an IPv6 route. The reverse path follows the same components in reverse order.
 
 ```mermaid
 sequenceDiagram
@@ -112,22 +112,22 @@ sequenceDiagram
     Socks->>Manager: Select sticky host for example.com
     Manager-->>Socks: Lease for one ready host and its stack
     opt Destination is a hostname
-        Socks->>Stack: Resolve A record
-        Stack->>App: DNS query as IPv4 packet
+        Socks->>Stack: Resolve A or AAAA record
+        Stack->>App: DNS query as IP packet
         App->>VPN: Encrypt packet
         VPN->>Server: UDP data packet
         Server-->>VPN: Encrypted DNS response
-        VPN-->>App: Plain IPv4 packet
+        VPN-->>App: Plain IP packet
         App-->>Stack: Deliver DNS response
-        Stack-->>Socks: Destination IPv4 address
+        Stack-->>Socks: Destination IP address
     end
     Socks->>Stack: Open virtual TCP connection to address:443
-    Stack->>App: TCP SYN as IPv4 packet
+    Stack->>App: TCP SYN as IP packet
     App->>VPN: Encrypt packet
     VPN->>Server: UDP data packet
     Server->>Site: Forward TCP connection
     Site-->>Server: TCP response
-    Server-->>VPN: Encrypted IPv4 packet
+    Server-->>VPN: Encrypted IP packet
     VPN-->>App: Decrypt packet
     App-->>Stack: Deliver TCP response
     Stack-->>Socks: Connected event
@@ -135,13 +135,13 @@ sequenceDiagram
     loop HTTPS byte stream
         Client->>Socks: TLS / HTTP bytes
         Socks->>Stack: Write virtual TCP stream
-        Stack->>App: IPv4 packets
+        Stack->>App: IP packets
         App->>VPN: Encrypt and send over UDP
         VPN->>Server: Encrypted data
         Server->>Site: Forward TCP data
         Site-->>Server: TCP data
         Server-->>VPN: Encrypted data
-        VPN-->>App: Decrypted IPv4 packets
+        VPN-->>App: Decrypted IP packets
         App-->>Stack: Deliver packets
         Stack-->>Socks: Stream data event
         Socks-->>Client: TLS / HTTP bytes
@@ -173,7 +173,7 @@ cp config.toml.example config.toml
 cargo run --release -p openvpn-proxy-app
 ```
 
-Pass a path as the sole argument to use a config file other than `config.toml`. Relative `profile_path` values resolve from that file's directory. `max_active_vpn_hosts` defaults to 16. `dns_override` is optional; it replaces the server-pushed resolver for SOCKS destination lookups and still sends those queries through the assigned VPN. Without a usable DNS server, hostname requests fail; IPv4 address requests can still work.
+Pass a path as the sole argument to use a config file other than `config.toml`. Relative `profile_path` values resolve from that file's directory. `max_active_vpn_hosts` defaults to 16. `dns_override` is optional; it replaces the server-pushed resolver for SOCKS destination lookups and still sends those queries through the assigned VPN. Without a usable DNS server, hostname requests fail; direct IP address requests can still work.
 
 ```sh
 curl --socks5-hostname 127.0.0.1:1080 https://example.com
@@ -186,4 +186,4 @@ For a browser speed test, run the release build with `RUST_LOG=debug`. `stack_id
 
 ## Current scope
 
-Supported profiles use UDP/IPv4, an inline CA, `tls-crypt` v1, and AES-256-GCM. Username/password is supported when required. SOCKS5 supports unauthenticated TCP CONNECT to IPv4 addresses or hostnames resolved to IPv4. IPv6 destinations, UDP ASSOCIATE, throughput-based host selection, the Web UI, configuration editing, status page, and charts are not implemented. macOS behavior remains unverified.
+Supported profiles use UDP/IPv4 to reach the VPN server, an inline CA, `tls-crypt` v1, and AES-256-GCM. Username/password is supported when required. The SOCKS5 listener stays on the configured IPv4 address and supports unauthenticated TCP CONNECT to IPv4, IPv6, and hostnames. IPv6 destinations work only when the chosen VPN server pushes an IPv6 tunnel address and route and neither the profile nor server blocks IPv6; otherwise the request fails closed. Hostnames use tunneled A and AAAA queries on IPv6-capable hosts and can fall back to IPv4. UDP ASSOCIATE, throughput-based host selection, the Web UI, configuration editing, status page, and charts are not implemented. macOS behavior remains unverified.

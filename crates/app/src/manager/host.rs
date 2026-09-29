@@ -1,10 +1,10 @@
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use ovpn_client::{ClientConfig, Session};
-use ovpn_netstack::{Stack, TunnelConfig};
+use ovpn_netstack::{Ipv6Config, Ipv6Route, Stack, TunnelConfig};
 use ovpn_profile::Profile;
 use tokio::sync::{Semaphore, mpsc, watch};
 use tokio::time;
@@ -137,9 +137,26 @@ async fn connect_host(
         .context("OpenVPN session failed")?;
     let settings = &session.config().tunnel;
     let dns = dns_override
-        .map(|address| vec![address])
+        .map(|address| vec![IpAddr::V4(address)])
         .unwrap_or_else(|| settings.dns.clone());
-    let tunnel = TunnelConfig::new(settings.local, settings.gateway, dns, settings.mtu)
+    let ipv6 = settings
+        .ipv6
+        .as_ref()
+        .filter(|_| !profile.block_ipv6)
+        .map(|config| Ipv6Config {
+            local: config.local,
+            prefix_len: config.prefix_len,
+            routes: config
+                .routes
+                .iter()
+                .map(|route| Ipv6Route {
+                    network: route.network,
+                    prefix_len: route.prefix_len,
+                    gateway: route.gateway,
+                })
+                .collect(),
+        });
+    let tunnel = TunnelConfig::new(settings.local, settings.gateway, dns, settings.mtu, ipv6)
         .context("invalid VPN tunnel settings")?;
     let stack = Stack::start();
     let (tx, rx) = mpsc::channel(TUNNEL_PACKET_QUEUE_CAPACITY);

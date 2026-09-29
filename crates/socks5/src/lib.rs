@@ -1,7 +1,8 @@
-use std::net::{Ipv4Addr, SocketAddrV4};
+use std::collections::VecDeque;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::{Duration, Instant};
 
-use ovpn_netstack::{Stack, StackError, StreamEvent};
+use ovpn_netstack::{IpVersion, Stack, StackError, StreamEvent};
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -19,9 +20,11 @@ const NO_ACCEPTABLE_METHOD: u8 = 0xff;
 const CONNECT_COMMAND: u8 = 1;
 const IPV4_ADDRESS_TYPE: u8 = 1;
 const DOMAIN_ADDRESS_TYPE: u8 = 3;
+const IPV6_ADDRESS_TYPE: u8 = 4;
 const GREETING_BYTES: usize = 2;
 const REQUEST_HEADER_BYTES: usize = 4;
 const IPV4_ADDRESS_BYTES: usize = 4;
+const IPV6_ADDRESS_BYTES: usize = 16;
 const PORT_BYTES: usize = 2;
 const SOCKS_REPLY_BYTES: usize = 10;
 const VERSION_INDEX: usize = 0;
@@ -32,6 +35,8 @@ const REQUEST_RESERVED_INDEX: usize = 2;
 const ADDRESS_TYPE_INDEX: usize = 3;
 const SOCKET_IO_TIMEOUT: Duration = Duration::from_secs(10);
 const TUNNEL_CONNECT_TIMEOUT: Duration = Duration::from_secs(16);
+const IPV6_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+const DNS_FALLBACK_WINDOW: Duration = Duration::from_millis(75);
 const READY_CHECK_INTERVAL: Duration = Duration::from_millis(250);
 const TRANSFER_STATUS_INTERVAL: Duration = Duration::from_secs(10);
 const TRANSFER_BUFFER_BYTES: usize = 8192;
@@ -52,6 +57,7 @@ type Result<T> = std::result::Result<T, SocksError>;
 pub enum DestinationHost {
     Domain(String),
     Ipv4(Ipv4Addr),
+    Ipv6(Ipv6Addr),
 }
 
 pub trait RouteLease: Send {
@@ -146,6 +152,17 @@ pub async fn handle<R: RouteProvider>(mut stream: TcpStream, router: R) -> Resul
             };
             DestinationHost::Domain(host)
         }
+        IPV6_ADDRESS_TYPE => {
+            let mut raw = [0; IPV6_ADDRESS_BYTES];
+            read_exact(&mut stream, &mut raw).await?;
+            let address = Ipv6Addr::from(raw);
+            if address.is_unspecified() || address.is_multicast() {
+                tracing::debug!(%address, "SOCKS5 client requested an invalid IPv6 destination");
+                reply(&mut stream, REPLY_ADDRESS).await?;
+                return Ok(());
+            }
+            DestinationHost::Ipv6(address)
+        }
         _ => {
             tracing::debug!(
                 address_type = request[ADDRESS_TYPE_INDEX],
@@ -165,7 +182,10 @@ pub async fn handle<R: RouteProvider>(mut stream: TcpStream, router: R) -> Resul
     }
     let route_started = Instant::now();
     let Some(route) = router.select(&destination) else {
-        tracing::warn!(?destination, "SOCKS5 request rejected: no healthy VPN host");
+        tracing::warn!(
+            ?destination,
+            "SOCKS5 request rejected: no VPN host with a route to the destination"
+        );
         reply(&mut stream, REPLY_NETWORK).await?;
         return Ok(());
     };
@@ -178,58 +198,112 @@ pub async fn handle<R: RouteProvider>(mut stream: TcpStream, router: R) -> Resul
         return Ok(());
     }
     let mut dns_elapsed = None;
-    let address = match destination {
-        DestinationHost::Ipv4(address) => address,
+    let mut delayed_ipv4 = None;
+    let addresses = match destination {
+        DestinationHost::Ipv4(address) => vec![IpAddr::V4(address)],
+        DestinationHost::Ipv6(address) => vec![IpAddr::V6(address)],
         DestinationHost::Domain(host) => {
             tracing::debug!(%host, "resolving SOCKS5 destination through assigned VPN");
             let dns_started = Instant::now();
-            match stack.resolve(&host).await {
-                Ok(address) => {
-                    dns_elapsed = Some(dns_started.elapsed());
-                    tracing::debug!(%host, %address, ?dns_elapsed, "SOCKS5 destination resolved");
-                    address
+            let mut addresses = Vec::new();
+            if stack.supports_ipv6() {
+                let ipv4 = stack.resolve(&host, IpVersion::V4);
+                let ipv6 = stack.resolve(&host, IpVersion::V6);
+                tokio::pin!(ipv4, ipv6);
+                tokio::select! {
+                    result = &mut ipv4 => {
+                        if let Ok(IpAddr::V4(address)) = result {
+                            addresses.push(IpAddr::V4(address));
+                        } else if let Ok(IpAddr::V6(address)) = ipv6.await
+                            && stack.can_route_ipv6(address)
+                        {
+                            addresses.push(IpAddr::V6(address));
+                        }
+                    }
+                    result = &mut ipv6 => {
+                        if let Ok(IpAddr::V6(address)) = result
+                            && stack.can_route_ipv6(address)
+                        {
+                            addresses.push(IpAddr::V6(address));
+                            match time::timeout(DNS_FALLBACK_WINDOW, &mut ipv4).await {
+                                Ok(Ok(IpAddr::V4(address))) => addresses.push(IpAddr::V4(address)),
+                                Err(_) => delayed_ipv4 = Some(host.clone()),
+                                _ => {}
+                            }
+                        } else if let Ok(IpAddr::V4(address)) = ipv4.await {
+                            addresses.push(IpAddr::V4(address));
+                        }
+                    }
                 }
+            } else if let Ok(IpAddr::V4(address)) = stack.resolve(&host, IpVersion::V4).await {
+                addresses.push(IpAddr::V4(address));
+            }
+            dns_elapsed = Some(dns_started.elapsed());
+            if addresses.is_empty() {
+                tracing::warn!(%host, ?dns_elapsed, "SOCKS5 destination lookup returned no routable address");
+                reply(&mut stream, REPLY_HOST).await?;
+                return Ok(());
+            }
+            tracing::debug!(%host, ?addresses, ?dns_elapsed, "SOCKS5 destination resolved");
+            addresses
+        }
+    };
+    let mut connected = None;
+    let connect_phase_started = Instant::now();
+    let mut addresses: VecDeque<_> = addresses.into();
+    loop {
+        let address = if let Some(address) = addresses.pop_front() {
+            address
+        } else if let Some(host) = delayed_ipv4.take() {
+            match stack.resolve(&host, IpVersion::V4).await {
+                Ok(IpAddr::V4(address)) => IpAddr::V4(address),
                 Err(error) => {
-                    tracing::warn!(%host, %error, elapsed = ?dns_started.elapsed(), "SOCKS5 destination lookup failed");
-                    reply(&mut stream, REPLY_HOST).await?;
-                    return Ok(());
+                    tracing::warn!(%host, %error, "IPv4 fallback lookup failed");
+                    break;
                 }
+                Ok(_) => break,
+            }
+        } else {
+            break;
+        };
+        let destination = SocketAddr::new(address, port);
+        tracing::debug!(%destination, "connecting SOCKS5 destination through VPN");
+        let connect_started = Instant::now();
+        let (id, mut events) = match stack.connect(destination).await {
+            Ok(value) => value,
+            Err(error) => {
+                tracing::warn!(%destination, %error, elapsed = ?connect_started.elapsed(), "SOCKS5 tunnel connection failed");
+                continue;
+            }
+        };
+        let timeout = if address.is_ipv6() && (!addresses.is_empty() || delayed_ipv4.is_some()) {
+            IPV6_CONNECT_TIMEOUT
+        } else {
+            TUNNEL_CONNECT_TIMEOUT
+        };
+        match time::timeout(timeout, events.recv()).await {
+            Ok(Some(StreamEvent::Connected)) => {
+                connected = Some((destination, id, events, connect_phase_started.elapsed()));
+                break;
+            }
+            Ok(Some(StreamEvent::Closed) | None) => {
+                tracing::warn!(id, %destination, elapsed = ?connect_started.elapsed(), "SOCKS5 tunnel closed before connecting");
+            }
+            Ok(Some(StreamEvent::Data(_))) => {
+                tracing::warn!(id, %destination, elapsed = ?connect_started.elapsed(), "SOCKS5 tunnel sent data before connecting");
+            }
+            Err(_) => {
+                tracing::warn!(id, %destination, elapsed = ?connect_started.elapsed(), "SOCKS5 tunnel connect timed out");
             }
         }
-    };
-    let destination = SocketAddrV4::new(address, port);
-    tracing::debug!(%destination, "connecting SOCKS5 destination through VPN");
-    let connect_started = Instant::now();
-    let (id, mut events) = match stack.connect(destination).await {
-        Ok(value) => value,
-        Err(error) => {
-            tracing::warn!(%destination, %error, elapsed = ?connect_started.elapsed(), "SOCKS5 tunnel connection failed");
-            reply(&mut stream, REPLY_NETWORK).await?;
-            return Ok(());
+        if let Err(error) = stack.close(id) {
+            tracing::debug!(id, %error, "SOCKS tunnel cleanup failed");
         }
-    };
-    let connected = match time::timeout(TUNNEL_CONNECT_TIMEOUT, events.recv()).await {
-        Ok(Some(StreamEvent::Connected)) => true,
-        Ok(Some(StreamEvent::Closed) | None) => {
-            tracing::warn!(id, %destination, elapsed = ?connect_started.elapsed(), "SOCKS5 tunnel closed before connecting");
-            false
-        }
-        Ok(Some(StreamEvent::Data(_))) => {
-            tracing::warn!(id, %destination, elapsed = ?connect_started.elapsed(), "SOCKS5 tunnel sent data before connecting");
-            false
-        }
-        Err(_) => {
-            tracing::warn!(id, %destination, elapsed = ?connect_started.elapsed(), "SOCKS5 tunnel connect timed out");
-            false
-        }
-    };
-    if !connected {
-        let close_result = stack.close(id);
-        reply(&mut stream, REPLY_HOST).await?;
-        close_result?;
-        return Ok(());
     }
-    let connect_elapsed = connect_started.elapsed();
+    let Some((destination, id, mut events, connect_elapsed)) = connected else {
+        reply(&mut stream, REPLY_HOST).await?;
+        return Ok(());
+    };
     tracing::debug!(id, %destination, stack_id, ?route_elapsed, ?dns_elapsed, ?connect_elapsed, "SOCKS5 tunnel connected");
     reply(&mut stream, REPLY_OK).await?;
 

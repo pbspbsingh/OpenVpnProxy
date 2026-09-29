@@ -26,8 +26,8 @@ rustls = { version = "0.23.45", default-features = false, features = ["std", "tl
 rustls-pemfile = "2.2.0"
 x509-parser = "0.18.1"
 
-# Userspace TCP, IPv4, and DNS
-smoltcp = { version = "0.14.0", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "socket-tcp", "socket-dns"] }
+# Userspace TCP, IP, and DNS
+smoltcp = { version = "0.14.0", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-dns", "iface-max-route-count-4", "dns-max-server-count-4"] }
 
 # TOML application configuration
 serde = { version = "1.0", features = ["derive"] }

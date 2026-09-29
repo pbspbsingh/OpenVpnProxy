@@ -5,5 +5,7 @@ mod error;
 mod protocol;
 mod tlscrypt;
 
-pub use client::{ClientConfig, Session, SessionConfig, TunnelSettings};
+pub use client::{
+    ClientConfig, Ipv6Route, Ipv6TunnelSettings, Session, SessionConfig, TunnelSettings,
+};
 pub use error::Error;

@@ -66,7 +66,7 @@ impl Shared {
             .filter(|host| host.stack.is_some())
             .count();
         self.ready.send_replace(ready);
-        tracing::info!(host_id = id, %endpoint, stack_id = stack.id(), generation, ?elapsed, ready_hosts = ready, "VPN host ready");
+        tracing::info!(host_id = id, %endpoint, stack_id = stack.id(), ipv6 = stack.supports_ipv6(), generation, ?elapsed, ready_hosts = ready, "VPN host ready");
     }
 
     pub(super) fn down(&self, id: usize, shutdown: bool) {
@@ -142,7 +142,7 @@ impl RouteProvider for RouterHandle {
             if let Some(stack) = state.hosts[id]
                 .stack
                 .as_ref()
-                .filter(|stack| stack.is_ready())
+                .filter(|stack| stack.is_ready() && destination_supported(stack, destination))
             {
                 let stack = stack.clone();
                 let active = Arc::clone(&state.hosts[id].active);
@@ -163,17 +163,34 @@ impl RouteProvider for RouterHandle {
             );
             return None;
         }
-        let ready: Vec<usize> = state
+        let mut ready: Vec<usize> = state
             .hosts
             .iter()
             .enumerate()
             .filter_map(|(id, host)| {
                 host.stack
                     .as_ref()
-                    .is_some_and(Stack::is_ready)
+                    .is_some_and(|stack| {
+                        stack.is_ready() && destination_supported(stack, destination)
+                    })
                     .then_some(id)
             })
             .collect();
+        if matches!(destination, DestinationHost::Domain(_))
+            && ready.iter().any(|&id| {
+                state.hosts[id]
+                    .stack
+                    .as_ref()
+                    .is_some_and(Stack::supports_ipv6)
+            })
+        {
+            ready.retain(|&id| {
+                state.hosts[id]
+                    .stack
+                    .as_ref()
+                    .is_some_and(Stack::supports_ipv6)
+            });
+        }
         if ready.is_empty() {
             tracing::debug!(group = %key, "no ready VPN host for new assignment");
             return None;
@@ -193,7 +210,7 @@ impl RouteProvider for RouterHandle {
         let stack = host.stack.as_ref()?.clone();
         let active = Arc::clone(&host.active);
         let count = active.fetch_add(1, Ordering::Relaxed) + 1;
-        tracing::info!(group = %key, host_id = id, stack_id = stack.id(), endpoint = %host.endpoint, generation = host.generation, active = count, ready_hosts = ready.len(), "assigned domain group to VPN host");
+        tracing::info!(group = %key, host_id = id, stack_id = stack.id(), endpoint = %host.endpoint, generation = host.generation, active = count, eligible_hosts = ready.len(), "assigned destination group to VPN host");
         Some(HostLease {
             stack,
             active,
@@ -205,6 +222,7 @@ impl RouteProvider for RouterHandle {
 fn sticky_key(destination: &DestinationHost) -> Option<String> {
     match destination {
         DestinationHost::Ipv4(address) => Some(format!("ip:{address}")),
+        DestinationHost::Ipv6(address) => Some(format!("ip6:{address}")),
         DestinationHost::Domain(name) => {
             let normalized = name.trim_end_matches('.').to_ascii_lowercase();
             if normalized.is_empty() {
@@ -213,6 +231,13 @@ fn sticky_key(destination: &DestinationHost) -> Option<String> {
             let group = psl::domain_str(&normalized).unwrap_or(&normalized);
             Some(format!("domain:{group}"))
         }
+    }
+}
+
+fn destination_supported(stack: &Stack, destination: &DestinationHost) -> bool {
+    match destination {
+        DestinationHost::Ipv6(address) => stack.can_route_ipv6(*address),
+        DestinationHost::Ipv4(_) | DestinationHost::Domain(_) => true,
     }
 }
 

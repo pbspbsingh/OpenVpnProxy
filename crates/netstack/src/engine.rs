@@ -1,10 +1,10 @@
 use std::collections::{HashMap, VecDeque};
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::time::{Duration, Instant as Clock};
 
-use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
+use smoltcp::iface::{Config, Interface, Route, SocketHandle, SocketSet};
 use smoltcp::socket::{dns, tcp};
 use smoltcp::time::Instant;
 use smoltcp::wire::{DnsQueryType, HardwareAddress, IpAddress, IpCidr, Ipv4Address};
@@ -14,7 +14,7 @@ use tokio::time;
 use crate::device::PacketDevice;
 use crate::error::{Result, StackError};
 use crate::stack::Command;
-use crate::types::{StackPhase, StreamEvent, TunnelConfig};
+use crate::types::{IpVersion, Ipv6Route, StackPhase, StreamEvent, TunnelConfig, matches_route};
 
 const MAX_QUEUED_WRITE: usize = 256 * 1024;
 const TCP_RECEIVE_BUFFER_BYTES: usize = 256 * 1024;
@@ -58,8 +58,9 @@ struct Connection {
 
 struct PendingDns {
     host: String,
+    version: IpVersion,
     query: dns::QueryHandle,
-    reply: oneshot::Sender<Result<Ipv4Addr>>,
+    reply: oneshot::Sender<Result<IpAddr>>,
     deadline: Clock,
 }
 
@@ -70,6 +71,7 @@ struct Engine {
     sockets: SocketSet<'static>,
     dns_socket: SocketHandle,
     dns_available: bool,
+    ipv6_routes: Vec<Ipv6Route>,
     pending_dns: Vec<PendingDns>,
     connections: HashMap<u64, Connection>,
     next_port: u16,
@@ -88,6 +90,11 @@ impl Engine {
             inserted = addresses
                 .push(IpCidr::new(ip(config.local).into(), IPV4_HOST_PREFIX_BITS))
                 .is_ok();
+            if let Some(ipv6) = &config.ipv6 {
+                inserted &= addresses
+                    .push(IpCidr::new(ipv6.local.into(), ipv6.prefix_len))
+                    .is_ok();
+            }
         });
         if !inserted {
             return Err(StackError::AddressTableFull);
@@ -96,15 +103,29 @@ impl Engine {
             .routes_mut()
             .add_default_ipv4_route(ip(config.gateway))
             .map_err(|_| StackError::RouteTableFull)?;
-        let servers: Vec<IpAddress> = config
-            .dns
-            .iter()
-            .copied()
-            .map(|addr| ip(addr).into())
-            .collect();
+        if let Some(ipv6) = &config.ipv6 {
+            let mut inserted = true;
+            iface.routes_mut().update(|routes| {
+                for route in &ipv6.routes {
+                    inserted &= routes
+                        .push(Route {
+                            cidr: IpCidr::new(route.network.into(), route.prefix_len),
+                            via_router: route.gateway.into(),
+                            preferred_until: None,
+                            expires_at: None,
+                        })
+                        .is_ok();
+                }
+            });
+            if !inserted {
+                return Err(StackError::RouteTableFull);
+            }
+        }
+        let servers: Vec<IpAddress> = config.dns.iter().copied().map(smol_ip).collect();
         let mut sockets = SocketSet::new(vec![]);
         let dns_socket = sockets.add(dns::Socket::new(&servers, vec![]));
-        tracing::debug!(local = %config.local, gateway = %config.gateway, mtu = config.mtu, dns_servers = servers.len(), "userspace packet stack initialized");
+        tracing::debug!(local = %config.local, gateway = %config.gateway, mtu = config.mtu, dns_servers = servers.len(), ipv6_routes = config.ipv6.as_ref().map_or(0, |ipv6| ipv6.routes.len()), "userspace packet stack initialized");
+        let ipv6_routes = config.ipv6.map_or_else(Vec::new, |ipv6| ipv6.routes);
         Ok(Self {
             id,
             iface,
@@ -112,6 +133,7 @@ impl Engine {
             sockets,
             dns_socket,
             dns_available: !servers.is_empty(),
+            ipv6_routes,
             pending_dns: Vec::new(),
             connections: HashMap::new(),
             next_port: EPHEMERAL_PORT_START,
@@ -129,17 +151,22 @@ impl Engine {
                 tracing::trace!(bytes = packet.len(), "packet delivered to userspace stack");
                 self.device.inbound.push_back(packet);
             }
-            Command::Resolve(host, reply) => {
+            Command::Resolve(host, version, reply) => {
                 if !self.dns_available {
                     tracing::warn!(%host, "tunneled DNS requested without a DNS server");
                     let _ = reply.send(Err(StackError::NoDnsServer));
                     return;
                 }
-                tracing::debug!(%host, "starting tunneled DNS query");
+                tracing::debug!(%host, ?version, "starting tunneled DNS query");
                 let socket = self.sockets.get_mut::<dns::Socket>(self.dns_socket);
-                match socket.start_query(self.iface.context(), &host, DnsQueryType::A) {
+                let query_type = match version {
+                    IpVersion::V4 => DnsQueryType::A,
+                    IpVersion::V6 => DnsQueryType::Aaaa,
+                };
+                match socket.start_query(self.iface.context(), &host, query_type) {
                     Ok(query) => self.pending_dns.push(PendingDns {
                         host,
+                        version,
                         query,
                         reply,
                         deadline: Clock::now() + DNS_QUERY_TIMEOUT,
@@ -151,6 +178,11 @@ impl Engine {
                 }
             }
             Command::Connect(id, address, events, wake_needed) => {
+                if !matches_route(&self.ipv6_routes, address.ip()) {
+                    tracing::warn!(id, %address, "VPN has no IPv6 route for SOCKS destination");
+                    let _ = events.try_send(StreamEvent::Closed);
+                    return;
+                }
                 if self.connections.len() >= MAX_CONNECTIONS {
                     tracing::warn!(id, %address, "userspace TCP connection limit reached");
                     let _ = events.try_send(StreamEvent::Closed);
@@ -170,7 +202,7 @@ impl Engine {
                 };
                 let result = self.sockets.get_mut::<tcp::Socket>(handle).connect(
                     self.iface.context(),
-                    (ip(*address.ip()), address.port()),
+                    (smol_ip(address.ip()), address.port()),
                     port,
                 );
                 match result {
@@ -241,6 +273,10 @@ impl Engine {
         let mut pending = Vec::new();
         for request in self.pending_dns.drain(..) {
             let socket = self.sockets.get_mut::<dns::Socket>(self.dns_socket);
+            if request.reply.is_closed() {
+                socket.cancel_query(request.query);
+                continue;
+            }
             if Clock::now() >= request.deadline {
                 tracing::warn!(host = %request.host, "tunneled DNS query timed out");
                 socket.cancel_query(request.query);
@@ -249,9 +285,14 @@ impl Engine {
             }
             match socket.get_query_result(request.query) {
                 Ok(addresses) => {
-                    let address = addresses.iter().next().map(|address| match address {
-                        IpAddress::Ipv4(value) => *value,
-                    });
+                    let address =
+                        addresses
+                            .iter()
+                            .find_map(|address| match (request.version, address) {
+                                (IpVersion::V4, IpAddress::Ipv4(value)) => Some(IpAddr::V4(*value)),
+                                (IpVersion::V6, IpAddress::Ipv6(value)) => Some(IpAddr::V6(*value)),
+                                _ => None,
+                            });
                     tracing::debug!(host = %request.host, ?address, "tunneled DNS query completed");
                     let _ = request.reply.send(address.ok_or(StackError::NoDnsAddress));
                 }
@@ -537,7 +578,7 @@ pub(crate) async fn run(
 
 fn reject_without_tunnel(command: Command) {
     match command {
-        Command::Resolve(_, reply) => {
+        Command::Resolve(_, _, reply) => {
             let _ = reply.send(Err(StackError::VpnDown));
         }
         Command::Connect(_, _, events, _) => {
@@ -549,4 +590,11 @@ fn reject_without_tunnel(command: Command) {
 
 fn ip(address: Ipv4Addr) -> Ipv4Address {
     address
+}
+
+fn smol_ip(address: IpAddr) -> IpAddress {
+    match address {
+        IpAddr::V4(address) => IpAddress::Ipv4(address),
+        IpAddr::V6(address) => IpAddress::Ipv6(address),
+    }
 }

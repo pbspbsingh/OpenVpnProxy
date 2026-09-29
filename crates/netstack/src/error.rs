@@ -4,6 +4,10 @@ use thiserror::Error;
 pub enum StackError {
     #[error("tunnel MTU must be between 576 and 1400 bytes")]
     InvalidMtu,
+    #[error("invalid IPv6 tunnel configuration")]
+    InvalidIpv6Config,
+    #[error("VPN has no route to this IPv6 destination")]
+    NoIpv6Route,
     #[error("tunnel address table is full")]
     AddressTableFull,
     #[error("tunnel route table is full")]
@@ -20,7 +24,7 @@ pub enum StackError {
     NoDnsServer,
     #[error("tunneled DNS query failed: {0}")]
     DnsQuery(String),
-    #[error("tunneled DNS returned no IPv4 address")]
+    #[error("tunneled DNS returned no address")]
     NoDnsAddress,
     #[error("tunneled DNS failed")]
     DnsFailed,

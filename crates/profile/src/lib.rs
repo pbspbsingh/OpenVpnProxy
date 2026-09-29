@@ -51,6 +51,7 @@ pub struct Profile {
     pub ca_pem: String,
     pub tls_crypt_key: [u8; TLS_CRYPT_KEY_BYTES],
     pub needs_credentials: bool,
+    pub block_ipv6: bool,
     pub require_server_certificate_purpose: bool,
     pub renegotiate_after: Option<Duration>,
     pub handshake_window: Duration,
@@ -63,6 +64,7 @@ impl Profile {
         let mut static_key = String::new();
         let mut remotes = Vec::new();
         let mut needs_credentials = false;
+        let mut block_ipv6 = false;
         let mut require_server_certificate_purpose = false;
         let mut renegotiate_after = Some(DEFAULT_RENEGOTIATION_INTERVAL);
         let mut handshake_window = DEFAULT_HANDSHAKE_WINDOW;
@@ -117,6 +119,7 @@ impl Profile {
                 }
                 Some("proto") => protocol = words.next().ok_or(ProfileError::MissingProtocol)?,
                 Some("auth-user-pass") => needs_credentials = true,
+                Some("block-ipv6") => block_ipv6 = true,
                 Some("remote-cert-tls") => {
                     if words.next() != Some("server") || words.next().is_some() {
                         return Err(ProfileError::UnsupportedRemoteCertTls);
@@ -207,6 +210,7 @@ impl Profile {
             ca_pem: ca,
             tls_crypt_key: key,
             needs_credentials,
+            block_ipv6,
             require_server_certificate_purpose,
             renegotiate_after,
             handshake_window,
@@ -228,9 +232,15 @@ mod tests {
         let profile = Profile::parse(&input).unwrap();
         assert_eq!(profile.remotes.len(), 1);
         assert!(profile.needs_credentials);
+        assert!(!profile.block_ipv6);
         assert!(profile.require_server_certificate_purpose);
         assert_eq!(profile.renegotiate_after, None);
         assert_eq!(profile.tls_crypt_key, [0; TLS_CRYPT_KEY_BYTES]);
+        assert!(
+            Profile::parse(&format!("block-ipv6\n{input}"))
+                .unwrap()
+                .block_ipv6
+        );
     }
 
     #[test]

@@ -1,6 +1,6 @@
-use std::net::{Ipv4Addr, SocketAddrV4};
-use std::sync::Arc;
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use tokio::sync::{Notify, mpsc, oneshot};
@@ -8,7 +8,7 @@ use tokio::time;
 
 use crate::engine::run;
 use crate::error::{Result, StackError};
-use crate::types::{StackPhase, StreamEvent, TunnelConfig};
+use crate::types::{IpVersion, Ipv6Route, StackPhase, StreamEvent, TunnelConfig};
 
 const COMMAND_QUEUE_CAPACITY: usize = 2048;
 const CONNECTION_EVENT_QUEUE_CAPACITY: usize = 32;
@@ -24,13 +24,8 @@ pub(crate) enum Command {
     ),
     Packet(Vec<u8>),
     Reset,
-    Resolve(String, oneshot::Sender<Result<Ipv4Addr>>),
-    Connect(
-        u64,
-        SocketAddrV4,
-        mpsc::Sender<StreamEvent>,
-        Arc<AtomicBool>,
-    ),
+    Resolve(String, IpVersion, oneshot::Sender<Result<IpAddr>>),
+    Connect(u64, SocketAddr, mpsc::Sender<StreamEvent>, Arc<AtomicBool>),
     Data(u64, Vec<u8>),
     Close(u64),
 }
@@ -64,6 +59,7 @@ pub struct Stack {
     phase: Arc<AtomicU8>,
     next_id: Arc<AtomicU64>,
     wake: Arc<Notify>,
+    ipv6_routes: Arc<RwLock<Vec<Ipv6Route>>>,
 }
 
 impl Stack {
@@ -80,6 +76,7 @@ impl Stack {
             phase,
             next_id: Arc::new(AtomicU64::new(1)),
             wake,
+            ipv6_routes: Arc::new(RwLock::new(Vec::new())),
         }
     }
 
@@ -89,6 +86,24 @@ impl Stack {
 
     pub fn is_ready(&self) -> bool {
         self.phase() == StackPhase::Ready
+    }
+
+    pub fn supports_ipv6(&self) -> bool {
+        self.is_ready()
+            && self
+                .ipv6_routes
+                .read()
+                .is_ok_and(|routes| !routes.is_empty())
+    }
+
+    pub fn can_route_ipv6(&self, address: Ipv6Addr) -> bool {
+        !address.is_unspecified()
+            && !address.is_multicast()
+            && self.is_ready()
+            && self
+                .ipv6_routes
+                .read()
+                .is_ok_and(|routes| routes.iter().any(|route| route.contains(address)))
     }
 
     pub fn phase(&self) -> StackPhase {
@@ -110,15 +125,27 @@ impl Stack {
     pub async fn configure(&self, config: TunnelConfig, io: mpsc::Sender<Vec<u8>>) -> Result<()> {
         self.phase
             .store(StackPhase::Offline as u8, Ordering::Release);
+        self.ipv6_routes
+            .write()
+            .map_err(|_| StackError::InvalidState)?
+            .clear();
+        let ipv6_routes = config.ipv6.as_ref().map(|config| config.routes.clone());
         let (tx, rx) = oneshot::channel();
         self.tx
             .send(Command::Configure(config, io, tx))
             .await
             .map_err(|_| StackError::WorkerStopped)?;
-        time::timeout(CONFIGURATION_TIMEOUT, rx)
+        let result = time::timeout(CONFIGURATION_TIMEOUT, rx)
             .await
             .map_err(|_| StackError::ConfigurationTimeout)?
-            .map_err(|_| StackError::WorkerStopped)?
+            .map_err(|_| StackError::WorkerStopped)?;
+        if result.is_ok() {
+            *self
+                .ipv6_routes
+                .write()
+                .map_err(|_| StackError::InvalidState)? = ipv6_routes.unwrap_or_default();
+        }
+        result
     }
 
     pub fn packet(&self, packet: &[u8]) -> Result<()> {
@@ -139,19 +166,26 @@ impl Stack {
     pub async fn reset(&self) -> Result<()> {
         self.phase
             .store(StackPhase::Offline as u8, Ordering::Release);
+        self.ipv6_routes
+            .write()
+            .map_err(|_| StackError::InvalidState)?
+            .clear();
         self.tx
             .send(Command::Reset)
             .await
             .map_err(|_| StackError::WorkerStopped)
     }
 
-    pub async fn resolve(&self, host: &str) -> Result<Ipv4Addr> {
+    pub async fn resolve(&self, host: &str, version: IpVersion) -> Result<IpAddr> {
         if !self.is_ready() {
             return Err(StackError::VpnDown);
         }
+        if version == IpVersion::V6 && !self.supports_ipv6() {
+            return Err(StackError::NoIpv6Route);
+        }
         let (tx, rx) = oneshot::channel();
         self.tx
-            .send(Command::Resolve(host.to_owned(), tx))
+            .send(Command::Resolve(host.to_owned(), version, tx))
             .await
             .map_err(|_| StackError::WorkerStopped)?;
         time::timeout(DNS_RESPONSE_TIMEOUT, rx)
@@ -160,9 +194,14 @@ impl Stack {
             .map_err(|_| StackError::WorkerStopped)?
     }
 
-    pub async fn connect(&self, address: SocketAddrV4) -> Result<(u64, StreamEvents)> {
+    pub async fn connect(&self, address: SocketAddr) -> Result<(u64, StreamEvents)> {
         if !self.is_ready() {
             return Err(StackError::VpnDown);
+        }
+        if let IpAddr::V6(ipv6) = address.ip()
+            && !self.can_route_ipv6(ipv6)
+        {
+            return Err(StackError::NoIpv6Route);
         }
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = mpsc::channel(CONNECTION_EVENT_QUEUE_CAPACITY);

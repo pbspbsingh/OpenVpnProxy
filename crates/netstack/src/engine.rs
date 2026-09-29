@@ -18,6 +18,14 @@ use crate::types::{StackPhase, StreamEvent, TunnelConfig};
 
 const MAX_QUEUED_WRITE: usize = 256 * 1024;
 const TCP_BUFFER: usize = 32 * 1024;
+const IPV4_HOST_PREFIX_BITS: u8 = 32;
+const EPHEMERAL_PORT_START: u16 = 40_000;
+const EPHEMERAL_PORT_END: u16 = 60_000;
+const MAX_CONNECTIONS: usize = 256;
+const DNS_QUERY_TIMEOUT: Duration = Duration::from_secs(10);
+const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+const TCP_READ_BUFFER_BYTES: usize = 4096;
+const ENGINE_TICK_INTERVAL: Duration = Duration::from_millis(10);
 
 struct Connection {
     socket: SocketHandle,
@@ -54,7 +62,7 @@ impl Engine {
         let mut inserted = false;
         iface.update_ip_addrs(|addresses| {
             inserted = addresses
-                .push(IpCidr::new(ip(config.local).into(), 32))
+                .push(IpCidr::new(ip(config.local).into(), IPV4_HOST_PREFIX_BITS))
                 .is_ok();
         });
         if !inserted {
@@ -81,7 +89,7 @@ impl Engine {
             dns_available: !servers.is_empty(),
             pending_dns: Vec::new(),
             connections: HashMap::new(),
-            next_port: 40000,
+            next_port: EPHEMERAL_PORT_START,
             io,
         })
     }
@@ -105,7 +113,7 @@ impl Engine {
                         host,
                         query,
                         reply,
-                        deadline: Clock::now() + Duration::from_secs(10),
+                        deadline: Clock::now() + DNS_QUERY_TIMEOUT,
                     }),
                     Err(error) => {
                         tracing::warn!(%host, ?error, "could not start tunneled DNS query");
@@ -114,7 +122,7 @@ impl Engine {
                 }
             }
             Command::Connect(id, address, events) => {
-                if self.connections.len() >= 256 {
+                if self.connections.len() >= MAX_CONNECTIONS {
                     tracing::warn!(id, %address, "userspace TCP connection limit reached");
                     let _ = events.try_send(StreamEvent::Closed);
                     return;
@@ -126,7 +134,11 @@ impl Engine {
                 );
                 let handle = self.sockets.add(socket);
                 let port = self.next_port;
-                self.next_port = if port >= 60000 { 40000 } else { port + 1 };
+                self.next_port = if port >= EPHEMERAL_PORT_END {
+                    EPHEMERAL_PORT_START
+                } else {
+                    port + 1
+                };
                 let result = self.sockets.get_mut::<tcp::Socket>(handle).connect(
                     self.iface.context(),
                     (ip(*address.ip()), address.port()),
@@ -141,7 +153,7 @@ impl Engine {
                                 events,
                                 write_queue: VecDeque::new(),
                                 established: false,
-                                deadline: Clock::now() + Duration::from_secs(15),
+                                deadline: Clock::now() + TCP_CONNECT_TIMEOUT,
                             },
                         );
                     }
@@ -252,7 +264,7 @@ impl Engine {
                     }
                 }
                 if socket.can_recv() && connection.events.capacity() > 0 {
-                    let mut buffer = vec![0; 4096];
+                    let mut buffer = vec![0; TCP_READ_BUFFER_BYTES];
                     match socket.recv_slice(&mut buffer) {
                         Ok(read) => {
                             tracing::trace!(id, bytes = read, "userspace TCP data received");
@@ -299,7 +311,7 @@ impl Engine {
 pub(crate) async fn run(mut rx: mpsc::Receiver<Command>, phase: Arc<AtomicU8>) {
     let started = Clock::now();
     let mut engine: Option<Engine> = None;
-    let mut ticker = time::interval(Duration::from_millis(10));
+    let mut ticker = time::interval(ENGINE_TICK_INTERVAL);
     ticker.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     loop {
         let command = tokio::select! {

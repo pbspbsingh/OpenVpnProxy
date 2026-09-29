@@ -1,15 +1,29 @@
 use std::net::Ipv4Addr;
 use std::time::{Duration, Instant};
 
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
+
 use super::TunnelSettings;
 use crate::control::Link;
 use crate::error::{Error, Result, require};
+use crate::protocol::{MAX_CONTROL_FIELD_BYTES, MAX_TUN_MTU, MIN_TUN_MTU, PEER_ID_BITS};
+
+const PUSH_REPLY_TIMEOUT: Duration = Duration::from_secs(20);
+const DEFAULT_PING_INTERVAL: Duration = Duration::from_secs(10);
+const DEFAULT_RESTART_INTERVAL: Duration = Duration::from_secs(60);
+const MAX_AUTH_TOKEN_BYTES: usize = 256;
+const MAX_ENCODED_AUTH_USERNAME_BYTES: usize = 340;
+const MAX_AUTH_USERNAME_BYTES: usize = 255;
 
 pub(super) async fn read_push(link: &mut Link) -> Result<String> {
-    let deadline = Instant::now() + Duration::from_secs(20);
+    let deadline = Instant::now() + PUSH_REPLY_TIMEOUT;
     loop {
         if let Some(index) = link.application_data().iter().position(|byte| *byte == 0) {
-            require(index <= 16384, "server PUSH_REPLY too large")?;
+            require(
+                index <= MAX_CONTROL_FIELD_BYTES,
+                "server PUSH_REPLY too large",
+            )?;
             let bytes: Vec<_> = link.application_data().drain(..=index).collect();
             let message = String::from_utf8(bytes[..index].to_vec())?;
             if message.starts_with("AUTH_FAILED") {
@@ -33,14 +47,14 @@ pub(super) fn parse_push(push: &str) -> Result<(TunnelSettings, u32, Duration, D
     )?;
     let mut cipher = None;
     let mut peer_id = None;
-    let mut ping = Duration::from_secs(10);
-    let mut restart = Duration::from_secs(60);
+    let mut ping = DEFAULT_PING_INTERVAL;
+    let mut restart = DEFAULT_RESTART_INTERVAL;
     let mut local = None;
     let mut ifconfig_peer = None;
     let mut route_gateway = None;
     let mut subnet_topology = false;
     let mut dns = Vec::new();
-    let mut mtu = 1400;
+    let mut mtu = MAX_TUN_MTU;
     for item in push.split(',').skip(1) {
         let words: Vec<_> = item.split_whitespace().collect();
         match words.as_slice() {
@@ -103,7 +117,7 @@ pub(super) fn parse_push(push: &str) -> Result<(TunnelSettings, u32, Duration, D
         "server did not select AES-256-GCM",
     )?;
     let peer_id = peer_id.ok_or(Error::Protocol("server did not assign peer ID"))?;
-    require(peer_id < 1 << 24, "invalid server peer ID")?;
+    require(peer_id < 1 << PEER_ID_BITS, "invalid server peer ID")?;
     let local = local.ok_or(Error::PushMissingAddress)?;
     let gateway = route_gateway
         .or(if subnet_topology { None } else { ifconfig_peer })
@@ -112,9 +126,47 @@ pub(super) fn parse_push(push: &str) -> Result<(TunnelSettings, u32, Duration, D
         local,
         gateway,
         dns,
-        mtu: mtu.clamp(576, 1400),
+        mtu: mtu.clamp(MIN_TUN_MTU, MAX_TUN_MTU),
     };
     Ok((tunnel, peer_id, ping, restart))
+}
+
+pub(super) fn pushed_auth_token(push: &str) -> Result<Option<(String, Option<String>)>> {
+    let mut token = None;
+    let mut user = None;
+    for item in push.split(',').skip(1).map(str::trim) {
+        if let Some(value) = item.strip_prefix("auth-token ") {
+            require(
+                !value.is_empty() && value.len() <= MAX_AUTH_TOKEN_BYTES,
+                "invalid auth token",
+            )?;
+            token = Some(value.to_owned());
+        } else if let Some(value) = item.strip_prefix("auth-token-user ") {
+            require(
+                value.len() <= MAX_ENCODED_AUTH_USERNAME_BYTES,
+                "auth token username too long",
+            )?;
+            let decoded = STANDARD
+                .decode(value)
+                .map_err(|_| Error::Protocol("invalid auth token username"))?;
+            require(
+                decoded.len() <= MAX_AUTH_USERNAME_BYTES,
+                "auth token username too long",
+            )?;
+            let decoded = String::from_utf8(decoded)
+                .map_err(|_| Error::Protocol("invalid auth token username"))?;
+            require(
+                !decoded.contains(['\0', '\r', '\n']),
+                "invalid auth token username",
+            )?;
+            user = Some(decoded);
+        }
+    }
+    require(
+        user.is_none() || token.is_some(),
+        "auth token username without token",
+    )?;
+    Ok(token.map(|token| (token, user)))
 }
 
 #[cfg(test)]
@@ -130,5 +182,15 @@ mod tests {
         assert_eq!(tunnel.dns, vec![Ipv4Addr::new(10, 8, 0, 53)]);
         assert_eq!(peer_id, 7);
         assert!(parse_push(&push.replace("10.8.0.53", "bad-ip")).is_err());
+    }
+
+    #[test]
+    fn decodes_pushed_auth_username_without_exposing_token() {
+        let push = "PUSH_REPLY,auth-token opaque,auth-token-user dXNlcg==";
+        assert_eq!(
+            pushed_auth_token(push).unwrap(),
+            Some(("opaque".into(), Some("user".into())))
+        );
+        assert!(pushed_auth_token("PUSH_REPLY,auth-token-user dXNlcg==").is_err());
     }
 }

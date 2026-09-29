@@ -11,6 +11,7 @@ use rustls::{
     ClientConfig as TlsClientConfig, ClientConnection, DigitallySignedStruct, RootCertStore,
     SignatureScheme,
 };
+use x509_parser::prelude::{FromDer, X509Certificate};
 
 use super::ClientConfig;
 use crate::error::{Error, Result};
@@ -19,6 +20,7 @@ use crate::error::{Error, Result};
 struct OpenVpnVerifier {
     roots: RootCertStore,
     algorithms: WebPkiSupportedAlgorithms,
+    require_server_certificate_purpose: bool,
 }
 
 impl ServerCertVerifier for OpenVpnVerifier {
@@ -39,6 +41,9 @@ impl ServerCertVerifier for OpenVpnVerifier {
             now,
             self.algorithms.all,
         )?;
+        if self.require_server_certificate_purpose {
+            verify_server_certificate_purpose(end_entity)?;
+        }
         Ok(ServerCertVerified::assertion())
     }
 
@@ -65,7 +70,33 @@ impl ServerCertVerifier for OpenVpnVerifier {
     }
 }
 
-pub(super) fn tls_client(profile: &ClientConfig<'_>) -> Result<ClientConnection> {
+fn verify_server_certificate_purpose(
+    cert: &CertificateDer<'_>,
+) -> std::result::Result<(), rustls::Error> {
+    use rustls::CertificateError;
+
+    let (remaining, parsed) = X509Certificate::from_der(cert.as_ref())
+        .map_err(|_| rustls::Error::InvalidCertificate(CertificateError::BadEncoding))?;
+    if !remaining.is_empty() {
+        return Err(rustls::Error::InvalidCertificate(
+            CertificateError::BadEncoding,
+        ));
+    }
+    let key_usage = parsed
+        .key_usage()
+        .map_err(|_| rustls::Error::InvalidCertificate(CertificateError::BadEncoding))?;
+    let extended_key_usage = parsed
+        .extended_key_usage()
+        .map_err(|_| rustls::Error::InvalidCertificate(CertificateError::BadEncoding))?;
+    if key_usage.is_none() || !extended_key_usage.is_some_and(|usage| usage.value.server_auth) {
+        return Err(rustls::Error::InvalidCertificate(
+            CertificateError::InvalidPurpose,
+        ));
+    }
+    Ok(())
+}
+
+pub(super) fn tls_client(profile: &ClientConfig<'_>) -> Result<Arc<TlsClientConfig>> {
     let mut reader = Cursor::new(profile.ca_pem.as_bytes());
     let certs: Vec<_> = rustls_pemfile::certs(&mut reader).collect::<std::io::Result<_>>()?;
     if certs.is_empty() {
@@ -79,6 +110,7 @@ pub(super) fn tls_client(profile: &ClientConfig<'_>) -> Result<ClientConnection>
     let verifier = OpenVpnVerifier {
         roots,
         algorithms: provider.signature_verification_algorithms,
+        require_server_certificate_purpose: profile.require_server_certificate_purpose,
     };
     let mut config = TlsClientConfig::builder_with_provider(Arc::new(provider))
         .with_safe_default_protocol_versions()?
@@ -86,7 +118,11 @@ pub(super) fn tls_client(profile: &ClientConfig<'_>) -> Result<ClientConnection>
         .with_custom_certificate_verifier(Arc::new(verifier))
         .with_no_client_auth();
     config.enable_sni = false;
+    Ok(Arc::new(config))
+}
+
+pub(crate) fn new_tls_connection(config: &Arc<TlsClientConfig>) -> Result<ClientConnection> {
     let name = ServerName::try_from("openvpn.invalid")
         .map_err(|_| Error::Protocol("invalid internal TLS server name"))?;
-    Ok(ClientConnection::new(Arc::new(config), name)?)
+    Ok(ClientConnection::new(Arc::clone(config), name)?)
 }

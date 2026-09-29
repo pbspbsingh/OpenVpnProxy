@@ -8,6 +8,7 @@ publish.workspace = true
 # OpenVPN packet cryptography and randomness
 aes.workspace = true
 aes-gcm.workspace = true
+base64.workspace = true
 ctr.workspace = true
 getrandom.workspace = true
 hmac.workspace = true
@@ -16,6 +17,7 @@ sha2.workspace = true
 # TLS and certificate parsing
 rustls.workspace = true
 rustls-pemfile.workspace = true
+x509-parser.workspace = true
 
 # Async UDP transport
 tokio.workspace = true

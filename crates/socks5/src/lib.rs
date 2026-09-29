@@ -13,6 +13,27 @@ const REPLY_NETWORK: u8 = 0x03;
 const REPLY_HOST: u8 = 0x04;
 const REPLY_COMMAND: u8 = 0x07;
 const REPLY_ADDRESS: u8 = 0x08;
+const SOCKS_VERSION: u8 = 5;
+const NO_AUTH_METHOD: u8 = 0;
+const NO_ACCEPTABLE_METHOD: u8 = 0xff;
+const CONNECT_COMMAND: u8 = 1;
+const IPV4_ADDRESS_TYPE: u8 = 1;
+const DOMAIN_ADDRESS_TYPE: u8 = 3;
+const GREETING_BYTES: usize = 2;
+const REQUEST_HEADER_BYTES: usize = 4;
+const IPV4_ADDRESS_BYTES: usize = 4;
+const PORT_BYTES: usize = 2;
+const SOCKS_REPLY_BYTES: usize = 10;
+const VERSION_INDEX: usize = 0;
+const GREETING_METHOD_COUNT_INDEX: usize = 1;
+const REQUEST_COMMAND_INDEX: usize = 1;
+const REPLY_CODE_INDEX: usize = 1;
+const REQUEST_RESERVED_INDEX: usize = 2;
+const ADDRESS_TYPE_INDEX: usize = 3;
+const SOCKET_IO_TIMEOUT: Duration = Duration::from_secs(10);
+const TUNNEL_CONNECT_TIMEOUT: Duration = Duration::from_secs(16);
+const READY_CHECK_INTERVAL: Duration = Duration::from_millis(250);
+const TRANSFER_BUFFER_BYTES: usize = 8192;
 
 #[derive(Debug, Error)]
 pub enum SocksError {
@@ -27,12 +48,16 @@ pub enum SocksError {
 type Result<T> = std::result::Result<T, SocksError>;
 
 async fn reply(stream: &mut TcpStream, code: u8) -> Result<()> {
-    stream.write_all(&[5, code, 0, 1, 0, 0, 0, 0, 0, 0]).await?;
+    let mut response = [0; SOCKS_REPLY_BYTES];
+    response[VERSION_INDEX] = SOCKS_VERSION;
+    response[REPLY_CODE_INDEX] = code;
+    response[ADDRESS_TYPE_INDEX] = IPV4_ADDRESS_TYPE;
+    stream.write_all(&response).await?;
     Ok(())
 }
 
 async fn read_exact(stream: &mut TcpStream, buf: &mut [u8]) -> Result<()> {
-    time::timeout(Duration::from_secs(10), stream.read_exact(buf))
+    time::timeout(SOCKET_IO_TIMEOUT, stream.read_exact(buf))
         .await
         .map_err(|_| SocksError::SocketTimeout)??;
     Ok(())
@@ -40,30 +65,35 @@ async fn read_exact(stream: &mut TcpStream, buf: &mut [u8]) -> Result<()> {
 
 pub async fn handle(mut stream: TcpStream, stack: Stack) -> Result<()> {
     tracing::debug!("SOCKS5 handshake started");
-    let mut greeting = [0; 2];
+    let mut greeting = [0; GREETING_BYTES];
     read_exact(&mut stream, &mut greeting).await?;
-    if greeting[0] != 5 || greeting[1] == 0 {
+    if greeting[VERSION_INDEX] != SOCKS_VERSION || greeting[GREETING_METHOD_COUNT_INDEX] == 0 {
         tracing::debug!("SOCKS5 client sent an invalid greeting");
         return Ok(());
     }
-    let mut methods = vec![0; greeting[1] as usize];
+    let mut methods = vec![0; greeting[GREETING_METHOD_COUNT_INDEX] as usize];
     read_exact(&mut stream, &mut methods).await?;
-    if !methods.contains(&0) {
+    if !methods.contains(&NO_AUTH_METHOD) {
         tracing::debug!("SOCKS5 client does not support no-authentication method");
-        stream.write_all(&[5, 0xff]).await?;
+        stream
+            .write_all(&[SOCKS_VERSION, NO_ACCEPTABLE_METHOD])
+            .await?;
         return Ok(());
     }
-    stream.write_all(&[5, 0]).await?;
+    stream.write_all(&[SOCKS_VERSION, NO_AUTH_METHOD]).await?;
 
-    let mut request = [0; 4];
+    let mut request = [0; REQUEST_HEADER_BYTES];
     read_exact(&mut stream, &mut request).await?;
-    if request[0] != 5 || request[2] != 0 {
+    if request[VERSION_INDEX] != SOCKS_VERSION || request[REQUEST_RESERVED_INDEX] != 0 {
         tracing::debug!("SOCKS5 client sent an invalid request");
         reply(&mut stream, REPLY_FAILURE).await?;
         return Ok(());
     }
-    if request[1] != 1 {
-        tracing::debug!(command = request[1], "SOCKS5 command is unsupported");
+    if request[REQUEST_COMMAND_INDEX] != CONNECT_COMMAND {
+        tracing::debug!(
+            command = request[REQUEST_COMMAND_INDEX],
+            "SOCKS5 command is unsupported"
+        );
         reply(&mut stream, REPLY_COMMAND).await?;
         return Ok(());
     }
@@ -73,13 +103,13 @@ pub async fn handle(mut stream: TcpStream, stack: Stack) -> Result<()> {
         return Ok(());
     }
 
-    let address = match request[3] {
-        1 => {
-            let mut raw = [0; 4];
+    let address = match request[ADDRESS_TYPE_INDEX] {
+        IPV4_ADDRESS_TYPE => {
+            let mut raw = [0; IPV4_ADDRESS_BYTES];
             read_exact(&mut stream, &mut raw).await?;
             Ipv4Addr::from(raw)
         }
-        3 => {
+        DOMAIN_ADDRESS_TYPE => {
             let mut length = [0; 1];
             read_exact(&mut stream, &mut length).await?;
             if length[0] == 0 {
@@ -112,14 +142,14 @@ pub async fn handle(mut stream: TcpStream, stack: Stack) -> Result<()> {
         }
         _ => {
             tracing::debug!(
-                address_type = request[3],
+                address_type = request[ADDRESS_TYPE_INDEX],
                 "SOCKS5 address type is unsupported"
             );
             reply(&mut stream, REPLY_ADDRESS).await?;
             return Ok(());
         }
     };
-    let mut port = [0; 2];
+    let mut port = [0; PORT_BYTES];
     read_exact(&mut stream, &mut port).await?;
     let port = u16::from_be_bytes(port);
     if port == 0 {
@@ -142,7 +172,7 @@ pub async fn handle(mut stream: TcpStream, stack: Stack) -> Result<()> {
             return Ok(());
         }
     };
-    let connected = match time::timeout(Duration::from_secs(16), events.recv()).await {
+    let connected = match time::timeout(TUNNEL_CONNECT_TIMEOUT, events.recv()).await {
         Ok(Some(StreamEvent::Connected)) => true,
         Ok(Some(StreamEvent::Closed) | None) => {
             tracing::warn!(id, %destination, "SOCKS5 tunnel closed before connecting");
@@ -167,8 +197,8 @@ pub async fn handle(mut stream: TcpStream, stack: Stack) -> Result<()> {
     reply(&mut stream, REPLY_OK).await?;
 
     let (mut reader, mut writer) = stream.into_split();
-    let mut buffer = [0; 8192];
-    let mut ready_check = time::interval(Duration::from_millis(250));
+    let mut buffer = [0; TRANSFER_BUFFER_BYTES];
+    let mut ready_check = time::interval(READY_CHECK_INTERVAL);
     ready_check.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     let transfer = async {
         loop {
@@ -189,7 +219,7 @@ pub async fn handle(mut stream: TcpStream, stack: Stack) -> Result<()> {
                 event = events.recv() => match event {
                     Some(StreamEvent::Data(data)) => {
                         tracing::trace!(id, bytes = data.len(), "forwarding VPN data to SOCKS5 client");
-                        time::timeout(Duration::from_secs(10), writer.write_all(&data))
+                        time::timeout(SOCKET_IO_TIMEOUT, writer.write_all(&data))
                             .await.map_err(|_| SocksError::SocketTimeout)??;
                     }
                     Some(StreamEvent::Connected) => {}

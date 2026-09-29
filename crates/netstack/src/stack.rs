@@ -10,6 +10,11 @@ use crate::engine::run;
 use crate::error::{Result, StackError};
 use crate::types::{StackPhase, StreamEvent, TunnelConfig};
 
+const COMMAND_QUEUE_CAPACITY: usize = 2048;
+const CONNECTION_EVENT_QUEUE_CAPACITY: usize = 32;
+const CONFIGURATION_TIMEOUT: Duration = Duration::from_secs(5);
+const DNS_RESPONSE_TIMEOUT: Duration = Duration::from_secs(12);
+
 pub(crate) enum Command {
     Configure(
         TunnelConfig,
@@ -33,7 +38,7 @@ pub struct Stack {
 
 impl Stack {
     pub fn start() -> Self {
-        let (tx, rx) = mpsc::channel(2048);
+        let (tx, rx) = mpsc::channel(COMMAND_QUEUE_CAPACITY);
         let phase = Arc::new(AtomicU8::new(StackPhase::Offline as u8));
         let worker_phase = phase.clone();
         tokio::spawn(run(rx, worker_phase));
@@ -72,7 +77,7 @@ impl Stack {
             .send(Command::Configure(config, io, tx))
             .await
             .map_err(|_| StackError::WorkerStopped)?;
-        time::timeout(Duration::from_secs(5), rx)
+        time::timeout(CONFIGURATION_TIMEOUT, rx)
             .await
             .map_err(|_| StackError::ConfigurationTimeout)?
             .map_err(|_| StackError::WorkerStopped)?
@@ -111,7 +116,7 @@ impl Stack {
             .send(Command::Resolve(host.to_owned(), tx))
             .await
             .map_err(|_| StackError::WorkerStopped)?;
-        time::timeout(Duration::from_secs(12), rx)
+        time::timeout(DNS_RESPONSE_TIMEOUT, rx)
             .await
             .map_err(|_| StackError::DnsTimeout)?
             .map_err(|_| StackError::WorkerStopped)?
@@ -125,7 +130,7 @@ impl Stack {
             return Err(StackError::VpnDown);
         }
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let (tx, rx) = mpsc::channel(32);
+        let (tx, rx) = mpsc::channel(CONNECTION_EVENT_QUEUE_CAPACITY);
         self.tx
             .send(Command::Connect(id, address, tx))
             .await

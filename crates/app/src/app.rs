@@ -9,6 +9,8 @@ use tokio::sync::mpsc;
 
 use crate::config::{config_path, load_config};
 
+const TUNNEL_PACKET_QUEUE_CAPACITY: usize = 1024;
+
 async fn resolve_vpn_endpoint(profile: &Profile) -> Result<SocketAddr> {
     let mut last_error = None;
     for (host, port) in &profile.remotes {
@@ -104,6 +106,10 @@ pub(crate) async fn run() -> Result<()> {
         endpoint: resolve_vpn_endpoint(&profile).await?,
         ca_pem: &profile.ca_pem,
         tls_crypt_key: &profile.tls_crypt_key,
+        require_server_certificate_purpose: profile.require_server_certificate_purpose,
+        renegotiate_after: profile.renegotiate_after,
+        handshake_window: profile.handshake_window,
+        transition_window: profile.transition_window,
     };
     let session = Session::connect(&client_config, &config.username, &config.password)
         .await
@@ -117,7 +123,7 @@ pub(crate) async fn run() -> Result<()> {
         .context("invalid VPN tunnel settings")?;
     tracing::info!(local = %tunnel.local, gateway = %tunnel.gateway, mtu = tunnel.mtu, dns_servers = tunnel.dns.len(), "VPN tunnel configured");
     let stack = Stack::start();
-    let (packet_tx, packet_rx) = mpsc::channel(1024);
+    let (packet_tx, packet_rx) = mpsc::channel(TUNNEL_PACKET_QUEUE_CAPACITY);
     stack
         .configure(tunnel, packet_tx)
         .await

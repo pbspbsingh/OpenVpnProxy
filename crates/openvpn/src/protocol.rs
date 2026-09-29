@@ -1,0 +1,12 @@
+pub(crate) const STATIC_KEY_BYTES: usize = 256;
+pub(crate) const DATA_KEY_MATERIAL_BYTES: usize = 256;
+pub(crate) const OPCODE_SHIFT: u8 = 3;
+pub(crate) const KEY_ID_MASK: u8 = 0x07;
+pub(crate) const MAX_KEY_ID: u8 = KEY_ID_MASK;
+pub(crate) const DATA_V2_OPCODE: u8 = 9;
+pub(crate) const PEER_ID_BITS: u32 = 24;
+pub(crate) const REPLAY_WINDOW_BITS: u32 = 64;
+pub(crate) const GCM_TAG_BYTES: usize = 16;
+pub(crate) const MIN_TUN_MTU: usize = 576;
+pub(crate) const MAX_TUN_MTU: usize = 1400;
+pub(crate) const MAX_CONTROL_FIELD_BYTES: usize = 16_384;

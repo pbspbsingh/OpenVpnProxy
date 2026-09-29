@@ -2,6 +2,9 @@ use std::net::Ipv4Addr;
 
 use crate::error::{Result, StackError};
 
+pub(crate) const MIN_TUN_MTU: usize = 576;
+pub(crate) const MAX_TUN_MTU: usize = 1400;
+
 #[derive(Clone, Debug)]
 pub struct TunnelConfig {
     pub local: Ipv4Addr,
@@ -12,7 +15,7 @@ pub struct TunnelConfig {
 
 impl TunnelConfig {
     pub fn new(local: Ipv4Addr, gateway: Ipv4Addr, dns: Vec<Ipv4Addr>, mtu: usize) -> Result<Self> {
-        if !(576..=1400).contains(&mtu) {
+        if !(MIN_TUN_MTU..=MAX_TUN_MTU).contains(&mtu) {
             return Err(StackError::InvalidMtu);
         }
         Ok(Self {
@@ -43,9 +46,9 @@ pub enum StackPhase {
 impl StackPhase {
     pub(crate) fn from_raw(value: u8) -> Self {
         match value {
-            1 => Self::Configured,
-            2 => Self::Ready,
-            3 => Self::Failed,
+            value if value == Self::Configured as u8 => Self::Configured,
+            value if value == Self::Ready as u8 => Self::Ready,
+            value if value == Self::Failed as u8 => Self::Failed,
             _ => Self::Offline,
         }
     }

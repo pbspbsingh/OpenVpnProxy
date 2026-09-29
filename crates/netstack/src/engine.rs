@@ -28,6 +28,7 @@ struct Connection {
 }
 
 struct PendingDns {
+    host: String,
     query: dns::QueryHandle,
     reply: oneshot::Sender<Result<Ipv4Addr>>,
     deadline: Clock,
@@ -71,6 +72,7 @@ impl Engine {
             .collect();
         let mut sockets = SocketSet::new(vec![]);
         let dns_socket = sockets.add(dns::Socket::new(&servers, vec![]));
+        tracing::debug!(local = %config.local, gateway = %config.gateway, mtu = config.mtu, dns_servers = servers.len(), "userspace packet stack initialized");
         Ok(Self {
             iface,
             device,
@@ -86,29 +88,38 @@ impl Engine {
 
     fn handle(&mut self, command: Command) {
         match command {
-            Command::Packet(packet) => self.device.inbound.push_back(packet),
+            Command::Packet(packet) => {
+                tracing::trace!(bytes = packet.len(), "packet delivered to userspace stack");
+                self.device.inbound.push_back(packet);
+            }
             Command::Resolve(host, reply) => {
                 if !self.dns_available {
+                    tracing::warn!(%host, "tunneled DNS requested without a DNS server");
                     let _ = reply.send(Err(StackError::NoDnsServer));
                     return;
                 }
+                tracing::debug!(%host, "starting tunneled DNS query");
                 let socket = self.sockets.get_mut::<dns::Socket>(self.dns_socket);
                 match socket.start_query(self.iface.context(), &host, DnsQueryType::A) {
                     Ok(query) => self.pending_dns.push(PendingDns {
+                        host,
                         query,
                         reply,
                         deadline: Clock::now() + Duration::from_secs(10),
                     }),
                     Err(error) => {
+                        tracing::warn!(%host, ?error, "could not start tunneled DNS query");
                         let _ = reply.send(Err(StackError::DnsQuery(format!("{error:?}"))));
                     }
                 }
             }
             Command::Connect(id, address, events) => {
                 if self.connections.len() >= 256 {
+                    tracing::warn!(id, %address, "userspace TCP connection limit reached");
                     let _ = events.try_send(StreamEvent::Closed);
                     return;
                 }
+                tracing::debug!(id, %address, "opening userspace TCP connection");
                 let socket = tcp::Socket::new(
                     tcp::SocketBuffer::new(vec![0; TCP_BUFFER]),
                     tcp::SocketBuffer::new(vec![0; TCP_BUFFER]),
@@ -134,7 +145,8 @@ impl Engine {
                             },
                         );
                     }
-                    Err(_) => {
+                    Err(error) => {
+                        tracing::warn!(id, %address, ?error, "userspace TCP connect failed");
                         self.sockets.remove(handle);
                         let _ = events.try_send(StreamEvent::Closed);
                     }
@@ -143,6 +155,12 @@ impl Engine {
             Command::Data(id, data) => {
                 if let Some(connection) = self.connections.get_mut(&id) {
                     if connection.write_queue.len() + data.len() > MAX_QUEUED_WRITE {
+                        tracing::warn!(
+                            id,
+                            queued = connection.write_queue.len(),
+                            incoming = data.len(),
+                            "userspace TCP write queue limit reached"
+                        );
                         self.close(id);
                     } else {
                         connection.write_queue.extend(data);
@@ -156,6 +174,7 @@ impl Engine {
 
     fn close(&mut self, id: u64) {
         if let Some(connection) = self.connections.remove(&id) {
+            tracing::debug!(id, "closing userspace TCP connection");
             let _ = connection.events.try_send(StreamEvent::Closed);
             self.sockets.remove(connection.socket);
         }
@@ -164,6 +183,7 @@ impl Engine {
     fn tick(&mut self, now: Instant) -> Result<()> {
         self.iface.poll(now, &mut self.device, &mut self.sockets);
         while let Some(packet) = self.device.outbound.pop_front() {
+            tracing::trace!(bytes = packet.len(), "userspace stack produced VPN packet");
             self.io
                 .try_send(packet)
                 .map_err(|_| StackError::PacketDelivery)?;
@@ -172,6 +192,7 @@ impl Engine {
         for request in self.pending_dns.drain(..) {
             let socket = self.sockets.get_mut::<dns::Socket>(self.dns_socket);
             if Clock::now() >= request.deadline {
+                tracing::warn!(host = %request.host, "tunneled DNS query timed out");
                 socket.cancel_query(request.query);
                 let _ = request.reply.send(Err(StackError::DnsTimeout));
                 continue;
@@ -181,10 +202,12 @@ impl Engine {
                     let address = addresses.iter().next().map(|address| match address {
                         IpAddress::Ipv4(value) => *value,
                     });
+                    tracing::debug!(host = %request.host, ?address, "tunneled DNS query completed");
                     let _ = request.reply.send(address.ok_or(StackError::NoDnsAddress));
                 }
                 Err(dns::GetQueryResultError::Pending) => pending.push(request),
                 Err(_) => {
+                    tracing::warn!(host = %request.host, "tunneled DNS query failed");
                     let _ = request.reply.send(Err(StackError::DnsFailed));
                 }
             }
@@ -196,34 +219,56 @@ impl Engine {
             let socket = self.sockets.get_mut::<tcp::Socket>(connection.socket);
             if !connection.established && socket.state() == tcp::State::Established {
                 connection.established = true;
+                tracing::debug!(id, "userspace TCP connection established");
                 if connection.events.try_send(StreamEvent::Connected).is_err() {
+                    tracing::debug!(id, "TCP client disappeared before connection completed");
                     close.push(id);
                     continue;
                 }
             }
-            if !socket.is_active()
-                || (!connection.established && Clock::now() >= connection.deadline)
-            {
+            if !socket.is_active() {
+                tracing::debug!(id, state = ?socket.state(), "userspace TCP socket became inactive");
+                close.push(id);
+                continue;
+            }
+            if !connection.established && Clock::now() >= connection.deadline {
+                tracing::warn!(id, "userspace TCP connection timed out");
                 close.push(id);
                 continue;
             }
             if connection.established {
                 if socket.can_send() && !connection.write_queue.is_empty() {
                     let data = connection.write_queue.make_contiguous();
-                    if let Ok(written) = socket.send_slice(data) {
-                        connection.write_queue.drain(..written);
+                    match socket.send_slice(data) {
+                        Ok(written) => {
+                            tracing::trace!(id, bytes = written, "userspace TCP data queued");
+                            connection.write_queue.drain(..written);
+                        }
+                        Err(error) => {
+                            tracing::warn!(id, ?error, "userspace TCP send failed");
+                            close.push(id);
+                            continue;
+                        }
                     }
                 }
                 if socket.can_recv() && connection.events.capacity() > 0 {
                     let mut buffer = vec![0; 4096];
-                    if let Ok(read) = socket.recv_slice(&mut buffer) {
-                        buffer.truncate(read);
-                        if read > 0
-                            && connection
-                                .events
-                                .try_send(StreamEvent::Data(buffer))
-                                .is_err()
-                        {
+                    match socket.recv_slice(&mut buffer) {
+                        Ok(read) => {
+                            tracing::trace!(id, bytes = read, "userspace TCP data received");
+                            buffer.truncate(read);
+                            if read > 0
+                                && connection
+                                    .events
+                                    .try_send(StreamEvent::Data(buffer))
+                                    .is_err()
+                            {
+                                tracing::debug!(id, "TCP client disappeared during receive");
+                                close.push(id);
+                            }
+                        }
+                        Err(error) => {
+                            tracing::warn!(id, ?error, "userspace TCP receive failed");
                             close.push(id);
                         }
                     }
@@ -237,6 +282,11 @@ impl Engine {
     }
 
     fn shutdown(mut self) {
+        tracing::info!(
+            connections = self.connections.len(),
+            pending_dns = self.pending_dns.len(),
+            "userspace packet stack shutting down"
+        );
         for (_, connection) in self.connections.drain() {
             let _ = connection.events.try_send(StreamEvent::Closed);
         }
@@ -266,14 +316,17 @@ pub(crate) async fn run(mut rx: mpsc::Receiver<Command>, phase: Arc<AtomicU8>) {
                     Ok(new) => {
                         engine = Some(new);
                         phase.store(StackPhase::Configured as u8, Ordering::Release);
+                        tracing::debug!("userspace packet stack configured");
                         let _ = reply.send(Ok(()));
                     }
                     Err(error) => {
+                        tracing::error!(%error, "userspace packet stack configuration failed");
                         let _ = reply.send(Err(error));
                     }
                 }
             }
             Some(Some(Command::Reset)) => {
+                tracing::debug!("resetting userspace packet stack");
                 phase.store(StackPhase::Offline as u8, Ordering::Release);
                 if let Some(old) = engine.take() {
                     old.shutdown();

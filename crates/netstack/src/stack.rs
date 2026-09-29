@@ -85,6 +85,9 @@ impl Stack {
         if self.tx.try_send(Command::Packet(packet.to_vec())).is_err() {
             self.phase
                 .store(StackPhase::Failed as u8, Ordering::Release);
+            tracing::error!(
+                "packet stack command queue rejected a VPN packet; tunnel marked failed"
+            );
             return Err(StackError::CommandQueueFull);
         }
         Ok(())
@@ -137,6 +140,10 @@ impl Stack {
         self.tx.try_send(Command::Data(id, data)).map_err(|_| {
             self.phase
                 .store(StackPhase::Failed as u8, Ordering::Release);
+            tracing::error!(
+                id,
+                "packet stack command queue rejected TCP data; tunnel marked failed"
+            );
             StackError::CommandQueueFull
         })
     }
@@ -145,6 +152,10 @@ impl Stack {
         self.tx.try_send(Command::Close(id)).map_err(|_| {
             self.phase
                 .store(StackPhase::Failed as u8, Ordering::Release);
+            tracing::error!(
+                id,
+                "packet stack command queue rejected TCP close; tunnel marked failed"
+            );
             StackError::CommandQueueFull
         })
     }

@@ -48,10 +48,12 @@ impl Session {
         username: &str,
         password: &str,
     ) -> Result<Self> {
+        tracing::debug!(endpoint = %profile.endpoint, "opening OpenVPN UDP session");
         let socket = UdpSocket::bind("0.0.0.0:0").await?;
         socket.connect(profile.endpoint).await?;
         let mut link = Link::new(socket, profile.tls_crypt_key, tls_client(profile)?).await?;
         link.handshake().await?;
+        tracing::debug!("exchanging OpenVPN key method 2 messages");
         let mut km2 = client_km2(username, password)?;
         let send_result = link.write_app(&km2).await;
         km2.fill(0);
@@ -60,6 +62,7 @@ impl Session {
         link.write_app(b"PUSH_REQUEST\0").await?;
         let push = read_push(&mut link).await?;
         let (tunnel, peer_id, ping_interval, restart_interval) = parse_push(&push)?;
+        tracing::debug!(peer_id, local = %tunnel.local, gateway = %tunnel.gateway, mtu = tunnel.mtu, dns_servers = tunnel.dns.len(), ?ping_interval, ?restart_interval, "OpenVPN server settings accepted");
         let mut key = [0; 256];
         link.tls()
             .export_keying_material(&mut key, b"EXPORTER-OpenVPN-datakeys", None)?;
@@ -84,6 +87,11 @@ impl Session {
 
     pub async fn send_packet(&mut self, packet: &[u8]) -> Result<()> {
         let wire = self.data.encrypt(packet)?;
+        tracing::trace!(
+            plain_bytes = packet.len(),
+            wire_bytes = wire.len(),
+            "sending encrypted OpenVPN data"
+        );
         let sent = self.link.socket().send(&wire).await?;
         require(sent == wire.len(), "short VPN UDP send")
     }
@@ -95,6 +103,7 @@ impl Session {
             return Err(Error::Timeout("server stopped responding"));
         }
         if self.last_ping.elapsed() >= self.ping_interval.max(Duration::from_secs(5)) {
+            tracing::debug!("sending OpenVPN keepalive ping");
             self.send_packet(&PING).await?;
             self.last_ping = Instant::now();
         }
@@ -102,9 +111,15 @@ impl Session {
             Some(wire) => match self.data.decrypt(&wire) {
                 Ok(plain) => {
                     self.last_data = Instant::now();
+                    tracing::trace!(plain_bytes = plain.len(), "decrypted OpenVPN data");
                     if plain == PING { None } else { Some(plain) }
                 }
-                Err(Error::Replay | Error::DataAuthenticationFailed | Error::Protocol(_)) => None,
+                Err(
+                    error @ (Error::Replay | Error::DataAuthenticationFailed | Error::Protocol(_)),
+                ) => {
+                    tracing::debug!(%error, "discarded invalid OpenVPN data packet");
+                    None
+                }
                 Err(error) => return Err(error),
             },
             None => None,

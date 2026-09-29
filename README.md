@@ -9,10 +9,10 @@ This workspace contains a userspace OpenVPN SOCKS5 proof of concept. It creates 
 | `ovpn-profile` | Parse a supported `.ovpn` profile. No runtime or network dependencies. |
 | `ovpn-client` | OpenVPN control and data channels, TLS, and typed tunnel settings. |
 | `ovpn-netstack` | Userspace IPv4 TCP and DNS over decrypted VPN packets. |
-| `ovpn-socks5` | Loopback SOCKS5 CONNECT server using the packet stack. |
+| `ovpn-socks5` | SOCKS5 CONNECT server using the packet stack. |
 | `openvpn-proxy-app` | TOML configuration, async orchestration, and future Web UI. |
 
-The app is the composition root. The OpenVPN client, profile parser, and packet stack do not depend on each other. Reusable crates use `thiserror` for typed failures; the app uses `anyhow` for contextual errors. Tokio runs network I/O; the `smoltcp` engine is polled by one task. `tracing` provides logs (`RUST_LOG=debug` for detail).
+The app is the composition root. The OpenVPN client, profile parser, and packet stack do not depend on each other. Reusable crates use `thiserror` for typed failures; the app uses `anyhow` for contextual errors. Tokio runs network I/O; the `smoltcp` engine is polled by one task. `tracing` provides logs (`RUST_LOG=debug` for connection details and protocol retries, `RUST_LOG=trace` for packet sizes).
 
 ## Build and run
 

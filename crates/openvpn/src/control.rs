@@ -73,6 +73,7 @@ impl Link {
             app: Vec::new(),
             last_received: Instant::now(),
         };
+        tracing::debug!("starting OpenVPN control handshake");
         link.queue(HARD_RESET_CLIENT, &[]).await?;
         Ok(link)
     }
@@ -92,6 +93,12 @@ impl Link {
                 last_sent: Instant::now(),
                 attempts: 1,
             },
+        );
+        tracing::trace!(
+            opcode,
+            pid,
+            bytes = body.len(),
+            "queued OpenVPN control packet"
         );
         self.send_control(opcode, pid, body).await
     }
@@ -120,6 +127,11 @@ impl Link {
 
     async fn send_wrapped(&mut self, opcode: u8, payload: &[u8]) -> Result<()> {
         let wire = self.crypt.wrap(opcode << 3, self.local_sid, payload)?;
+        tracing::trace!(
+            opcode,
+            bytes = wire.len(),
+            "sending OpenVPN control datagram"
+        );
         let sent = self.socket.send(&wire).await?;
         ensure!(sent == wire.len(), "short VPN UDP send");
         Ok(())
@@ -173,7 +185,10 @@ impl Link {
     fn receive_control(&mut self, packet: &[u8]) -> Result<()> {
         let (op, sid, payload) = match self.crypt.unwrap(packet) {
             Ok(value) => value,
-            Err(Error::Replay | Error::ControlAuthenticationFailed | Error::Protocol(_)) => {
+            Err(
+                error @ (Error::Replay | Error::ControlAuthenticationFailed | Error::Protocol(_)),
+            ) => {
+                tracing::debug!(%error, "discarded invalid OpenVPN control packet");
                 return Ok(());
             }
             Err(error) => return Err(error),
@@ -205,6 +220,7 @@ impl Link {
         for ack in payload[1..ack_end].as_chunks::<4>().0 {
             self.pending.remove(&u32::from_be_bytes(*ack));
         }
+        tracing::trace!(opcode, acks = count, "received OpenVPN control datagram");
         self.last_received = Instant::now();
         if opcode == ACK {
             return Ok(());
@@ -219,6 +235,7 @@ impl Link {
                 .try_into()
                 .map_err(|_| Error::Protocol("short control message ID"))?,
         );
+        tracing::trace!(pid, opcode, "received OpenVPN control packet");
         self.acks.push_back(pid);
         if pid < self.next_rx {
             return Ok(());
@@ -253,10 +270,21 @@ impl Link {
                     .get_mut(&pid)
                     .ok_or(Error::Protocol("missing retransmit packet"))?;
                 if pending.attempts >= 8 {
+                    tracing::warn!(
+                        pid,
+                        opcode = pending.opcode,
+                        "OpenVPN control retransmission limit reached"
+                    );
                     return Err(Error::Timeout("control retransmission"));
                 }
                 pending.attempts += 1;
                 pending.last_sent = now;
+                tracing::debug!(
+                    pid,
+                    opcode = pending.opcode,
+                    attempts = pending.attempts,
+                    "retransmitting OpenVPN control packet"
+                );
                 (pending.opcode, pending.body.clone())
             };
             self.send_control(opcode, pid, &body).await?;
@@ -282,6 +310,7 @@ impl Link {
         match time::timeout(Duration::from_millis(50), self.socket.recv(&mut buffer)).await {
             Ok(Ok(n)) if n > 0 => {
                 if buffer[0] >> 3 == DATA {
+                    tracing::trace!(bytes = n, "received OpenVPN data datagram");
                     return Ok(Some(buffer[..n].to_vec()));
                 }
                 self.receive_control(&buffer[..n])?;
@@ -293,6 +322,7 @@ impl Link {
     }
 
     pub async fn handshake(&mut self) -> Result<()> {
+        tracing::debug!("waiting for OpenVPN TLS handshake");
         let deadline = Instant::now() + Duration::from_secs(30);
         while self.tls.is_handshaking() {
             if Instant::now() >= deadline {

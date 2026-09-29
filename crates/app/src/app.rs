@@ -12,14 +12,19 @@ use crate::config::{config_path, load_config};
 async fn resolve_vpn_endpoint(profile: &Profile) -> Result<SocketAddr> {
     let mut last_error = None;
     for (host, port) in &profile.remotes {
+        tracing::debug!(host, port, "resolving VPN remote");
         match tokio::net::lookup_host((host.as_str(), *port)).await {
             Ok(mut addresses) => {
                 if let Some(address) = addresses.find(SocketAddr::is_ipv4) {
-                    tracing::info!("VPN address host: {address:?}");
+                    tracing::info!(host, %address, "selected VPN remote");
                     return Ok(address);
                 }
+                tracing::warn!(host, port, "VPN remote has no IPv4 address");
             }
-            Err(error) => last_error = Some(error),
+            Err(error) => {
+                tracing::warn!(host, port, %error, "VPN remote lookup failed");
+                last_error = Some(error);
+            }
         }
     }
     if let Some(error) = last_error {
@@ -48,20 +53,25 @@ async fn serve_socks(
                     return Ok(());
                 }
                 accepted = listener.accept() => {
-                    let (stream, _) = accepted?;
+                    let (stream, peer) = accepted?;
+                    tracing::debug!(%peer, "SOCKS5 client accepted");
                     let stack = stack.clone();
                     tokio::spawn(async move {
                         if let Err(error) = ovpn_socks5::handle(stream, stack).await {
-                            tracing::debug!(%error, "SOCKS5 client ended with error");
+                            tracing::debug!(%peer, %error, "SOCKS5 client ended with error");
+                        } else {
+                            tracing::debug!(%peer, "SOCKS5 handler finished");
                         }
                     });
                 }
                 packet = outbound.recv() => {
                     let packet = packet.context("tunnel packet output channel closed")?;
+                    tracing::trace!(bytes = packet.len(), "sending VPN data packet");
                     session.send_packet(&packet).await?;
                 }
                 received = session.step() => {
                     if let Some(packet) = received? {
+                        tracing::trace!(bytes = packet.len(), "received VPN data packet");
                         stack.packet(&packet)?;
                     }
                 }
@@ -81,6 +91,11 @@ pub(crate) async fn run() -> Result<()> {
         .await
         .with_context(|| format!("cannot read profile {}", config.profile_path.display()))?;
     let profile = Profile::parse(&content).context("invalid OpenVPN profile")?;
+    tracing::debug!(
+        remotes = profile.remotes.len(),
+        credentials_required = profile.needs_credentials,
+        "OpenVPN profile loaded"
+    );
     if profile.needs_credentials && (config.username.is_empty() || config.password.is_empty()) {
         bail!("username and password are required by this profile");
     }
@@ -100,6 +115,7 @@ pub(crate) async fn run() -> Result<()> {
         .unwrap_or_else(|| settings.dns.clone());
     let tunnel = TunnelConfig::new(settings.local, settings.gateway, dns, settings.mtu)
         .context("invalid VPN tunnel settings")?;
+    tracing::info!(local = %tunnel.local, gateway = %tunnel.gateway, mtu = tunnel.mtu, dns_servers = tunnel.dns.len(), "VPN tunnel configured");
     let stack = Stack::start();
     let (packet_tx, packet_rx) = mpsc::channel(1024);
     stack

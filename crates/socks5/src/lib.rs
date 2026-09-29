@@ -1,6 +1,7 @@
 //! SOCKS5 TCP CONNECT handling over an assigned userspace VPN stack.
 
 use std::collections::VecDeque;
+use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::{Duration, Instant};
 
@@ -74,7 +75,10 @@ pub trait RouteLease: Send {
 pub trait RouteProvider: Clone + Send + Sync + 'static {
     type Lease: RouteLease;
 
-    fn select(&self, destination: &DestinationHost) -> Option<Self::Lease>;
+    fn select(
+        &self,
+        destination: DestinationHost,
+    ) -> impl Future<Output = Option<Self::Lease>> + Send;
 }
 
 /// Serves one unauthenticated SOCKS5 TCP connection through a VPN route.
@@ -84,7 +88,7 @@ pub async fn handle<R: RouteProvider>(mut stream: TcpStream, router: R) -> Resul
         return Ok(());
     };
     let route_started = Instant::now();
-    let Some(route) = router.select(&destination) else {
+    let Some(route) = router.select(destination.clone()).await else {
         tracing::warn!(
             ?destination,
             "SOCKS5 request rejected: no VPN host with a route to the destination"

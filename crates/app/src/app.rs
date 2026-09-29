@@ -28,7 +28,6 @@ pub(crate) async fn run() -> Result<()> {
     )
     .await?;
     let result = async {
-        manager.wait_ready().await?;
         let listener = TcpListener::bind(config.socks5_address)
             .await
             .with_context(|| format!("cannot bind SOCKS5 listener on {}", config.socks5_address))?;

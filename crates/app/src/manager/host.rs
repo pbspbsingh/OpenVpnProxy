@@ -10,14 +10,15 @@ use tokio::sync::{Semaphore, mpsc, watch};
 use tokio::time;
 
 use super::discovery::HostCandidate;
-use super::routing::{HostPhase, Shared};
+use super::routing::{HostPhase, HostUsage, Shared, UsageState};
 
 const TUNNEL_PACKET_QUEUE_CAPACITY: usize = 1024;
-pub(super) const CONTROL_SETUP_ALLOWANCE: Duration = Duration::from_secs(50);
+pub(super) const CONTROL_SETUP_ALLOWANCE: Duration = Duration::from_secs(30);
 const INITIAL_RETRY_DELAY: Duration = Duration::from_secs(2);
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(60);
 const STABLE_SESSION_WINDOW: Duration = Duration::from_secs(30);
 const HOST_STATUS_INTERVAL: Duration = Duration::from_secs(10);
+const VPN_IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 pub(super) struct HostWorker {
     pub(super) id: usize,
@@ -27,8 +28,14 @@ pub(super) struct HostWorker {
     pub(super) password: Arc<str>,
     pub(super) dns_override: Option<Ipv4Addr>,
     pub(super) permits: Arc<Semaphore>,
+    pub(super) usage: Arc<HostUsage>,
     pub(super) shared: Arc<Shared>,
     pub(super) stop: watch::Receiver<bool>,
+}
+
+enum HostExit {
+    Idle,
+    Shutdown,
 }
 
 impl HostWorker {
@@ -41,16 +48,33 @@ impl HostWorker {
             password,
             dns_override,
             permits,
+            usage,
             shared,
             mut stop,
         } = self;
+        let mut demand = usage.subscribe();
         let mut delay = INITIAL_RETRY_DELAY;
         let mut next_endpoint = 0;
-        loop {
+        'worker: loop {
             if *stop.borrow() {
                 break;
             }
-            shared.phase(id, HostPhase::Waiting);
+            shared.phase(id, HostPhase::Dormant);
+            while demand.borrow().active == 0 {
+                tokio::select! {
+                    changed = demand.changed() => if changed.is_err() { break 'worker; },
+                    _ = stop.changed() => break,
+                }
+                if *stop.borrow() {
+                    break;
+                }
+            }
+            if *stop.borrow() || demand.borrow().active == 0 {
+                if *stop.borrow() {
+                    break;
+                }
+                continue;
+            }
             let permit = tokio::select! {
                 result = permits.acquire() => match result {
                     Ok(permit) => permit,
@@ -68,7 +92,7 @@ impl HostWorker {
             };
             next_endpoint = (next_endpoint + 1) % candidate.endpoints.len();
             let started = Instant::now();
-            tracing::info!(host_id = id, address = %candidate.address, %endpoint, "connecting VPN host");
+            tracing::info!(host_id = id, address = %candidate.address, %endpoint, "connecting VPN host on demand");
             let connect_timeout = profile
                 .handshake_window
                 .saturating_add(CONTROL_SETUP_ALLOWANCE);
@@ -81,15 +105,32 @@ impl HostWorker {
                 Ok((session, stack, outbound)) => {
                     shared.ready(id, endpoint, &stack, started.elapsed());
                     let active_since = Instant::now();
-                    let result =
-                        drive_host(id, endpoint, &stack, session, outbound, &mut stop).await;
-                    let shutdown = *stop.borrow();
-                    shared.down(id, shutdown);
+                    let result = drive_host(
+                        id,
+                        endpoint,
+                        &stack,
+                        session,
+                        outbound,
+                        &shared,
+                        &mut demand,
+                        &mut stop,
+                    )
+                    .await;
+                    let shutdown = *stop.borrow() || matches!(&result, Ok(HostExit::Shutdown));
+                    let idle = matches!(&result, Ok(HostExit::Idle));
+                    if !idle {
+                        shared.down(id, shutdown);
+                    }
                     if let Err(error) = stack.reset().await {
                         tracing::error!(host_id = id, %endpoint, %error, "VPN packet stack reset failed");
                     }
+                    drop(permit);
                     if shutdown {
                         break;
+                    }
+                    if idle {
+                        delay = INITIAL_RETRY_DELAY;
+                        continue;
                     }
                     if let Err(error) = result {
                         tracing::warn!(host_id = id, %endpoint, %error, cause = %error.root_cause(), "VPN host disconnected");
@@ -101,9 +142,9 @@ impl HostWorker {
                 Err(error) => {
                     shared.down(id, false);
                     tracing::warn!(host_id = id, %endpoint, %error, cause = %error.root_cause(), "VPN host connection failed");
+                    drop(permit);
                 }
             }
-            drop(permit);
             tracing::debug!(host_id = id, %endpoint, ?delay, "waiting before VPN host retry");
             tokio::select! {
                 _ = time::sleep(delay) => {}
@@ -176,8 +217,10 @@ async fn drive_host(
     stack: &Stack,
     mut session: Session,
     mut outbound: mpsc::Receiver<Vec<u8>>,
+    shared: &Shared,
+    demand: &mut watch::Receiver<UsageState>,
     stop: &mut watch::Receiver<bool>,
-) -> Result<()> {
+) -> Result<HostExit> {
     let started = Instant::now();
     let stack_id = stack.id();
     let mut status = time::interval(HOST_STATUS_INTERVAL);
@@ -195,8 +238,17 @@ async fn drive_host(
             if !stack.is_ready() {
                 bail!("VPN packet stack stopped");
             }
+            let idle_deadline = demand.borrow().idle_since.map(|since| since + VPN_IDLE_TIMEOUT);
             tokio::select! {
-                _ = stop.changed() => return Ok(()),
+                _ = stop.changed() => return Ok(HostExit::Shutdown),
+                changed = demand.changed() => {
+                    changed.context("VPN host demand channel closed")?;
+                }
+                _ = wait_until_idle(idle_deadline) => {
+                    if shared.park_if_idle(id, VPN_IDLE_TIMEOUT)? {
+                        return Ok(HostExit::Idle);
+                    }
+                }
                 packet = outbound.recv() => {
                     let packet = packet.context("VPN packet output channel closed")?;
                     tracing::trace!(host_id = id, %endpoint, bytes = packet.len(), "sending VPN packet");
@@ -226,6 +278,14 @@ async fn drive_host(
             }
         }
     }.await;
-    tracing::debug!(host_id = id, %endpoint, stack_id, elapsed = ?started.elapsed(), sent_packets, received_packets, sent_bytes, received_bytes, outcome = if result.is_ok() { "shutdown" } else { "error" }, "VPN host traffic summary");
+    tracing::debug!(host_id = id, %endpoint, stack_id, elapsed = ?started.elapsed(), sent_packets, received_packets, sent_bytes, received_bytes, outcome = match &result { Ok(HostExit::Idle) => "idle", Ok(HostExit::Shutdown) => "shutdown", Err(_) => "error" }, "VPN host traffic summary");
     result
+}
+
+async fn wait_until_idle(deadline: Option<Instant>) {
+    if let Some(deadline) = deadline {
+        time::sleep_until(time::Instant::from_std(deadline)).await;
+    } else {
+        std::future::pending().await
+    }
 }

@@ -1,6 +1,6 @@
 # Rootless OpenVPN SOCKS5 proxy
 
-This Rust workspace is a userspace OpenVPN SOCKS5 proof of concept. An application connects to its SOCKS5 listener, and the proxy carries that application's TCP traffic through a selected OpenVPN server. It creates no TUN device, changes no system routes, and needs no root permissions. A real VPN profile has been tested on Linux; macOS still needs a build and live test.
+This Rust workspace is a userspace OpenVPN SOCKS5 proof of concept. An application connects to its SOCKS5 listener, and the proxy carries that application's TCP traffic through a selected OpenVPN server. It creates no TUN device, changes no system routes, and needs no root permissions. Earlier tunnel and proxy behavior was tested with a real VPN profile on Linux; the current lazy-host changes still need an app build and live test. macOS also needs a build and live test.
 
 ## The networking model
 
@@ -40,9 +40,9 @@ The dependency direction is `app → profile/client/netstack/socks5` and `socks5
 
 ### Connection manager and sticky routing
 
-The app resolves every profile `remote` to IPv4 endpoints, deduplicates them, and groups ports under each server IP. Each host worker tries its ports in turn, establishes a VPN session and packet stack, then monitors that tunnel. The first ready host lets the SOCKS listener start; other hosts continue connecting in the background. Up to `max_active_vpn_hosts` tunnels may be active at once (default: 16). A failed host is retried with bounded exponential backoff.
+The app resolves every profile `remote` to IPv4 endpoints, deduplicates them, and groups ports under each server IP. The SOCKS listener starts with all VPN hosts dormant. A request selects a host and wakes its worker; concurrent requests for that host share the same connection attempt. The worker tries the host's ports in turn, establishes a VPN session and packet stack, then monitors the tunnel. Up to `max_active_vpn_hosts` tunnels may be active at once (default: 16). A failed host is retried with bounded exponential backoff while requests need it.
 
-For a SOCKS hostname, the handler asks the manager for a route **before DNS**. The manager uses the Public Suffix List to group a registrable domain and its subdomains: `abc.com` and `xyz.abc.com` get the same assignment, while `example.co.uk` is handled correctly. A direct IP request uses its address as the sticky key; IPv6 destinations are assigned only to hosts with a matching VPN route. A new group chooses the less busy of two rotating healthy hosts. The assignment stays fixed until that host fails; changing load does not move an established group. On failure, the manager removes that host's assignments and resets its stack, closing existing proxied TCP connections. A later request can choose another healthy host.
+For a SOCKS hostname, the handler asks the manager for a route **before DNS**. The manager uses the Public Suffix List to group a registrable domain and its subdomains: `abc.com` and `xyz.abc.com` get the same assignment, while `example.co.uk` is handled correctly. A direct IP request uses its address as the sticky key. A new group chooses the lowest-cost eligible host, balancing active requests against the cost of opening a dormant tunnel. IPv6 requests use a host only after its tunnel confirms a matching IPv6 route; a dormant host may need to connect before that can be checked. The assignment stays fixed until that host fails; changing load does not move an established group. On failure, the manager removes that host's assignments and resets its stack, closing existing proxied TCP connections. A later request can choose another healthy host. After the last request lease closes, an idle host keeps its tunnel for 30 minutes, then closes it; its sticky assignments remain for the next request.
 
 The sticky table is bounded. If it fills, new groups fail closed rather than silently losing their assignment. DNS for a hostname runs through its assigned host's packet stack, so DNS and TCP use the same VPN.
 
@@ -63,35 +63,24 @@ The control channel establishes trust and derives data keys. The data channel ca
 
 ## Startup sequence
 
-The listener is opened only after at least one VPN session and its packet stack are ready. Other host workers may continue connecting afterward.
+The listener opens after profile validation and VPN host discovery. VPN sessions start when requests arrive.
 
 ```mermaid
 sequenceDiagram
     participant App as App
     participant Profile as Profile parser
     participant Manager as Connection manager
-    participant VPN as OpenVPN client
-    participant Server as VPN server
-    participant Stack as Userspace stack
     participant Listener as SOCKS listener
 
     App->>Profile: Read config.toml and parse .ovpn
     Profile-->>App: Remotes, CA, keys, options
     App->>Manager: Resolve all remotes; group endpoints by server IP
-    Manager->>VPN: One worker connects UDP and starts OpenVPN session
-    VPN->>Server: Protected reset and TLS handshake
-    Server-->>VPN: Certificate and control replies
-    VPN->>Server: Credentials and PUSH_REQUEST inside TLS
-    Server-->>VPN: Tunnel address, DNS, peer ID, cipher, timers
-    VPN-->>Manager: Session and tunnel settings
-    Manager->>Stack: Configure and activate this host's stack
-    Manager-->>App: At least one host is ready
+    Manager-->>App: Dormant host pool ready
     App->>Listener: Bind socks5_address
-    Note over Manager,Stack: Other host workers may still be connecting
     Listener-->>App: Accept SOCKS5 clients
 ```
 
-If no host becomes ready before the startup deadline, startup returns an error and the SOCKS listener is not opened. The manager does not benchmark throughput or refresh remote DNS records after startup yet.
+Profile or host discovery errors prevent startup. The manager does not benchmark throughput or refresh remote DNS records after startup yet.
 
 ## One proxied HTTPS request
 
@@ -110,6 +99,10 @@ sequenceDiagram
 
     Client->>Socks: Local TCP; SOCKS5 CONNECT example.com:443
     Socks->>Manager: Select sticky host for example.com
+    Manager->>VPN: Wake selected worker; start OpenVPN session if dormant
+    VPN->>Server: Protected reset, TLS handshake, credentials, PUSH_REQUEST
+    Server-->>VPN: Tunnel settings
+    VPN-->>Manager: Session established; activate packet stack
     Manager-->>Socks: Lease for one ready host and its stack
     opt Destination is a hostname
         Socks->>Stack: Resolve A or AAAA record
@@ -148,7 +141,7 @@ sequenceDiagram
     end
 ```
 
-The app's serving loop accepts SOCKS clients and handles shutdown. Each accepted client gets an async task. Each VPN host worker separately multiplexes outbound stack packets, inbound OpenVPN packets, keepalive/status work, and shutdown. Each packet stack has one owning task for its TCP and DNS state.
+The app's serving loop accepts SOCKS clients and handles shutdown. Each accepted client gets an async task. Each VPN host worker separately multiplexes outbound stack packets, inbound OpenVPN packets, keepalive/status work, idle timeout, and shutdown. Each packet stack has one owning task for its TCP and DNS state.
 
 ## Key rotation and failure behavior
 
@@ -156,7 +149,7 @@ OpenVPN may request a new data key, or the client may start renegotiation when i
 
 The design fails closed for **traffic handled by this proxy**:
 
-- If the VPN is unavailable at startup, there is no SOCKS listener.
+- The SOCKS listener can start before a VPN connects. A request waits for a selected host up to the profile handshake window plus 30 seconds for control setup (60 seconds with the default 30-second handshake window). A failed host clears its assignment so the request can try another eligible host within the same deadline. If no host becomes ready, the proxy returns a SOCKS5 network failure. A profile's `hand-window` setting overrides the default handshake window and also limits key renegotiation.
 - During a session, SOCKS requests can select only a ready host. A VPN or stack error marks that host unhealthy, clears its sticky assignments, resets its stack, and closes its client connections. Other hosts continue serving. Full queues mark the affected stack failed instead of bypassing it.
 - There is no direct-to-destination fallback in the SOCKS or stack crates. If every host is unavailable, new requests fail. The manager retries failed hosts and tries their alternate ports; automatic DNS rediscovery and migration of existing TCP connections are not implemented.
 
@@ -180,7 +173,7 @@ curl --socks5-hostname 127.0.0.1:1080 https://example.com
 RUST_LOG=debug cargo run --release -p openvpn-proxy-app
 ```
 
-`RUST_LOG=info` shows discovered hosts, ready/down transitions, and new domain assignments. `RUST_LOG=debug` adds sticky reuse, retries, and per-host activity. `RUST_LOG=trace` adds packet flow details. `socks5_address = "0.0.0.0:1080"` accepts clients from other machines. The proxy has **no SOCKS authentication**, so choose the bind address and network exposure accordingly. `config.toml` contains credentials; it and `*.ovpn` are ignored by Git.
+`RUST_LOG=info` shows discovered hosts, connection attempts, ready/down transitions, idle closures, and new domain assignments. `RUST_LOG=debug` adds route requests, retries, and per-host activity. `RUST_LOG=trace` adds packet flow details. `socks5_address = "0.0.0.0:1080"` accepts clients from other machines. The proxy has **no SOCKS authentication**, so choose the bind address and network exposure accordingly. `config.toml` contains credentials; it and `*.ovpn` are ignored by Git.
 
 For a browser speed test, run the release build with `RUST_LOG=debug`. `stack_id` links route, SOCKS, VPN host, and packet stack logs. A `SOCKS5 transfer summary` reports route, DNS, TCP connect, and transfer times plus bytes in each direction; `first_response` measures the first tunneled bytes after the SOCKS connection, which may be a TLS handshake. Active transfers and packet stacks also report 10-second traffic windows. `packet stack activity` includes command, timer, and consumer wakeups, timer lateness, time spent per pass, full 4 KiB reads, event queue stalls, and the largest queued TCP write. Share these summaries and the matching `VPN host traffic` lines when investigating a slow request; debug logs also contain destination names.
 

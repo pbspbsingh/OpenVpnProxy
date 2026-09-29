@@ -5,7 +5,7 @@ use std::time::Duration;
 use thiserror::Error;
 
 const DEFAULT_RENEGOTIATION_INTERVAL: Duration = Duration::from_secs(3600);
-const DEFAULT_HANDSHAKE_WINDOW: Duration = Duration::from_secs(60);
+const DEFAULT_HANDSHAKE_WINDOW: Duration = Duration::from_secs(30);
 const DEFAULT_TRANSITION_WINDOW: Duration = Duration::from_secs(3600);
 const DEFAULT_REMOTE_PORT: u16 = 1194;
 const TLS_CRYPT_KEY_BYTES: usize = 256;

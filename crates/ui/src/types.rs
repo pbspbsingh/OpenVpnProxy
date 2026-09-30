@@ -109,6 +109,7 @@ pub(crate) struct DashboardFrame {
 #[derive(Serialize)]
 pub(crate) struct MinuteSample {
     pub minute_start_ms: u64,
+    pub observed_ms: u64,
     pub tx_bytes: u64,
     pub rx_bytes: u64,
     pub average_latency_ms: Option<f64>,

@@ -5,25 +5,30 @@ const HISTORY_MINUTES = 60;
 const WS_INTERVAL_MS = 5_000;
 const WS_STALE_MS = WS_INTERVAL_MS * 4;
 const WS_HEALTH_CHECK_MS = 2_000;
+const WS_RETRY_DELAYS_MS = [5_000, 10_000, 30_000];
 const MAX_RATE_SAMPLE_GAP_SECONDS = WS_STALE_MS / 1000;
 const COLORS = { rx: "#42d5c8", tx: "#8f9dff", latency: "#f1bd77" };
 const INITIAL_VISIBLE_LOG_ROWS = 2000;
 const LOG_LEVEL_RANK = { TRACE: 0, DEBUG: 1, INFO: 2, WARN: 3, ERROR: 4 };
-const state = { frame: null, previous: null, rates: null, hostRates: new Map(), selectedHostId: null, tab: "overview", socket: null, retryMs: 1000, lastMessageAt: 0, groupHostId: null, groupItems: [], groupTotal: 0, groupRequest: null, profileLoaded: false, profileRequest: false };
-const logState = { socket: null, retryMs: 1000, retryTimer: null, entries: [], head: 0, matchingCount: 0, capacity: 1000, lastSequence: 0, visibleLimit: INITIAL_VISIBLE_LOG_ROWS, pending: [], renderScheduled: false };
+const charts = new Map();
+const state = { frame: null, previous: null, rates: null, hostRates: new Map(), selectedHostId: null, tab: "overview", socket: null, retryAttempt: 0, lastMessageAt: 0, groupHostId: null, groupItems: [], groupTotal: 0, groupRequest: null, profileLoaded: false, profileRequest: false };
+const logState = { socket: null, retryAttempt: 0, retryExhausted: false, retryTimer: null, entries: [], head: 0, matchingCount: 0, capacity: 1000, lastSequence: 0, visibleLimit: INITIAL_VISIBLE_LOG_ROWS, pending: [], renderScheduled: false };
 const $ = (id) => document.getElementById(id);
 
 function text(id, value) { $(id).textContent = value; }
 function humanPhase(phase) { return phase ? phase.replaceAll("_", " ").replace(/^./, (c) => c.toUpperCase()) : "Unknown"; }
 function formatBytes(bytes) {
   if (!Number.isFinite(bytes)) return "—";
-  const units = ["B", "KB", "MB", "GB", "TB"];
+  const units = ["B", "kB", "MB", "GB", "TB"];
   let value = Math.max(0, bytes);
   let unit = 0;
   while (value >= 1000 && unit < units.length - 1) { value /= 1000; unit++; }
   return `${value.toFixed(unit === 0 ? 0 : value >= 100 ? 0 : 1)} ${units[unit]}`;
 }
-function formatRate(bytesPerSecond) { return `${formatBytes(bytesPerSecond)}/s`; }
+function formatRate(bytesPerSecond) {
+  if (bytesPerSecond > 0 && bytesPerSecond < 1) return `${bytesPerSecond.toPrecision(2)} B/s`;
+  return `${formatBytes(bytesPerSecond)}/s`;
+}
 function formatLatency(ms) { return ms == null ? "—" : `${ms.toFixed(1)} ms`; }
 function make(tag, className, value) {
   const node = document.createElement(tag);
@@ -37,16 +42,22 @@ function setFeed(kind, label) {
   text("feed-label", label);
 }
 
+function nextRetryDelay(connection) {
+  if (connection.retryAttempt >= WS_RETRY_DELAYS_MS.length) return null;
+  return WS_RETRY_DELAYS_MS[connection.retryAttempt++];
+}
+
 function connect() {
   setFeed("connecting", "Connecting");
   const scheme = location.protocol === "https:" ? "wss:" : "ws:";
   const socket = new WebSocket(`${scheme}//${location.host}/ws`);
   state.socket = socket;
-  socket.onopen = () => { state.retryMs = 1000; state.lastMessageAt = Date.now(); setFeed("live", "Live"); };
+  socket.onopen = () => { state.lastMessageAt = Date.now(); setFeed("live", "Live"); };
   socket.onmessage = (event) => {
     let frame;
     try { frame = JSON.parse(event.data); } catch { return; }
     if (frame?.snapshot?.version !== 1 || !Array.isArray(frame.history)) return;
+    state.retryAttempt = 0;
     state.lastMessageAt = Date.now();
     state.previous = state.frame?.snapshot ?? null;
     state.frame = frame;
@@ -57,23 +68,26 @@ function connect() {
   socket.onerror = () => socket.close();
   socket.onclose = () => {
     if (state.socket !== socket) return;
-    setFeed("offline", "Reconnecting");
-    const delay = state.retryMs;
-    state.retryMs = Math.min(state.retryMs * 2, 10000);
+    const delay = nextRetryDelay(state);
+    if (delay == null) { setFeed("offline", "Disconnected"); return; }
+    setFeed("offline", `Reconnecting in ${delay / 1000}s`);
     window.setTimeout(connect, delay);
   };
 }
 
 function connectLogs() {
-  if (state.tab !== "logs" || logState.socket) return;
+  if (state.tab !== "logs" || logState.socket || logState.retryExhausted) return;
   text("log-status", "Connecting");
   const scheme = location.protocol === "https:" ? "wss:" : "ws:";
   const socket = new WebSocket(`${scheme}//${location.host}/ws/logs`);
   logState.socket = socket;
-  socket.onopen = () => { logState.retryMs = 1000; text("log-status", "Live"); };
+  socket.onopen = () => { text("log-status", "Live"); };
   socket.onmessage = (event) => {
     let message;
     try { message = JSON.parse(event.data); } catch { return; }
+    if (message?.type !== "reset" && message?.type !== "batch"
+        && message?.type !== "entry" && message?.type !== "dropped") return;
+    logState.retryAttempt = 0;
     if (message.type === "reset") {
       logState.capacity = message.capacity;
       logState.entries = [];
@@ -99,9 +113,13 @@ function connectLogs() {
     if (logState.socket !== socket) return;
     logState.socket = null;
     if (state.tab !== "logs") return;
-    text("log-status", "Reconnecting");
-    const delay = logState.retryMs;
-    logState.retryMs = Math.min(logState.retryMs * 2, 10000);
+    const delay = nextRetryDelay(logState);
+    if (delay == null) {
+      logState.retryExhausted = true;
+      text("log-status", "Disconnected");
+      return;
+    }
+    text("log-status", `Reconnecting in ${delay / 1000}s`);
     logState.retryTimer = window.setTimeout(() => { logState.retryTimer = null; connectLogs(); }, delay);
   };
 }
@@ -109,10 +127,11 @@ function connectLogs() {
 function disconnectLogs() {
   if (logState.retryTimer != null) window.clearTimeout(logState.retryTimer);
   logState.retryTimer = null;
+  if (!logState.retryExhausted) logState.retryAttempt = 0;
   const socket = logState.socket;
   logState.socket = null;
   if (socket) socket.close();
-  text("log-status", "Paused while tab is closed");
+  text("log-status", logState.retryExhausted ? "Disconnected" : "Paused while tab is closed");
 }
 
 function updateLogDropped(count) {
@@ -421,90 +440,103 @@ function minuteSeries(history, sampledAtMs, valueForBucket) {
   });
 }
 
+function bucketRate(bytes, observedMs) {
+  return observedMs > 0 ? bytes * 1000 / observedMs : null;
+}
+
 function renderCharts() {
   if (!state.frame) return;
   const { history, snapshot } = state.frame;
   if (state.tab === "overview") {
-    const rx = minuteSeries(history, snapshot.sampled_at_ms, (bucket) => bucket.rx_bytes / 1e6);
-    const tx = minuteSeries(history, snapshot.sampled_at_ms, (bucket) => bucket.tx_bytes / 1e6);
-    drawChart($("system-traffic-chart"), [{ values: rx, color: COLORS.rx }, { values: tx, color: COLORS.tx }], "MB/min", snapshot.sampled_at_ms);
+    const rx = minuteSeries(history, snapshot.sampled_at_ms, (bucket) => bucketRate(bucket.rx_bytes, bucket.observed_ms));
+    const tx = minuteSeries(history, snapshot.sampled_at_ms, (bucket) => bucketRate(bucket.tx_bytes, bucket.observed_ms));
+    drawChart($("system-traffic-chart"), [{ label: "Download", values: rx, color: COLORS.rx }, { label: "Upload", values: tx, color: COLORS.tx }], "B/s", snapshot.sampled_at_ms);
     const latency = minuteSeries(history, snapshot.sampled_at_ms, (bucket) => bucket.average_latency_ms);
-    drawChart($("system-latency-chart"), [{ values: latency, color: COLORS.latency }], "ms", snapshot.sampled_at_ms, true);
+    drawChart($("system-latency-chart"), [{ label: "Selected host mean", values: latency, color: COLORS.latency }], "ms", snapshot.sampled_at_ms, true);
   } else if (state.tab === "hosts" && state.selectedHostId != null) {
     const id = state.selectedHostId;
     const hostValue = (bucket, field) => bucket.hosts.find((host) => host.host_id === id)?.[field] ?? null;
     const rx = minuteSeries(history, snapshot.sampled_at_ms, (bucket) => {
-      const value = hostValue(bucket, "rx_bytes"); return value == null ? null : value / 1e6;
+      const value = hostValue(bucket, "rx_bytes"); return value == null ? null : bucketRate(value, bucket.observed_ms);
     });
     const tx = minuteSeries(history, snapshot.sampled_at_ms, (bucket) => {
-      const value = hostValue(bucket, "tx_bytes"); return value == null ? null : value / 1e6;
+      const value = hostValue(bucket, "tx_bytes"); return value == null ? null : bucketRate(value, bucket.observed_ms);
     });
     const latency = minuteSeries(history, snapshot.sampled_at_ms, (bucket) => hostValue(bucket, "average_latency_ms"));
-    drawChart($("host-traffic-chart"), [{ values: rx, color: COLORS.rx }, { values: tx, color: COLORS.tx }], "MB/min", snapshot.sampled_at_ms);
-    drawChart($("host-latency-chart"), [{ values: latency, color: COLORS.latency }], "ms", snapshot.sampled_at_ms, true);
+    drawChart($("host-traffic-chart"), [{ label: "Download", values: rx, color: COLORS.rx }, { label: "Upload", values: tx, color: COLORS.tx }], "B/s", snapshot.sampled_at_ms);
+    drawChart($("host-latency-chart"), [{ label: "Probe score", values: latency, color: COLORS.latency }], "ms", snapshot.sampled_at_ms, true);
   }
 }
 
 function drawChart(canvas, series, unit, sampledAtMs, latencyScale = false) {
-  const width = canvas.clientWidth;
-  const height = canvas.clientHeight;
-  if (width < 50 || height < 50) return;
-  const pixelRatio = Math.min(window.devicePixelRatio || 1, 2);
-  const targetWidth = Math.round(width * pixelRatio);
-  const targetHeight = Math.round(height * pixelRatio);
-  if (canvas.width !== targetWidth || canvas.height !== targetHeight) {
-    canvas.width = targetWidth; canvas.height = targetHeight;
-  }
-  const ctx = canvas.getContext("2d");
-  ctx.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);
-  ctx.clearRect(0, 0, width, height);
-  const left = 43, right = 12, top = 13, bottom = 28;
-  const plotWidth = width - left - right, plotHeight = height - top - bottom;
+  if (!window.Chart || canvas.clientWidth < 50 || canvas.clientHeight < 50) return;
   const all = series.flatMap((line) => line.values.filter((value) => Number.isFinite(value)));
   const observedMin = all.length ? Math.min(...all) : 0;
   const observedMax = all.length ? Math.max(...all) : 1;
   const low = latencyScale ? Math.max(0, Math.floor((observedMin - 10) / 10) * 10) : 0;
   const high = latencyScale ? Math.max(low + 10, Math.ceil((observedMax + 10) / 10) * 10) : Math.max(1, observedMax * 1.15);
-  const xAt = (index) => left + index / (HISTORY_MINUTES - 1) * plotWidth;
-  const yAt = (value) => top + (high - value) / (high - low) * plotHeight;
-
-  ctx.font = "11px ui-sans-serif, system-ui, sans-serif";
-  ctx.textBaseline = "middle";
-  for (let tick = 0; tick <= 4; tick++) {
-    const y = top + tick / 4 * plotHeight;
-    ctx.beginPath(); ctx.moveTo(left, y); ctx.lineTo(width - right, y);
-    ctx.strokeStyle = "rgba(142,160,178,.13)"; ctx.lineWidth = 1; ctx.stroke();
-    const value = high - tick / 4 * (high - low);
-    ctx.fillStyle = "#8192a5"; ctx.textAlign = "right";
-    ctx.fillText(unit === "ms" ? value.toFixed(0) : value.toFixed(value >= 10 ? 0 : 1), left - 9, y);
-  }
   const currentMinute = Math.floor(sampledAtMs / MINUTE_MS) * MINUTE_MS;
-  for (const index of [0, 29, 59]) {
-    const time = new Date(currentMinute - (59 - index) * MINUTE_MS);
-    ctx.textAlign = index === 0 ? "left" : index === 59 ? "right" : "center";
-    ctx.fillStyle = "#718399";
-    ctx.fillText(time.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }), xAt(index), height - 9);
+  const labels = Array.from({ length: HISTORY_MINUTES }, (_, index) =>
+    new Date(currentMinute - (HISTORY_MINUTES - 1 - index) * MINUTE_MS).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }));
+  const datasets = series.map((line) => ({
+    label: line.label, data: line.values, borderColor: line.color, backgroundColor: line.color,
+    borderWidth: 2, pointRadius: 0, pointHoverRadius: 4, pointHitRadius: 10, spanGaps: false,
+  }));
+  const chart = charts.get(canvas.id);
+  if (chart) {
+    chart.data.labels = labels;
+    chart.data.datasets = datasets;
+    chart.options.scales.y.min = low;
+    chart.options.scales.y.max = high;
+    chart.resize();
+    chart.update("none");
+    return;
   }
-  for (const line of series) {
-    let drawing = false;
-    ctx.beginPath();
-    line.values.forEach((value, index) => {
-      if (!Number.isFinite(value)) { drawing = false; return; }
-      if (!drawing) { ctx.moveTo(xAt(index), yAt(value)); drawing = true; }
-      else ctx.lineTo(xAt(index), yAt(value));
-    });
-    ctx.strokeStyle = line.color; ctx.lineWidth = 2; ctx.lineJoin = "round"; ctx.lineCap = "round";
-    ctx.shadowColor = line.color; ctx.shadowBlur = 8; ctx.stroke(); ctx.shadowBlur = 0;
-    const last = line.values.findLastIndex((value) => Number.isFinite(value));
-    if (last >= 0) {
-      ctx.beginPath(); ctx.arc(xAt(last), yAt(line.values[last]), 3, 0, Math.PI * 2);
-      ctx.fillStyle = line.color; ctx.fill();
-    }
-  }
-  if (all.length === 0) {
-    ctx.textAlign = "center"; ctx.fillStyle = "#718399";
-    ctx.fillText("Waiting for chart samples", left + plotWidth / 2, top + plotHeight / 2);
-  }
+  charts.set(canvas.id, new Chart(canvas, {
+    type: "line",
+    data: { labels, datasets },
+    options: {
+      responsive: true, maintainAspectRatio: false, animation: false,
+      interaction: { mode: "index", intersect: false },
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          backgroundColor: "#172230", borderColor: "#3a5268", borderWidth: 1,
+          titleColor: "#e9f0f7", bodyColor: "#e9f0f7",
+          callbacks: {
+            label: (item) => `${item.dataset.label}: ${unit === "ms" ? formatLatency(item.parsed.y) : formatRate(item.parsed.y)}`,
+          },
+        },
+      },
+      scales: {
+        x: {
+          grid: { display: false }, border: { display: false },
+          ticks: { color: "#718399", font: { size: 11 }, maxTicksLimit: 3, maxRotation: 0 },
+        },
+        y: {
+          min: low, max: high, border: { display: false },
+          grid: { color: "rgba(142,160,178,.13)" },
+          ticks: {
+            color: "#8192a5", font: { size: 11 }, maxTicksLimit: 5,
+            callback: (value) => unit === "ms" ? formatLatency(value) : formatRate(value),
+          },
+        },
+      },
+    },
+    plugins: [{
+      id: "emptyChartMessage",
+      afterDraw: (chart) => {
+        if (chart.data.datasets.some((line) => line.data.some((value) => Number.isFinite(value)))) return;
+        const { ctx, chartArea } = chart;
+        ctx.save();
+        ctx.fillStyle = "#718399";
+        ctx.font = "11px ui-sans-serif, system-ui, sans-serif";
+        ctx.textAlign = "center";
+        ctx.fillText("Waiting for chart samples", (chartArea.left + chartArea.right) / 2, (chartArea.top + chartArea.bottom) / 2);
+        ctx.restore();
+      },
+    }],
+  }));
 }
 
 document.querySelectorAll(".tab").forEach((button) => button.addEventListener("click", () => {

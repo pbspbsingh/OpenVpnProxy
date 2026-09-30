@@ -7,6 +7,7 @@
   <title>OpenVPN Proxy · Status</title>
   <link rel="icon" type="image/svg+xml" href="/favicon.svg">
   <link rel="stylesheet" href="/style.css">
+  <script defer src="https://cdn.jsdelivr.net/npm/chart.js@4.5.1/dist/chart.umd.min.js" integrity="sha384-jb8JQMbMoBUzgWatfe6COACi2ljcDdZQ2OxczGA3bGNeWe+6DChMTBJemed7ZnvJ" crossorigin="anonymous"></script>
   <script defer src="/app.js"></script>
 </head>
 <body>
@@ -40,7 +41,7 @@
           <article class="metric-card"><div class="metric-label">Upload</div><div id="system-tx-rate" class="metric-value">—</div><div id="system-tx-total" class="metric-detail">Total —</div></article>
         </div>
         <div class="chart-grid">
-          <article class="panel chart-panel"><div class="panel-heading"><div><div class="eyebrow">TUNNEL THROUGHPUT</div><h3>System traffic</h3></div><div class="legend"><span class="legend-item"><i class="swatch rx"></i> Download</span><span class="legend-item"><i class="swatch tx"></i> Upload</span></div></div><div class="chart-wrap"><canvas id="system-traffic-chart" aria-label="System traffic per minute for the last hour"></canvas></div><div class="chart-foot">Bytes through VPN tunnels, grouped into one-minute buckets. Current minute is partial.</div></article>
+          <article class="panel chart-panel"><div class="panel-heading"><div><div class="eyebrow">TUNNEL THROUGHPUT</div><h3>System traffic</h3></div><div class="legend"><span class="legend-item"><i class="swatch rx"></i> Download</span><span class="legend-item"><i class="swatch tx"></i> Upload</span></div></div><div class="chart-wrap"><canvas id="system-traffic-chart" aria-label="Average system download and upload rate for each minute of the last hour"></canvas></div><div class="chart-foot">Average rate in each one-minute bucket. Current minute is partial.</div></article>
           <article class="panel chart-panel"><div class="panel-heading"><div><div class="eyebrow">TUNNEL RESPONSIVENESS</div><h3>System latency</h3></div><div class="legend"><span class="legend-item"><i class="swatch latency"></i> Selected host mean</span></div></div><div class="chart-wrap"><canvas id="system-latency-chart" aria-label="Average selected host latency per minute for the last hour"></canvas></div><div class="chart-foot">Mean of selected hosts' tunneled TCP probe scores.</div></article>
         </div>
         <div class="panel overview-strip"><div><span class="strip-label">Hosts online</span><strong id="hosts-ready">—</strong></div><div><span class="strip-label">Sticky groups</span><strong id="sticky-count">—</strong></div><div><span class="strip-label">Candidates</span><strong id="candidate-count">—</strong></div><div><span class="strip-label">Active limit</span><strong id="active-limit">—</strong></div></div>
@@ -53,7 +54,7 @@
           <div class="host-detail">
             <article class="panel host-detail-header"><div><div class="eyebrow">SELECTED HOST</div><h3 id="selected-host-name">Choose a host</h3><div id="selected-host-endpoint" class="muted">—</div></div><div id="selected-host-badge" class="phase-badge">—</div><div id="selected-host-stats" class="host-detail-stats"></div></article>
             <div class="host-chart-grid">
-              <article class="panel chart-panel"><div class="panel-heading"><div><div class="eyebrow">TUNNEL THROUGHPUT</div><h3>Host traffic</h3></div><div class="legend"><span class="legend-item"><i class="swatch rx"></i> Download</span><span class="legend-item"><i class="swatch tx"></i> Upload</span></div></div><div class="chart-wrap"><canvas id="host-traffic-chart" aria-label="Selected host traffic per minute for the last hour"></canvas></div><div class="chart-foot">One-minute buckets for the selected VPN host.</div></article>
+              <article class="panel chart-panel"><div class="panel-heading"><div><div class="eyebrow">TUNNEL THROUGHPUT</div><h3>Host traffic</h3></div><div class="legend"><span class="legend-item"><i class="swatch rx"></i> Download</span><span class="legend-item"><i class="swatch tx"></i> Upload</span></div></div><div class="chart-wrap"><canvas id="host-traffic-chart" aria-label="Average selected host download and upload rate for each minute of the last hour"></canvas></div><div class="chart-foot">Average rate for each one-minute bucket.</div></article>
               <article class="panel chart-panel"><div class="panel-heading"><div><div class="eyebrow">TUNNEL RESPONSIVENESS</div><h3>Host latency</h3></div><div class="legend"><span class="legend-item"><i class="swatch latency"></i> Probe score</span></div></div><div class="chart-wrap"><canvas id="host-latency-chart" aria-label="Selected host latency per minute for the last hour"></canvas></div><div class="chart-foot">Median TCP probe latency, smoothed by the connection manager.</div></article>
             </div>
             <article id="assigned-groups" class="panel groups-panel">

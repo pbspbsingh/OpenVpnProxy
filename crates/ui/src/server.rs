@@ -8,7 +8,8 @@ use axum::Router;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Query, State};
 use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE, HOST, ORIGIN};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
+use axum::middleware::map_response;
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{any, get};
 use serde::Deserialize;
@@ -107,6 +108,7 @@ pub async fn serve<S: SnapshotSource>(
         .route("/api/profile", get(profile))
         .route("/ws", any(websocket))
         .route("/ws/logs", any(log_websocket))
+        .layer(map_response(no_cache))
         .with_state(state);
     tracing::info!(address = %listener.local_addr()?, "dashboard listening");
 
@@ -149,38 +151,28 @@ async fn wait_for_shutdown(mut shutdown: watch::Receiver<bool>) {
     }
 }
 
+async fn no_cache(mut response: Response) -> Response {
+    response.headers_mut().insert(
+        CACHE_CONTROL,
+        HeaderValue::from_static("no-cache, no-store"),
+    );
+    response
+}
+
 async fn index() -> impl IntoResponse {
-    ([(CACHE_CONTROL, "no-store")], Html(UI_HTML))
+    Html(UI_HTML)
 }
 
 async fn style() -> impl IntoResponse {
-    (
-        [
-            (CONTENT_TYPE, "text/css; charset=utf-8"),
-            (CACHE_CONTROL, "no-store"),
-        ],
-        UI_CSS,
-    )
+    ([(CONTENT_TYPE, "text/css; charset=utf-8")], UI_CSS)
 }
 
 async fn script() -> impl IntoResponse {
-    (
-        [
-            (CONTENT_TYPE, "text/javascript; charset=utf-8"),
-            (CACHE_CONTROL, "no-store"),
-        ],
-        UI_JS,
-    )
+    ([(CONTENT_TYPE, "text/javascript; charset=utf-8")], UI_JS)
 }
 
 async fn favicon() -> impl IntoResponse {
-    (
-        [
-            (CONTENT_TYPE, "image/svg+xml"),
-            (CACHE_CONTROL, "public, max-age=86400"),
-        ],
-        UI_FAVICON,
-    )
+    ([(CONTENT_TYPE, "image/svg+xml")], UI_FAVICON)
 }
 
 async fn groups(
@@ -197,7 +189,7 @@ async fn groups(
         .await;
     drop(permit);
     match result {
-        Ok(Some(page)) => ([(CACHE_CONTROL, "no-store")], Json(page)).into_response(),
+        Ok(Some(page)) => Json(page).into_response(),
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(error) => {
             tracing::error!(host_id, %error, "dashboard assignment lookup failed");
@@ -207,7 +199,7 @@ async fn groups(
 }
 
 async fn profile(State(state): State<UiState>) -> impl IntoResponse {
-    ([(CACHE_CONTROL, "no-store")], Json(state.source.profile()))
+    Json(state.source.profile())
 }
 
 async fn websocket(

@@ -7,6 +7,7 @@ const HISTORY_MINUTES: usize = 60;
 
 pub(crate) struct MinuteHistory {
     buckets: VecDeque<MinuteBucket>,
+    previous_sample_ms: Option<u64>,
     previous_tx: Option<u64>,
     previous_rx: Option<u64>,
     previous_hosts: BTreeMap<usize, (u64, u64)>,
@@ -14,6 +15,7 @@ pub(crate) struct MinuteHistory {
 
 struct MinuteBucket {
     start_ms: u64,
+    observed_ms: u64,
     tx_bytes: u64,
     rx_bytes: u64,
     latency_sum_ms: f64,
@@ -33,6 +35,7 @@ impl MinuteHistory {
     pub(crate) fn new() -> Self {
         Self {
             buckets: VecDeque::with_capacity(HISTORY_MINUTES),
+            previous_sample_ms: None,
             previous_tx: None,
             previous_rx: None,
             previous_hosts: BTreeMap::new(),
@@ -41,6 +44,10 @@ impl MinuteHistory {
 
     pub(crate) fn observe(&mut self, snapshot: DashboardSnapshot) -> DashboardFrame {
         let minute = snapshot.sampled_at_ms / MILLIS_PER_MINUTE * MILLIS_PER_MINUTE;
+        let observed_ms = self.previous_sample_ms.map_or(0, |previous| {
+            snapshot.sampled_at_ms.saturating_sub(previous)
+        });
+        self.previous_sample_ms = Some(snapshot.sampled_at_ms);
         let tx_delta = self.previous_tx.map_or(0, |previous| {
             snapshot.pool.tx_bytes.saturating_sub(previous)
         });
@@ -57,6 +64,7 @@ impl MinuteHistory {
         {
             self.buckets.push_back(MinuteBucket {
                 start_ms: minute,
+                observed_ms: 0,
                 tx_bytes: 0,
                 rx_bytes: 0,
                 latency_sum_ms: 0.0,
@@ -77,6 +85,7 @@ impl MinuteHistory {
             .back_mut()
             .filter(|bucket| bucket.start_ms == minute)
         {
+            bucket.observed_ms = bucket.observed_ms.saturating_add(observed_ms);
             bucket.tx_bytes = bucket.tx_bytes.saturating_add(tx_delta);
             bucket.rx_bytes = bucket.rx_bytes.saturating_add(rx_delta);
             for host in &snapshot.hosts {
@@ -112,6 +121,7 @@ impl MinuteBucket {
     fn sample(&self) -> MinuteSample {
         MinuteSample {
             minute_start_ms: self.start_ms,
+            observed_ms: self.observed_ms,
             tx_bytes: self.tx_bytes,
             rx_bytes: self.rx_bytes,
             average_latency_ms: (self.latency_samples > 0)
@@ -178,10 +188,12 @@ mod tests {
     #[test]
     fn aggregates_deltas_and_selection_at_sample_time() {
         let mut history = MinuteHistory::new();
-        history.observe(snapshot(0, 10, 20, 40.0, true));
-        history.observe(snapshot(1_000, 30, 50, 60.0, true));
-        let frame = history.observe(snapshot(2_000, 35, 65, 100.0, false));
+        history.observe(snapshot(30_000, 10, 20, 40.0, true));
+        history.observe(snapshot(31_000, 30, 50, 60.0, true));
+        let frame = history.observe(snapshot(32_000, 35, 65, 100.0, false));
         let minute = &frame.history[0];
+        assert_eq!(minute.minute_start_ms, 0);
+        assert_eq!(minute.observed_ms, 2_000);
         assert_eq!((minute.tx_bytes, minute.rx_bytes), (25, 45));
         assert_eq!(minute.average_latency_ms, Some(50.0));
         assert_eq!(

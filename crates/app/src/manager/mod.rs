@@ -42,7 +42,6 @@ impl ConnectionManager {
         password: String,
         dns_override: Option<Ipv4Addr>,
         max_active_vpn_hosts: Option<NonZeroUsize>,
-        dashboard_enabled: bool,
     ) -> Result<Self> {
         let profile_summary = Arc::new(summarize_profile(&profile));
         let mut candidates = resolve_candidates(&profile).await?;
@@ -120,21 +119,9 @@ impl ConnectionManager {
         let acquire_timeout = profile
             .handshake_window
             .saturating_add(CONTROL_SETUP_ALLOWANCE);
-        let (shared, assignment_events) = Shared::new(
-            hosts,
-            acquire_timeout,
-            max_active_vpn_hosts,
-            dashboard_enabled,
-        );
+        let shared = Shared::new(hosts, acquire_timeout, max_active_vpn_hosts);
         let (stop, _) = watch::channel(false);
         let mut workers = JoinSet::new();
-        if let Some(assignment_events) = assignment_events {
-            let shared = Arc::clone(&shared);
-            let stop = stop.subscribe();
-            workers.spawn(async move {
-                routing::maintain_assignments(shared, assignment_events, stop).await;
-            });
-        }
         for (id, ((candidate, enabled), traffic)) in
             candidates.into_iter().zip(enabled).zip(traffic).enumerate()
         {
@@ -154,11 +141,6 @@ impl ConnectionManager {
                 }
                 .run(),
             );
-        }
-        {
-            let shared = Arc::clone(&shared);
-            let stop = stop.subscribe();
-            workers.spawn(async move { routing::manage_pool_idle(shared, stop).await });
         }
         tracing::info!(
             candidates = candidate_count,
@@ -184,6 +166,7 @@ impl ConnectionManager {
     }
 
     pub(crate) async fn shutdown(mut self) {
+        self.shared.stop_accepting().await;
         self.stop.send_replace(true);
         while let Some(result) = self.workers.join_next().await {
             if let Err(error) = result {
@@ -214,8 +197,10 @@ pub(crate) fn summarize_profile(profile: &Profile) -> ProfileSummary {
 }
 
 impl SnapshotSource for RouterHandle {
-    fn snapshot(&self) -> DashboardSnapshot {
-        self.dashboard_snapshot()
+    fn snapshot(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = DashboardSnapshot> + Send + '_>> {
+        Box::pin(self.dashboard_snapshot())
     }
 
     fn group_page(
@@ -223,8 +208,10 @@ impl SnapshotSource for RouterHandle {
         host_id: usize,
         offset: usize,
         limit: usize,
-    ) -> Result<Option<GroupPage>, GroupError> {
-        self.dashboard_group_page(host_id, offset, limit)
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Option<GroupPage>, GroupError>> + Send + '_>,
+    > {
+        Box::pin(self.dashboard_group_page(host_id, offset, limit))
     }
 
     fn profile(&self) -> ProfileSummary {

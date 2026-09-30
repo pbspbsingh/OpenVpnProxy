@@ -151,7 +151,7 @@ sequenceDiagram
     end
 ```
 
-The app's serving loop accepts SOCKS clients and handles shutdown. Each accepted client gets an async task. Each active VPN host worker multiplexes outbound stack packets, inbound OpenVPN packets, keepalive/status work, probes, and shutdown. A pool coordinator handles the shared idle timeout and sticky expiry. Each packet stack has one owning task for its TCP and DNS state.
+The app's serving loop accepts SOCKS clients and handles shutdown. Each accepted client gets an async task. Each active VPN host worker multiplexes outbound stack packets, inbound OpenVPN packets, keepalive/status work, probes, and shutdown. One routing task owns host selection, sticky assignments, pool idle time, and sticky expiry; the dashboard requests snapshots and group pages from that task. Each packet stack has one owning task for its TCP and DNS state.
 
 ## Key rotation and failure behavior
 
@@ -183,7 +183,7 @@ curl --socks5-hostname 127.0.0.1:1080 https://example.com
 RUST_LOG=debug cargo run --release -p openvpn-proxy-app
 ```
 
-With `webui_address = "127.0.0.1:8080"`, open `http://127.0.0.1:8080` for the read-only dashboard. Overview, Hosts, and Routing status update through a WebSocket every five seconds. System and per-host TX/RX and latency charts show the latest 60 one-minute buckets. The Hosts tab shows the selected host's assigned groups in a panel with its own scrollbar; entries load in pages and show source IP, destination group, and active or idle state. Assignment changes reach a separate dashboard copy through an async channel, so group counts and pages can briefly trail routing without making route selection wait for dashboard scans. The Profile tab shows loaded remotes, authentication policy, certificate checks, IPv6 policy, and timing settings.
+With `webui_address = "127.0.0.1:8080"`, open `http://127.0.0.1:8080` for the read-only dashboard. Overview, Hosts, and Routing status update through a WebSocket every five seconds. System and per-host TX/RX and latency charts show the latest 60 one-minute buckets. The Hosts tab shows the selected host's assigned groups in a panel with its own scrollbar; entries load in pages and show source IP, destination group, and active or idle state. The dashboard requests snapshots and group pages from the routing task, so both read the same assignment state; WebSocket status reflects the most recent five-second sample. The Profile tab shows loaded remotes, authentication policy, certificate checks, IPv6 policy, and timing settings.
 
 The Logs tab shows recent tracing events and receives new events immediately through its own WebSocket, which is open only while that tab is selected. `dashboard_log_capacity` sets the number of retained entries (default 1000, maximum 20000); each message is capped at 4096 bytes. History loads in batches, and the tab initially renders the latest 2000 matching rows; use Show older to view more. The Minimum level filter includes the selected severity and all more severe events: INFO includes WARN and ERROR. Under heavy logging, a full input queue drops log events and the tab reports the drop count rather than blocking traffic.
 

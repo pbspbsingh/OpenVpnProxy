@@ -63,7 +63,7 @@ impl HostWorker {
             if *stop.borrow() {
                 break;
             }
-            shared.phase(id, HostPhase::Dormant);
+            shared.phase(id, HostPhase::Dormant).await;
             while *enabled.borrow() == HostActivation::Dormant {
                 tokio::select! {
                     changed = enabled.changed() => if changed.is_err() { break 'worker; },
@@ -96,7 +96,7 @@ impl HostWorker {
                 }
                 continue;
             }
-            shared.phase(id, HostPhase::Connecting);
+            shared.phase(id, HostPhase::Connecting).await;
             let Some(&endpoint) = candidate.endpoints.get(next_endpoint) else {
                 tracing::error!(host_id = id, "VPN host lost its endpoints");
                 break;
@@ -130,7 +130,7 @@ impl HostWorker {
                         Ok(score) => score,
                         Err(error) => {
                             tracing::warn!(host_id = id, %endpoint, %error, "fresh VPN host probe failed");
-                            shared.down(id, false);
+                            shared.down(id, false).await;
                             let _ = stack.reset().await;
                             drop(permit);
                             tokio::select! {
@@ -146,7 +146,9 @@ impl HostWorker {
                         let _ = stack.reset().await;
                         continue;
                     }
-                    shared.ready(id, endpoint, &stack, started.elapsed(), score);
+                    shared
+                        .ready(id, endpoint, &stack, started.elapsed(), score)
+                        .await;
                     let active_since = Instant::now();
                     let result = drive_host(
                         id,
@@ -164,9 +166,9 @@ impl HostWorker {
                     let shutdown = *stop.borrow() || matches!(&result, Ok(HostExit::Shutdown));
                     let idle = matches!(&result, Ok(HostExit::Idle));
                     if idle {
-                        shared.parked(id);
+                        shared.parked(id).await;
                     } else {
-                        shared.down(id, shutdown);
+                        shared.down(id, shutdown).await;
                     }
                     if let Err(error) = stack.reset().await {
                         tracing::error!(host_id = id, %endpoint, %error, "VPN packet stack reset failed");
@@ -187,7 +189,7 @@ impl HostWorker {
                     }
                 }
                 Err(error) => {
-                    shared.down(id, false);
+                    shared.down(id, false).await;
                     tracing::warn!(host_id = id, %endpoint, %error, cause = %error.root_cause(), "VPN host connection failed");
                     drop(permit);
                 }
@@ -200,7 +202,7 @@ impl HostWorker {
             }
             delay = delay.saturating_mul(2).min(MAX_RETRY_DELAY);
         }
-        shared.down(id, true);
+        shared.down(id, true).await;
         tracing::debug!(host_id = id, address = %candidate.address, "VPN host worker stopped");
     }
 }
@@ -360,7 +362,7 @@ async fn drive_host(
                         probe_task = Some(tokio::spawn(async move {
                             let started = Instant::now();
                             let result = measure(&stack).await;
-                            shared.record_probe(id, stack.id(), result, started.elapsed());
+                            shared.record_probe(id, stack.id(), result, started.elapsed()).await;
                         }));
                     }
                 }

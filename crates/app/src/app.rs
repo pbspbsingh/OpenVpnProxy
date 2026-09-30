@@ -136,7 +136,6 @@ async fn initialize(
         config.password,
         config.dns_override,
         config.max_active_vpn_hosts,
-        dashboard.is_some(),
     )
     .await?;
     Ok((socks_listener, manager))

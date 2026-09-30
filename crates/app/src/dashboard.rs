@@ -14,6 +14,7 @@ pub(crate) struct DashboardSource {
     profile: Arc<RwLock<Option<ProfileSummary>>>,
 }
 
+#[derive(Clone)]
 enum DashboardState {
     Starting(&'static str),
     Running(RouterHandle),
@@ -77,45 +78,52 @@ impl DashboardSource {
 }
 
 impl SnapshotSource for DashboardSource {
-    fn snapshot(&self) -> DashboardSnapshot {
-        let (phase, message) = match self.state.read() {
-            Ok(state) => match &*state {
-                DashboardState::Running(router) => return router.snapshot(),
-                DashboardState::Starting(stage) => (PoolPhase::Starting, (*stage).to_owned()),
-                DashboardState::Failed { error, router } => {
-                    if let Some(router) = router {
-                        let mut snapshot = router.snapshot();
-                        snapshot.pool.phase = PoolPhase::Failed;
-                        snapshot.message = Some(error.clone());
-                        return snapshot;
-                    }
-                    (PoolPhase::Failed, error.clone())
+    fn snapshot(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = DashboardSnapshot> + Send + '_>> {
+        let state = self.state.read().ok().map(|state| state.clone());
+        Box::pin(async move {
+            let (phase, message) = match state {
+                Some(DashboardState::Running(router)) => return router.snapshot().await,
+                Some(DashboardState::Starting(stage)) => (PoolPhase::Starting, stage.to_owned()),
+                Some(DashboardState::Failed {
+                    error,
+                    router: Some(router),
+                }) => {
+                    let mut snapshot = router.snapshot().await;
+                    snapshot.pool.phase = PoolPhase::Failed;
+                    snapshot.message = Some(error);
+                    return snapshot;
                 }
-            },
-            Err(_) => (PoolPhase::Unavailable, "Dashboard state unavailable".into()),
-        };
-        let sampled_at_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
-            .unwrap_or_default();
-        DashboardSnapshot {
-            version: 1,
-            sampled_at_ms,
-            message: Some(message),
-            pool: PoolSnapshot {
-                phase,
-                candidate_hosts: 0,
-                selected_hosts: 0,
-                ready_hosts: 0,
-                max_active_hosts: 0,
-                active_routes: 0,
-                sticky_groups: 0,
-                idle_remaining_seconds: None,
-                tx_bytes: 0,
-                rx_bytes: 0,
-            },
-            hosts: Vec::new(),
-        }
+                Some(DashboardState::Failed {
+                    error,
+                    router: None,
+                }) => (PoolPhase::Failed, error),
+                None => (PoolPhase::Unavailable, "Dashboard state unavailable".into()),
+            };
+            let sampled_at_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
+                .unwrap_or_default();
+            DashboardSnapshot {
+                version: 1,
+                sampled_at_ms,
+                message: Some(message),
+                pool: PoolSnapshot {
+                    phase,
+                    candidate_hosts: 0,
+                    selected_hosts: 0,
+                    ready_hosts: 0,
+                    max_active_hosts: 0,
+                    active_routes: 0,
+                    sticky_groups: 0,
+                    idle_remaining_seconds: None,
+                    tx_bytes: 0,
+                    rx_bytes: 0,
+                },
+                hosts: Vec::new(),
+            }
+        })
     }
 
     fn group_page(
@@ -123,11 +131,16 @@ impl SnapshotSource for DashboardSource {
         host_id: usize,
         offset: usize,
         limit: usize,
-    ) -> Result<Option<GroupPage>, GroupError> {
-        match self.router() {
-            Some(router) => router.group_page(host_id, offset, limit),
-            None => Ok(None),
-        }
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Option<GroupPage>, GroupError>> + Send + '_>,
+    > {
+        let router = self.router();
+        Box::pin(async move {
+            match router {
+                Some(router) => router.group_page(host_id, offset, limit).await,
+                None => Ok(None),
+            }
+        })
     }
 
     fn profile(&self) -> ProfileSummary {

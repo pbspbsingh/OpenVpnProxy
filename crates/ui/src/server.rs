@@ -1,3 +1,5 @@
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -35,13 +37,13 @@ const UI_FAVICON: &str = include_str!("../assets/favicon.svg");
 
 /// A source of read-only dashboard data. Implementations must omit credentials.
 pub trait SnapshotSource: Send + Sync + 'static {
-    fn snapshot(&self) -> DashboardSnapshot;
+    fn snapshot(&self) -> Pin<Box<dyn Future<Output = DashboardSnapshot> + Send + '_>>;
     fn group_page(
         &self,
         host_id: usize,
         offset: usize,
         limit: usize,
-    ) -> Result<Option<GroupPage>, GroupError>;
+    ) -> Pin<Box<dyn Future<Output = Result<Option<GroupPage>, GroupError>> + Send + '_>>;
     fn profile(&self) -> ProfileSummary;
 }
 
@@ -85,7 +87,7 @@ pub async fn serve<S: SnapshotSource>(
 ) -> Result<(), UiError> {
     let source: Arc<dyn SnapshotSource> = Arc::new(source);
     let mut history = MinuteHistory::new();
-    let initial = serde_json::to_string(&history.observe(source.snapshot()))?;
+    let initial = serde_json::to_string(&history.observe(source.snapshot().await))?;
     let (updates, _) = watch::channel(initial);
     let state = UiState {
         source: Arc::clone(&source),
@@ -128,7 +130,7 @@ async fn sample(
     interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
-            _ = interval.tick() => match serde_json::to_string(&history.observe(source.snapshot())) {
+            _ = interval.tick() => match serde_json::to_string(&history.observe(source.snapshot().await)) {
                 Ok(snapshot) => { updates.send_replace(snapshot); }
                 Err(error) => tracing::error!(%error, "dashboard snapshot serialization failed"),
             },
@@ -189,21 +191,16 @@ async fn groups(
     let Ok(permit) = Arc::clone(&state.group_queries).try_acquire_owned() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    let source = Arc::clone(&state.source);
-    let result = tokio::task::spawn_blocking(move || {
-        let _permit = permit;
-        source.group_page(host_id, query.offset.unwrap_or(0), GROUP_PAGE_SIZE)
-    })
-    .await;
+    let result = state
+        .source
+        .group_page(host_id, query.offset.unwrap_or(0), GROUP_PAGE_SIZE)
+        .await;
+    drop(permit);
     match result {
-        Ok(Ok(Some(page))) => ([(CACHE_CONTROL, "no-store")], Json(page)).into_response(),
-        Ok(Ok(None)) => StatusCode::NOT_FOUND.into_response(),
-        Ok(Err(error)) => {
-            tracing::error!(host_id, %error, "dashboard assignment lookup failed");
-            StatusCode::SERVICE_UNAVAILABLE.into_response()
-        }
+        Ok(Some(page)) => ([(CACHE_CONTROL, "no-store")], Json(page)).into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(error) => {
-            tracing::error!(host_id, %error, "dashboard assignment task failed");
+            tracing::error!(host_id, %error, "dashboard assignment lookup failed");
             StatusCode::SERVICE_UNAVAILABLE.into_response()
         }
     }

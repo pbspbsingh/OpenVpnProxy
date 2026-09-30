@@ -10,7 +10,7 @@ use anyhow::{Context, Result};
 use ovpn_ui::LogHub;
 use tracing_subscriber::prelude::*;
 
-#[tokio::main(flavor = "current_thread")]
+#[tokio::main]
 async fn main() -> Result<()> {
     let (filter, filter_error) = match tracing_subscriber::EnvFilter::try_from_default_env() {
         Ok(filter) => (filter, None),

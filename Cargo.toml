@@ -42,7 +42,7 @@ psl = "2.1.238"
 idna = "1.1.0"
 
 # Async I/O and task scheduling
-tokio = { version = "1.53.1", features = ["rt", "macros", "net", "time", "sync", "io-util", "signal", "fs"] }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util", "signal", "fs"] }
 
 # Structured logging
 tracing = "0.1.41"

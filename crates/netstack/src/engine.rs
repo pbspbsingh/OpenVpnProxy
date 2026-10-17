@@ -16,7 +16,6 @@ use crate::error::{Result, StackError};
 use crate::stack::Command;
 use crate::types::{IpVersion, Ipv6Route, StackPhase, StreamEvent, TunnelConfig, matches_route};
 
-const MAX_QUEUED_WRITE: usize = 256 * 1024;
 const TCP_RECEIVE_BUFFER_BYTES: usize = 256 * 1024;
 const TCP_SEND_BUFFER_BYTES: usize = 32 * 1024;
 const IPV4_HOST_PREFIX_BITS: u8 = 32;
@@ -151,6 +150,7 @@ struct Connection {
     socket: SocketHandle,
     events: mpsc::Sender<StreamEvent>,
     wake_needed: Arc<AtomicBool>,
+    writes: mpsc::Receiver<Vec<u8>>,
     write_queue: VecDeque<u8>,
     established: bool,
     deadline: Clock,
@@ -277,7 +277,7 @@ impl Engine {
                     }
                 }
             }
-            Command::Connect(id, address, events, wake_needed) => {
+            Command::Connect(id, address, events, wake_needed, writes) => {
                 if !matches_route(&self.ipv6_routes, address.ip()) {
                     tracing::warn!(id, %address, "VPN has no IPv6 route for SOCKS destination");
                     let _ = events.try_send(StreamEvent::Closed);
@@ -313,6 +313,7 @@ impl Engine {
                                 socket: handle,
                                 events,
                                 wake_needed,
+                                writes,
                                 write_queue: VecDeque::new(),
                                 established: false,
                                 deadline: Clock::now() + TCP_CONNECT_TIMEOUT,
@@ -323,25 +324,6 @@ impl Engine {
                         tracing::warn!(id, %address, ?error, "userspace TCP connect failed");
                         self.sockets.remove(handle);
                         let _ = events.try_send(StreamEvent::Closed);
-                    }
-                }
-            }
-            Command::Data(id, data) => {
-                if let Some(connection) = self.connections.get_mut(&id) {
-                    if connection.write_queue.len() + data.len() > MAX_QUEUED_WRITE {
-                        tracing::warn!(
-                            id,
-                            queued = connection.write_queue.len(),
-                            incoming = data.len(),
-                            "userspace TCP write queue limit reached"
-                        );
-                        self.close(id);
-                    } else {
-                        connection.write_queue.extend(data);
-                        self.stats.max_write_queue_bytes = self
-                            .stats
-                            .max_write_queue_bytes
-                            .max(connection.write_queue.len());
                     }
                 }
             }
@@ -432,6 +414,16 @@ impl Engine {
                 continue;
             }
             if connection.established {
+                if socket.can_send()
+                    && connection.write_queue.is_empty()
+                    && let Ok(data) = connection.writes.try_recv()
+                {
+                    connection.write_queue.extend(data);
+                    self.stats.max_write_queue_bytes = self
+                        .stats
+                        .max_write_queue_bytes
+                        .max(connection.write_queue.len());
+                }
                 if socket.can_send() && !connection.write_queue.is_empty() {
                     let data = connection.write_queue.make_contiguous();
                     match socket.send_slice(data) {
@@ -491,7 +483,8 @@ impl Engine {
             let socket = self.sockets.get::<tcp::Socket>(connection.socket);
             connection.events.is_closed()
                 || (socket.can_recv() && connection.events.capacity() > 0)
-                || (!connection.write_queue.is_empty() && socket.can_send())
+                || (socket.can_send()
+                    && (!connection.write_queue.is_empty() || !connection.writes.is_empty()))
         }) {
             return Some(Duration::ZERO);
         }
@@ -571,6 +564,8 @@ enum Wake {
 
 async fn wait_for_timer(delay: Option<Duration>) {
     match delay {
+        // Ready work must yield to other tasks without waiting for the timer wheel.
+        Some(delay) if delay.is_zero() => tokio::task::yield_now().await,
         Some(delay) => time::sleep(delay).await,
         None => std::future::pending().await,
     }
@@ -581,7 +576,7 @@ fn reject_without_tunnel(command: Command) {
         Command::Resolve(_, _, reply) => {
             let _ = reply.send(Err(StackError::VpnDown));
         }
-        Command::Connect(_, _, events, _) => {
+        Command::Connect(_, _, events, _, _) => {
             let _ = events.try_send(StreamEvent::Closed);
         }
         _ => {}
@@ -598,3 +593,6 @@ fn smol_ip(address: IpAddr) -> IpAddress {
         IpAddr::V6(address) => IpAddress::Ipv6(address),
     }
 }
+
+#[cfg(test)]
+mod tests;

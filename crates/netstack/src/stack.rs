@@ -12,6 +12,8 @@ use crate::types::{IpVersion, Ipv6Route, StackPhase, StreamEvent, TunnelConfig};
 
 const COMMAND_QUEUE_CAPACITY: usize = 2048;
 const CONNECTION_EVENT_QUEUE_CAPACITY: usize = 32;
+const STREAM_WRITE_CHUNK_BYTES: usize = 8192;
+const STREAM_WRITE_QUEUE_CAPACITY: usize = 256 * 1024 / STREAM_WRITE_CHUNK_BYTES;
 const CONFIGURATION_TIMEOUT: Duration = Duration::from_secs(5);
 const DNS_RESPONSE_TIMEOUT: Duration = Duration::from_secs(12);
 static NEXT_STACK_ID: AtomicU64 = AtomicU64::new(1);
@@ -21,9 +23,15 @@ pub struct StreamEvents {
     rx: mpsc::Receiver<StreamEvent>,
     wake: Arc<Notify>,
     wake_needed: Arc<AtomicBool>,
+    writer: StreamWriter,
 }
 
 impl StreamEvents {
+    /// Returns a writer with bounded buffering for this connection.
+    pub fn writer(&self) -> StreamWriter {
+        self.writer.clone()
+    }
+
     /// Waits for the next connection event.
     pub async fn recv(&mut self) -> Option<StreamEvent> {
         let event = self.rx.recv().await;
@@ -34,8 +42,39 @@ impl StreamEvents {
     }
 }
 
+/// Uploads bytes to one virtual TCP connection, waiting when its queue is full.
+#[derive(Clone)]
+pub struct StreamWriter {
+    tx: mpsc::Sender<Vec<u8>>,
+    wake: Arc<Notify>,
+}
+
+impl StreamWriter {
+    /// Queues bytes, applying backpressure independently of other streams.
+    /// Canceling a write can leave a prefix queued for transmission.
+    pub async fn write(&self, data: Vec<u8>) -> Result<()> {
+        if data.len() <= STREAM_WRITE_CHUNK_BYTES {
+            return self.enqueue(data).await;
+        }
+        for chunk in data.chunks(STREAM_WRITE_CHUNK_BYTES) {
+            self.enqueue(chunk.to_vec()).await?;
+        }
+        Ok(())
+    }
+
+    async fn enqueue(&self, data: Vec<u8>) -> Result<()> {
+        self.tx
+            .send(data)
+            .await
+            .map_err(|_| StackError::Disconnected)?;
+        self.wake.notify_one();
+        Ok(())
+    }
+}
+
 impl Drop for StreamEvents {
     fn drop(&mut self) {
+        self.rx.close();
         self.wake.notify_one();
     }
 }
@@ -206,9 +245,16 @@ impl Stack {
         }
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = mpsc::channel(CONNECTION_EVENT_QUEUE_CAPACITY);
+        let (write_tx, write_rx) = mpsc::channel(STREAM_WRITE_QUEUE_CAPACITY);
         let wake_needed = Arc::new(AtomicBool::new(false));
         self.tx
-            .send(Command::Connect(id, address, tx, Arc::clone(&wake_needed)))
+            .send(Command::Connect(
+                id,
+                address,
+                tx,
+                Arc::clone(&wake_needed),
+                write_rx,
+            ))
             .await
             .map_err(|_| StackError::WorkerStopped)?;
         Ok((
@@ -217,24 +263,12 @@ impl Stack {
                 rx,
                 wake: Arc::clone(&self.wake),
                 wake_needed,
+                writer: StreamWriter {
+                    tx: write_tx,
+                    wake: Arc::clone(&self.wake),
+                },
             },
         ))
-    }
-
-    /// Queues bytes for a virtual TCP connection.
-    pub fn data(&self, id: u64, data: Vec<u8>) -> Result<()> {
-        if !self.is_ready() {
-            return Err(StackError::VpnDown);
-        }
-        self.tx.try_send(Command::Data(id, data)).map_err(|_| {
-            self.phase
-                .store(StackPhase::Failed as u8, Ordering::Release);
-            tracing::error!(
-                id,
-                "packet stack command queue rejected TCP data; tunnel marked failed"
-            );
-            StackError::CommandQueueFull
-        })
     }
 
     /// Closes a virtual TCP connection.
@@ -260,7 +294,12 @@ pub(crate) enum Command {
     Packet(Vec<u8>),
     Reset,
     Resolve(String, IpVersion, oneshot::Sender<Result<IpAddr>>),
-    Connect(u64, SocketAddr, mpsc::Sender<StreamEvent>, Arc<AtomicBool>),
-    Data(u64, Vec<u8>),
+    Connect(
+        u64,
+        SocketAddr,
+        mpsc::Sender<StreamEvent>,
+        Arc<AtomicBool>,
+        mpsc::Receiver<Vec<u8>>,
+    ),
     Close(u64),
 }

@@ -62,7 +62,7 @@ The control channel establishes trust and derives data keys. The data channel ca
 
 `Stack` is a cloneable async handle. Its commands go to one `smoltcp` engine task; callers receive connection events through channels. The engine polls a virtual IP device, runs DNS and TCP state machines, and emits IPv4 or IPv6 packets to the app according to the VPN server's routes. The device is an in-memory packet queue, not a TUN interface. The engine wakes for commands, consumed connection events, and the next TCP or application deadline; it does not need a dedicated OS thread for `smoltcp`.
 
-`smoltcp` supplies the TCP behavior a SOCKS client expects: connection setup, sequencing, acknowledgments, retransmission, and teardown. The SOCKS handler works with byte streams and connection events; it does not construct TCP or IP headers.
+`smoltcp` supplies the TCP behavior a SOCKS client expects: connection setup, sequencing, acknowledgments, retransmission, and teardown. The SOCKS handler works with byte streams and connection events; it does not construct TCP or IP headers. Each connection's `StreamWriter` has a bounded upload queue. When that queue fills, SOCKS pauses client reads while continuing to receive responses and monitor tunnel failure. Ready buffered work yields cooperatively without waiting on the timer wheel.
 
 ## Startup sequence
 
@@ -160,7 +160,7 @@ OpenVPN may request a new data key, or the client may start renegotiation when i
 The design fails closed for **traffic handled by this proxy**:
 
 - The SOCKS listener begins accepting after baseline probing but before serving tunnels connect. A request waits for a selected host up to the profile handshake window plus 30 seconds for control setup (60 seconds with the default 30-second handshake window). A failed host clears its assignment; a scored standby may take its slot after a fresh probe. If no host becomes ready, the proxy returns a SOCKS5 network failure. A profile's `hand-window` setting overrides the default handshake window and also limits key renegotiation.
-- During a session, SOCKS requests can select only a ready host. A VPN or stack error marks that host unhealthy, clears its sticky assignments, resets its stack, and closes its client connections. Other hosts continue serving. Full queues mark the affected stack failed instead of bypassing it.
+- During a session, SOCKS requests can select only a ready host. A VPN or stack error marks that host unhealthy, clears its sticky assignments, resets its stack, and closes its client connections. Other hosts continue serving. Full packet or command queues mark the affected stack failed; full per-connection upload queues apply backpressure.
 - There is no direct-to-destination fallback in the SOCKS or stack crates. If every selected host is unavailable, new requests fail. The manager can activate a scored standby, retries failed hosts when no standby remains, and tries alternate ports; automatic DNS rediscovery and migration of existing TCP connections are not implemented.
 
 This guarantee applies only to traffic sent to the proxy. An application that ignores its proxy setting can still use the ordinary network connection.

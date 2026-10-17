@@ -7,5 +7,5 @@ mod stack;
 mod types;
 
 pub use error::{Result, StackError};
-pub use stack::{Stack, StreamEvents};
+pub use stack::{Stack, StreamEvents, StreamWriter};
 pub use types::{IpVersion, Ipv6Config, Ipv6Route, StackPhase, StreamEvent, TunnelConfig};

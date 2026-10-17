@@ -5,7 +5,7 @@ username = ""
 password = ""
 # Listen on all IPv4 interfaces so other machines can use the proxy.
 socks5_address = "0.0.0.0:1080"
-# Uncomment to enable the read-only dashboard. Bind another address for remote access.
+# Uncomment to enable the dashboard, including its shutdown control. Bind another address for remote access.
 # webui_address = "127.0.0.1:8080"
 # Recent dashboard log events kept in memory (default 1000, maximum 20000).
 # dashboard_log_capacity = 1000

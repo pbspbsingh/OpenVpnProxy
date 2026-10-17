@@ -21,7 +21,9 @@
    <template :key="item.id" x-for="item in hosts">
     <button :aria-pressed="item.id === selectedId" :class="{ selected: item.id === selectedId }" :data-host-id="item.id" @click="select(item.id)" class="host-item" type="button">
      <div class="host-item-top">
-      <span class="host-item-title" x-text="`Host ${item.id + 1}`">
+      <span class="host-item-heading">
+       <span class="host-item-title" x-text="`Host ${item.id + 1}`"></span>
+       <span class="host-item-counts" :title="`Active routes: ${item.active_routes.toLocaleString()}; sticky groups: ${item.sticky_groups.toLocaleString()}`" :aria-label="`Active routes: ${item.active_routes.toLocaleString()}; sticky groups: ${item.sticky_groups.toLocaleString()}`" x-text="`${item.active_routes.toLocaleString()}/${item.sticky_groups.toLocaleString()}`"></span>
       </span>
       <span class="host-item-speed" x-text="item.selected ? 'SELECTED' : 'STANDBY'">
       </span>

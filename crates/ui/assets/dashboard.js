@@ -10,6 +10,7 @@ export function dashboardStore() {
     feedKind: "connecting",
     feedLabel: "Connecting",
     selectedHostId: null,
+    stopping: false,
     get snapshot() { return this.frame?.snapshot ?? null; },
     get pool() { return this.snapshot?.pool ?? null; },
     get hosts() { return this.snapshot?.hosts ?? []; },

@@ -131,10 +131,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
     let (shutdown, receiver) = watch::channel(false);
+    let (shutdown_request, mut requested) = watch::channel(false);
     tokio::spawn(async move {
-        let _ = tokio::signal::ctrl_c().await;
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {},
+            _ = requested.wait_for(|requested| *requested) => {},
+        }
         let _ = shutdown.send(true);
     });
-    ovpn_ui::serve(listener, Fixture, receiver, logs).await?;
+    ovpn_ui::serve(listener, Fixture, receiver, logs, shutdown_request).await?;
     Ok(())
 }

@@ -11,7 +11,7 @@ use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE, HOST, ORIGIN};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::map_response;
 use axum::response::{Html, IntoResponse, Response};
-use axum::routing::{any, get};
+use axum::routing::{any, get, post};
 use serde::Deserialize;
 use serde::Serialize;
 use thiserror::Error;
@@ -69,6 +69,7 @@ struct UiState {
     logs: LogHub,
     group_queries: Arc<Semaphore>,
     shutdown: watch::Receiver<bool>,
+    shutdown_request: watch::Sender<bool>,
 }
 
 #[derive(Deserialize)]
@@ -77,11 +78,13 @@ struct GroupQuery {
 }
 
 /// Serve the embedded dashboard and its live WebSocket feed.
+/// Shutdown requests are sent to the application; `shutdown` stops this server after cleanup.
 pub async fn serve<S: SnapshotSource>(
     listener: TcpListener,
     source: S,
     shutdown: watch::Receiver<bool>,
     logs: LogHub,
+    shutdown_request: watch::Sender<bool>,
 ) -> Result<(), UiError> {
     let source: Arc<dyn SnapshotSource> = Arc::new(source);
     let mut history = MinuteHistory::new();
@@ -95,6 +98,7 @@ pub async fn serve<S: SnapshotSource>(
         logs,
         group_queries: Arc::new(Semaphore::new(MAX_GROUP_QUERIES)),
         shutdown: shutdown.clone(),
+        shutdown_request,
     };
     let router = Router::new()
         .route("/", get(index))
@@ -102,6 +106,7 @@ pub async fn serve<S: SnapshotSource>(
         .route("/{*path}", get(asset))
         .route("/api/hosts/{host_id}/groups", get(groups))
         .route("/api/profile", get(profile))
+        .route("/api/shutdown", post(request_shutdown))
         .route("/ws", any(websocket))
         .route("/ws/logs", any(log_websocket))
         .layer(map_response(no_cache))
@@ -193,18 +198,35 @@ async fn profile(State(state): State<UiState>) -> impl IntoResponse {
     Json(state.source.profile())
 }
 
+fn check_origin(headers: &HeaderMap) -> Result<(), StatusCode> {
+    let host = headers
+        .get(HOST)
+        .and_then(|value| value.to_str().ok())
+        .ok_or(StatusCode::BAD_REQUEST)?;
+    let allowed_origin = format!("http://{host}");
+    if headers.get(ORIGIN).and_then(|value| value.to_str().ok()) != Some(allowed_origin.as_str()) {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    Ok(())
+}
+
+async fn request_shutdown(State(state): State<UiState>, headers: HeaderMap) -> StatusCode {
+    if let Err(status) = check_origin(&headers) {
+        return status;
+    }
+    tracing::info!("shutdown requested from dashboard");
+    state.shutdown_request.send_replace(true);
+    StatusCode::ACCEPTED
+}
+
 async fn websocket(
     ws: WebSocketUpgrade,
     State(state): State<UiState>,
     headers: HeaderMap,
 ) -> Response {
-    let Some(host) = headers.get(HOST).and_then(|value| value.to_str().ok()) else {
-        return StatusCode::BAD_REQUEST.into_response();
-    };
-    let allowed_origin = format!("http://{host}");
-    if headers.get(ORIGIN).and_then(|value| value.to_str().ok()) != Some(allowed_origin.as_str()) {
+    if let Err(status) = check_origin(&headers) {
         tracing::warn!("rejected dashboard WebSocket from another origin");
-        return StatusCode::FORBIDDEN.into_response();
+        return status.into_response();
     }
     let Ok(permit) = Arc::clone(&state.connections).try_acquire_owned() else {
         tracing::warn!(
@@ -237,13 +259,9 @@ async fn log_websocket(
     State(state): State<UiState>,
     headers: HeaderMap,
 ) -> Response {
-    let Some(host) = headers.get(HOST).and_then(|value| value.to_str().ok()) else {
-        return StatusCode::BAD_REQUEST.into_response();
-    };
-    let allowed_origin = format!("http://{host}");
-    if headers.get(ORIGIN).and_then(|value| value.to_str().ok()) != Some(allowed_origin.as_str()) {
+    if let Err(status) = check_origin(&headers) {
         tracing::warn!("rejected dashboard log WebSocket from another origin");
-        return StatusCode::FORBIDDEN.into_response();
+        return status.into_response();
     }
     let Ok(permit) = Arc::clone(&state.log_connections).try_acquire_owned() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();

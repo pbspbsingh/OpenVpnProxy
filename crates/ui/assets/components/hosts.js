@@ -9,7 +9,7 @@ export function hosts() {
     get hosts() { return this.$store.dashboard.hosts; },
     get selectedId() { return this.$store.dashboard.selectedHostId; },
     get host() { return this.hosts.find(host => host.id === this.selectedId) ?? null; },
-    get active() { return this.$store.dashboard.tab === "hosts"; },
+    get active() { return this.$store.dashboard.tab === "hosts" && !this.$store.dashboard.stopping; },
     get stats() {
       if (!this.host) return [];
       const rate = this.$store.dashboard.rates.hosts[this.selectedId];

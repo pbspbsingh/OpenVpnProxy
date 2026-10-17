@@ -13,7 +13,8 @@ import subprocess
 import tempfile
 import time
 from urllib.parse import urlsplit
-from urllib.request import urlopen
+from urllib.error import HTTPError
+from urllib.request import Request, urlopen
 
 
 class DevTools:
@@ -121,6 +122,40 @@ def check(cdp, expression):
     assert cdp.evaluate(expression), expression
 
 
+def check_failed_app_shutdown(binary):
+    """A failed proxy must still accept shutdown through its real application loop."""
+    with tempfile.TemporaryDirectory(prefix="ovpn-shutdown-app-") as directory:
+        with socket.socket() as reserved:
+            reserved.bind(("127.0.0.1", 0))
+            port = reserved.getsockname()[1]
+        url = f"http://127.0.0.1:{port}"
+        config = Path(directory) / "config.toml"
+        config.write_text(
+            'profile_path = "missing-profile.ovpn"\nusername = ""\npassword = ""\n'
+            f'socks5_address = "127.0.0.1:0"\nwebui_address = "127.0.0.1:{port}"\n'
+        )
+        with tempfile.TemporaryFile() as output:
+            process = subprocess.Popen([str(binary.resolve()), str(config)], stdout=output, stderr=output, env={**os.environ, "RUST_LOG": "info"})
+            try:
+                deadline = time.monotonic() + 10
+                while True:
+                    log = os.pread(output.fileno(), 1_048_576, 0)
+                    if b"proxy unavailable; dashboard remains active" in log:
+                        break
+                    if process.poll() is not None or time.monotonic() >= deadline:
+                        raise AssertionError(f"Failed-state dashboard did not start: {log.decode(errors='replace')}")
+                    time.sleep(0.1)
+                request = Request(url + "/api/shutdown", method="POST", headers={"Origin": url})
+                with urlopen(request, timeout=5) as response:
+                    assert response.status == 202
+                assert process.wait(timeout=5) == 1  # Original startup error is preserved.
+                assert b"dashboard stopped unexpectedly" not in os.pread(output.fileno(), 1_048_576, 0)
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    process.wait()
+
+
 def exercise(cdp, url):
     cdp.call("Runtime.enable")
     cdp.call("Network.enable")
@@ -131,6 +166,7 @@ def exercise(cdp, url):
         window.WebSocket = class extends NativeSocket {
             constructor(...args) { super(...args); window.testSockets.push(this); }
         };
+        window.confirm = () => false;
     """)
     cdp.call("Page.navigate", url=url)
     cdp.wait("document.querySelector('#pool-phase')?.textContent === 'Ready'")
@@ -219,6 +255,28 @@ def exercise(cdp, url):
         const series = minuteSeries([{ minute_start_ms: 60000, value: 7 }], 60000, b => b.value);
         return rates.pool.rx === 100 && rates.pool.tx === 0 && stale.pool.rx === 0 && series.length === 60 && series.at(-1) === 7 && series[0] === null;
     })()""")
+
+    # Cancellation leaves the server running; failed requests allow a retry.
+    cdp.evaluate("document.querySelector('#shutdown-button').click()")
+    check(cdp, "!document.querySelector('#shutdown-button').disabled")
+    check(cdp, "document.querySelector('#feed-label').textContent === 'Live'")
+    cdp.evaluate("""
+        window.confirm = () => true;
+        window.savedFetch = window.fetch;
+        window.fetch = (url, options) => url === '/api/shutdown'
+            ? Promise.resolve(new Response('', { status: 503 })) : savedFetch(url, options);
+        document.querySelector('#shutdown-button').click();
+    """)
+    cdp.wait("document.querySelector('#shutdown-error').textContent.includes('HTTP 503')")
+    check(cdp, "!document.querySelector('#shutdown-button').disabled")
+    cdp.evaluate("window.fetch = savedFetch; document.querySelector('[data-tab=logs]').click()")
+    cdp.wait("testSockets.some(s => s.url.endsWith('/ws/logs') && s.readyState === 1)")
+    cdp.evaluate("document.querySelector('#shutdown-button').click()")
+    cdp.wait("document.querySelector('#shutdown-button').textContent === 'Shutdown requested'")
+    check(cdp, "document.querySelector('#shutdown-button').disabled")
+    check(cdp, "document.querySelector('#feed-label').textContent === 'Shutdown requested'")
+    check(cdp, "document.documentElement.scrollWidth <= 390")
+    cdp.wait("testSockets.every(s => s.readyState === 3)")
     check(cdp, """(async () => {
         const { default: Alpine } = await import('https://cdn.jsdelivr.net/npm/alpinejs@3.17.4/dist/module.esm.min.js');
         Alpine.destroyTree(document.querySelector('.shell'));
@@ -237,6 +295,7 @@ def exercise(cdp, url):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--fixture", type=Path, required=True, help="compiled dashboard_fixture example")
+    parser.add_argument("--app", type=Path, help="also verify shutdown of the app after startup failure")
     parser.add_argument("--chrome", default="google-chrome")
     args = parser.parse_args()
     fixture = subprocess.Popen([str(args.fixture.resolve())], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
@@ -244,6 +303,14 @@ def main():
         url = fixture.stdout.readline().strip()
         if not url.startswith("http://127.0.0.1:"):
             raise RuntimeError(f"Fixture failed to start: {fixture.stderr.read()}")
+        for method, origin, expected in [("GET", url, 405), ("POST", None, 403), ("POST", "http://other.example", 403)]:
+            headers = {"Origin": origin} if origin else {}
+            try:
+                with urlopen(Request(url + "/api/shutdown", method=method, headers=headers), timeout=10):
+                    raise AssertionError("Shutdown accepted without a same-origin POST")
+            except HTTPError as error:
+                assert error.code == expected, (method, origin, error.code)
+        assert fixture.poll() is None
         with tempfile.TemporaryDirectory(prefix="ovpn-ui-browser-") as profile:
             with tempfile.TemporaryFile() as chrome_log:
                 chrome = subprocess.Popen([
@@ -265,6 +332,7 @@ def main():
                         page = next(page for page in json.load(response) if page["type"] == "page")
                     cdp = DevTools(page["webSocketDebuggerUrl"])
                     exercise(cdp, url)
+                    assert fixture.wait(timeout=5) == 0, "Shutdown did not stop the fixture cleanly"
                 finally:
                     if cdp is not None:
                         try:
@@ -283,7 +351,9 @@ def main():
     finally:
         fixture.terminate()
         fixture.wait(timeout=10)
-    print("PASS: five screens, charts, live updates, stable host rows, group pagination/cancellation, logs/filtering/lifecycle, mobile layout, cleanup, and history edge cases", flush=True)
+    if args.app:
+        check_failed_app_shutdown(args.app)
+    print("PASS: five screens, charts, live updates, hosts, logs, mobile layout, history, shutdown cancellation/retry, origin checks, and graceful process exit", flush=True)
 
 
 if __name__ == "__main__":

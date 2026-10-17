@@ -35,13 +35,6 @@
      </div>
     </div>
     <div class="topbar-right">
-     <div :class="$store.dashboard.feedKind" class="feed-status" id="feed-status">
-      <span class="status-dot">
-      </span>
-      <span id="feed-label" x-text="$store.dashboard.feedLabel">
-       Connecting
-      </span>
-     </div>
      <div class="topbar-time">
       <span>
        Last update
@@ -49,6 +42,17 @@
       <strong id="last-update" x-text="$store.dashboard.snapshot ? new Date($store.dashboard.snapshot.sampled_at_ms).toLocaleTimeString() : '—'">
        —
       </strong>
+     </div>
+     <div :class="$store.dashboard.feedKind" class="feed-status" id="feed-status">
+      <span class="status-dot">
+      </span>
+      <span id="feed-label" x-text="$store.dashboard.feedLabel">
+       Connecting
+      </span>
+     </div>
+     <div class="shutdown-control">
+      <button class="shutdown-button" id="shutdown-button" type="button" @click="shutdown()" :disabled="shuttingDown" x-text="shutdownAccepted ? 'Shutdown requested' : shuttingDown ? 'Shutting down…' : 'Shut down'">Shut down</button>
+      <span class="shutdown-error" id="shutdown-error" role="status" x-show="shutdownError" x-text="shutdownError"></span>
      </div>
     </div>
    </header>
@@ -77,15 +81,9 @@
     {{logs}}
    </main>
    <footer>
-    Read-only dashboard
-    <span>
-     ·
-    </span>
-    Live status via WebSocket
-    <span>
-     ·
-    </span>
-    Counters and chart history reset when the app restarts
+    <span>Proxy dashboard</span>
+    <span>Live status via WebSocket</span>
+    <span>Counters and chart history reset when the app restarts</span>
    </footer>
   </div>
   <noscript>

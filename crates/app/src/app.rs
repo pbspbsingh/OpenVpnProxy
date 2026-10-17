@@ -27,17 +27,19 @@ async fn run_with_dashboard(config: AppConfig, address: SocketAddr, logs: LogHub
         .with_context(|| format!("cannot bind dashboard on {address}"))?;
     let source = DashboardSource::new();
     let (shutdown, _) = watch::channel(false);
+    let (shutdown_request, mut requested) = watch::channel(false);
     let mut ui_task = tokio::spawn(ovpn_ui::serve(
         webui_listener,
         source.clone(),
         shutdown.subscribe(),
         logs,
+        shutdown_request,
     ));
 
     let startup = tokio::select! {
         result = initialize(config, Some(&source)) => result,
         result = &mut ui_task => return dashboard_ended(result),
-        signal = tokio::signal::ctrl_c() => {
+        signal = wait_for_stop(&mut requested) => {
             shutdown.send_replace(true);
             ui_task.await.context("dashboard task failed")??;
             signal?;
@@ -47,7 +49,9 @@ async fn run_with_dashboard(config: AppConfig, address: SocketAddr, logs: LogHub
 
     let (socks_listener, manager) = match startup {
         Ok(started) => started,
-        Err(error) => return show_failure(error, &source, &shutdown, &mut ui_task).await,
+        Err(error) => {
+            return show_failure(error, &source, &shutdown, &mut requested, &mut ui_task).await;
+        }
     };
     source.running(manager.router());
     let mut ui_finished = false;
@@ -57,7 +61,7 @@ async fn run_with_dashboard(config: AppConfig, address: SocketAddr, logs: LogHub
             ui_finished = true;
             dashboard_ended(result)
         }
-        signal = tokio::signal::ctrl_c() => {
+        signal = wait_for_stop(&mut requested) => {
             signal?;
             tracing::info!("shutdown requested");
             Ok(())
@@ -71,7 +75,9 @@ async fn run_with_dashboard(config: AppConfig, address: SocketAddr, logs: LogHub
     manager.shutdown().await;
 
     match proxy_result {
-        Err(error) if !ui_finished => show_failure(error, &source, &shutdown, &mut ui_task).await,
+        Err(error) if !ui_finished => {
+            show_failure(error, &source, &shutdown, &mut requested, &mut ui_task).await
+        }
         result => {
             shutdown.send_replace(true);
             if !ui_finished {
@@ -145,18 +151,29 @@ async fn show_failure(
     error: anyhow::Error,
     source: &DashboardSource,
     shutdown: &watch::Sender<bool>,
+    requested: &mut watch::Receiver<bool>,
     ui_task: &mut JoinHandle<std::result::Result<(), ovpn_ui::UiError>>,
 ) -> Result<()> {
     tracing::error!(%error, "proxy unavailable; dashboard remains active");
     source.failed(format!("{error:#}"));
     let signal = tokio::select! {
-        signal = tokio::signal::ctrl_c() => signal,
+        signal = wait_for_stop(requested) => signal,
         result = &mut *ui_task => return dashboard_ended(result),
     };
     shutdown.send_replace(true);
     ui_task.await.context("dashboard task failed")??;
     signal?;
     Err(error)
+}
+
+async fn wait_for_stop(requested: &mut watch::Receiver<bool>) -> std::io::Result<()> {
+    tokio::select! {
+        signal = tokio::signal::ctrl_c() => signal,
+        received = async { requested.wait_for(|requested| *requested).await.is_ok() } => {
+            // If the UI task exits, let its JoinHandle report the failure instead.
+            if received { Ok(()) } else { std::future::pending().await }
+        }
+    }
 }
 
 fn dashboard_ended(
@@ -181,5 +198,34 @@ async fn serve_socks(listener: TcpListener, router: RouterHandle) -> Result<()> 
                 tracing::debug!(%peer, "SOCKS5 handler finished");
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn dashboard_shutdown_is_received_after_a_lifecycle_transition() {
+        let (request, mut requested) = watch::channel(false);
+        request.send_replace(true);
+        tokio::time::timeout(Duration::from_secs(1), wait_for_stop(&mut requested))
+            .await
+            .expect("pending shutdown request was lost")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn dashboard_shutdown_wakes_a_running_application() {
+        let (request, mut requested) = watch::channel(false);
+        let waiting = tokio::spawn(async move { wait_for_stop(&mut requested).await });
+        tokio::task::yield_now().await;
+        request.send_replace(true);
+        tokio::time::timeout(Duration::from_secs(1), waiting)
+            .await
+            .expect("application did not observe shutdown")
+            .unwrap()
+            .unwrap();
     }
 }

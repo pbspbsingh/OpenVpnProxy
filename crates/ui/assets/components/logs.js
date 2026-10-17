@@ -11,7 +11,7 @@ export function logs() {
     rows: [], buffered: 0, matching: 0,
     level: "ALL", visibleLimit: INITIAL_VISIBLE, dropped: 0,
     status: "Opens when this tab is selected",
-    get active() { return this.$store.dashboard.tab === "logs"; },
+    get active() { return this.$store.dashboard.tab === "logs" && !this.$store.dashboard.stopping; },
     get count() { return `${this.rows.length.toLocaleString()} of ${this.matching.toLocaleString()} matching · ${this.buffered.toLocaleString()} buffered`; },
     init() {
       feed = createFeed("/ws/logs", {
@@ -20,7 +20,10 @@ export function logs() {
       });
       this.$watch("active", () => {
         if (this.active) feed.start();
-        else { feed.stop(); this.status = feed.exhausted ? "Disconnected" : "Paused while tab is closed"; }
+        else {
+          feed.stop();
+          this.status = this.$store.dashboard.stopping ? "Shutdown requested" : feed.exhausted ? "Disconnected" : "Paused while tab is closed";
+        }
       });
       if (this.active) feed.start();
     },

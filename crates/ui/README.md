@@ -22,15 +22,25 @@ Keep Chart.js instances, sockets, abort controllers, and timer handles outside
 reactive objects. Components release these resources in `destroy()`.
 Use `x-text` for data from APIs and logs, and stable keys for `x-for` collections.
 
+The header's Shut down button confirms the action, then sends a same-origin
+`POST /api/shutdown`. This requests the application's normal graceful shutdown;
+the app stops accepting clients, closes VPN hosts, and stops the dashboard.
+The request channel is separate from the dashboard's stop notification so the
+HTTP response can finish while the application cleans up. The UI stops its feeds
+and polling once the request is accepted.
+
 ## Checks
 
 ```sh
 cargo test --locked -p ovpn-ui
 cargo build --locked -p ovpn-ui --example dashboard_fixture
-python3 crates/ui/tests/browser.py --fixture target/debug/examples/dashboard_fixture
+cargo build --locked -p openvpn-proxy-app
+python3 crates/ui/tests/browser.py --fixture target/debug/examples/dashboard_fixture --app target/debug/openvpn-proxy-app
 ```
 
 The browser check needs Chrome (`--chrome` can override its path), Python 3,
 CDN access, and permission to bind loopback sockets. It uses Python's standard
 library and Chrome DevTools directly. The fixture exercises real Rust HTTP and
 WebSocket handlers without a VPN or credentials.
+`--app` also checks that the real application accepts shutdown after a profile
+loading failure, using a temporary configuration.

@@ -1,4 +1,4 @@
-//! Read-only HTTP dashboard with live WebSocket snapshots.
+//! HTTP dashboard with live WebSocket snapshots and graceful shutdown control.
 
 mod assets;
 mod history;

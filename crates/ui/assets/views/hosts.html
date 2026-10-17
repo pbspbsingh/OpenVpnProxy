@@ -1,0 +1,182 @@
+<section :hidden="$store.dashboard.tab !== 'hosts'" aria-labelledby="tab-hosts" class="tab-panel" hidden="" id="hosts" role="tabpanel" x-data="hosts">
+ <div class="section-heading">
+  <div>
+   <div class="eyebrow">
+    TUNNEL INVENTORY
+   </div>
+   <h2>
+    Hosts
+   </h2>
+  </div>
+  <div class="range-pill">
+   Last 60 minutes
+   <span>
+    ·
+   </span>
+   1 min buckets
+  </div>
+ </div>
+ <div class="host-layout">
+  <div aria-label="VPN hosts" class="host-list" id="host-list">
+   <template :key="item.id" x-for="item in hosts">
+    <button :aria-pressed="item.id === selectedId" :class="{ selected: item.id === selectedId }" :data-host-id="item.id" @click="select(item.id)" class="host-item" type="button">
+     <div class="host-item-top">
+      <span class="host-item-title" x-text="`Host ${item.id + 1}`">
+      </span>
+      <span class="host-item-speed" x-text="item.selected ? 'SELECTED' : 'STANDBY'">
+      </span>
+     </div>
+     <div class="host-item-bottom">
+      <span class="host-item-endpoint" x-text="item.endpoint">
+      </span>
+      <span class="host-item-speed">
+       <strong x-text="formatRate($store.dashboard.rates.hosts[item.id]?.rx ?? 0)">
+       </strong>
+       down
+      </span>
+     </div>
+    </button>
+   </template>
+  </div>
+  <div class="host-detail">
+   <article class="panel host-detail-header">
+    <div>
+     <div class="eyebrow">
+      SELECTED HOST
+     </div>
+     <h3 id="selected-host-name" x-text="host ? `Host ${host.id + 1}` : 'No hosts available'">
+      Choose a host
+     </h3>
+     <div class="muted" id="selected-host-endpoint" x-text="host?.endpoint ?? '—'">
+      —
+     </div>
+    </div>
+    <div :class="host?.phase ?? ''" class="phase-badge" id="selected-host-badge" x-text="host ? humanPhase(host.phase) : '—'">
+     —
+    </div>
+    <div class="host-detail-stats" id="selected-host-stats">
+     <template :key="stat[0]" x-for="stat in stats">
+      <span>
+       <span x-text="stat[0]">
+       </span>
+       <strong x-text="stat[1]">
+       </strong>
+      </span>
+     </template>
+    </div>
+   </article>
+   <div class="host-chart-grid">
+    <article class="panel chart-panel" x-data="trafficChart('hosts', 'traffic')" x-effect="refresh($store.dashboard.frame, $store.dashboard.selectedHostId, $store.dashboard.tab)">
+     <div class="panel-heading">
+      <div>
+       <div class="eyebrow">
+        TUNNEL THROUGHPUT
+       </div>
+       <h3>
+        Host traffic
+       </h3>
+      </div>
+      <div class="legend">
+       <span class="legend-item">
+        <i class="swatch rx">
+        </i>
+        Download
+       </span>
+       <span class="legend-item">
+        <i class="swatch tx">
+        </i>
+        Upload
+       </span>
+      </div>
+     </div>
+     <div class="chart-wrap">
+      <canvas aria-label="Average selected host download and upload rate for each minute of the last hour" id="host-traffic-chart" x-ref="canvas">
+      </canvas>
+     </div>
+     <div class="chart-foot">
+      Average rate for each one-minute bucket.
+     </div>
+    </article>
+    <article class="panel chart-panel" x-data="trafficChart('hosts', 'latency')" x-effect="refresh($store.dashboard.frame, $store.dashboard.selectedHostId, $store.dashboard.tab)">
+     <div class="panel-heading">
+      <div>
+       <div class="eyebrow">
+        TUNNEL RESPONSIVENESS
+       </div>
+       <h3>
+        Host latency
+       </h3>
+      </div>
+      <div class="legend">
+       <span class="legend-item">
+        <i class="swatch latency">
+        </i>
+        Probe score
+       </span>
+      </div>
+     </div>
+     <div class="chart-wrap">
+      <canvas aria-label="Selected host latency per minute for the last hour" id="host-latency-chart" x-ref="canvas">
+      </canvas>
+     </div>
+     <div class="chart-foot">
+      Median TCP probe latency, smoothed by the connection manager.
+     </div>
+    </article>
+   </div>
+   <article class="panel groups-panel" id="assigned-groups">
+    <div class="groups-heading">
+     <span>
+      Assigned groups
+      <strong id="assigned-group-count" x-text="host?.sticky_groups.toLocaleString() ?? '0'">
+       0
+      </strong>
+     </span>
+     <span aria-live="polite" id="groups-status" x-text="status">
+      Waiting for host selection
+     </span>
+     <button :hidden="groups.length &gt;= total" @click="loadGroups(true)" hidden="" id="groups-more" type="button">
+      Load more
+     </button>
+     <button @click="loadGroups()" id="groups-refresh" type="button">
+      Refresh
+     </button>
+    </div>
+    <div class="groups-table-wrap">
+     <table class="groups-table">
+      <thead>
+       <tr>
+        <th>
+         Source IP
+        </th>
+        <th>
+         Destination group
+        </th>
+        <th>
+         Connections / idle
+        </th>
+       </tr>
+      </thead>
+      <tbody id="groups-rows">
+       <template :key="JSON.stringify([group.source, group.destination])" x-for="group in groups">
+        <tr>
+         <td x-text="group.source">
+         </td>
+         <td x-text="group.destination">
+         </td>
+         <td x-text="activity(group)">
+         </td>
+        </tr>
+       </template>
+       <tr x-show="groups.length === 0">
+        <td class="groups-empty" colspan="3">
+         No assignments for this host
+        </td>
+       </tr>
+      </tbody>
+     </table>
+    </div>
+   </article>
+  </div>
+ </div>
+</section>

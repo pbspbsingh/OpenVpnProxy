@@ -1,5 +1,6 @@
 //! Read-only HTTP dashboard with live WebSocket snapshots.
 
+mod assets;
 mod history;
 mod logs;
 mod server;

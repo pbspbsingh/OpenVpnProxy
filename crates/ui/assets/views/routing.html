@@ -1,0 +1,150 @@
+<section :hidden="$store.dashboard.tab !== 'routing'" aria-labelledby="tab-routing" class="tab-panel" hidden="" id="routing" role="tabpanel" x-data="routing">
+ <div class="section-heading">
+  <div>
+   <div class="eyebrow">
+    ASSIGNMENT STATE
+   </div>
+   <h2>
+    Routing
+   </h2>
+  </div>
+  <div class="range-pill">
+   Live status
+  </div>
+ </div>
+ <div class="routing-grid">
+  <article class="panel routing-summary">
+   <div class="eyebrow">
+    POOL CAPACITY
+   </div>
+   <h3>
+    Host selection
+   </h3>
+   <div class="routing-row">
+    <span>
+     Profile candidates
+    </span>
+    <strong id="routing-candidates" x-text="pool?.candidate_hosts.toLocaleString() ?? '—'">
+     —
+    </strong>
+   </div>
+   <div class="routing-row">
+    <span>
+     Selected hosts
+    </span>
+    <strong id="routing-selected" x-text="pool?.selected_hosts.toLocaleString() ?? '—'">
+     —
+    </strong>
+   </div>
+   <div class="routing-row">
+    <span>
+     Ready tunnels
+    </span>
+    <strong id="routing-ready" x-text="pool?.ready_hosts.toLocaleString() ?? '—'">
+     —
+    </strong>
+   </div>
+   <div class="routing-row">
+    <span>
+     Configured active limit
+    </span>
+    <strong id="routing-limit" x-text="pool?.max_active_hosts.toLocaleString() ?? '—'">
+     —
+    </strong>
+   </div>
+   <div class="routing-row">
+    <span>
+     Idle shutdown
+    </span>
+    <strong id="routing-idle" x-text="idle">
+     —
+    </strong>
+   </div>
+  </article>
+  <article class="panel routing-summary">
+   <div class="eyebrow">
+    STICKY ROUTING
+   </div>
+   <h3>
+    Current assignments
+   </h3>
+   <div class="routing-row">
+    <span>
+     Sticky groups
+    </span>
+    <strong id="routing-sticky" x-text="pool?.sticky_groups.toLocaleString() ?? '—'">
+     —
+    </strong>
+   </div>
+   <div class="routing-row">
+    <span>
+     Active client routes
+    </span>
+    <strong id="routing-routes" x-text="pool?.active_routes.toLocaleString() ?? '—'">
+     —
+    </strong>
+   </div>
+   <p class="muted routing-note">
+    A client source IP and destination group stay on the same VPN host while the assignment is active. Idle groups expire after 30 minutes.
+   </p>
+  </article>
+ </div>
+ <article class="panel table-panel">
+  <div class="panel-heading">
+   <div>
+    <div class="eyebrow">
+     BY VPN SERVER
+    </div>
+    <h3>
+     Assignment distribution
+    </h3>
+   </div>
+  </div>
+  <div class="table-scroll">
+   <table>
+    <thead>
+     <tr>
+      <th>
+       Host
+      </th>
+      <th>
+       State
+      </th>
+      <th>
+       Sticky groups
+      </th>
+      <th>
+       Active routes
+      </th>
+      <th>
+       Latency
+      </th>
+      <th>
+       Download total
+      </th>
+     </tr>
+    </thead>
+    <tbody id="routing-hosts">
+     <template :key="host.id" x-for="host in hosts">
+      <tr>
+       <td x-text="`Host ${host.id + 1} · ${host.endpoint}`">
+       </td>
+       <td>
+        <span :class="host.phase" class="table-state" x-text="humanPhase(host.phase)">
+        </span>
+       </td>
+       <td x-text="host.sticky_groups.toLocaleString()">
+       </td>
+       <td x-text="host.active_routes.toLocaleString()">
+       </td>
+       <td x-text="formatLatency(host.latency_ms)">
+       </td>
+       <td x-text="formatBytes(host.rx_bytes)">
+       </td>
+      </tr>
+     </template>
+    </tbody>
+   </table>
+  </div>
+ </article>
+</section>

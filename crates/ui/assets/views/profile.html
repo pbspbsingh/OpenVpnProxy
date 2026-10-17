@@ -1,0 +1,157 @@
+<section :hidden="$store.dashboard.tab !== 'profile'" aria-labelledby="tab-profile" class="tab-panel" hidden="" id="profile" role="tabpanel" x-data="profile">
+ <div class="section-heading">
+  <div>
+   <div class="eyebrow">
+    LOADED VPN SETTINGS
+   </div>
+   <h2>
+    Profile
+   </h2>
+  </div>
+  <div class="range-pill">
+   Read-only summary
+  </div>
+ </div>
+ <div class="profile-grid">
+  <article class="panel routing-summary">
+   <div class="eyebrow">
+    CONNECTION
+   </div>
+   <h3>
+    Protocol and timing
+   </h3>
+   <div class="routing-row">
+    <span>
+     Transport
+    </span>
+    <strong>
+     UDP over IPv4
+    </strong>
+   </div>
+   <div class="routing-row">
+    <span>
+     Profile remotes
+    </span>
+    <strong id="profile-remote-count" x-text="summary?.remotes.length.toLocaleString() ?? '—'">
+     —
+    </strong>
+   </div>
+   <div class="routing-row">
+    <span>
+     Handshake window
+    </span>
+    <strong id="profile-handshake" x-text="summary ? formatDuration(summary.handshake_window_seconds) : '—'">
+     —
+    </strong>
+   </div>
+   <div class="routing-row">
+    <span>
+     Transition window
+    </span>
+    <strong id="profile-transition" x-text="summary ? formatDuration(summary.transition_window_seconds) : '—'">
+     —
+    </strong>
+   </div>
+   <div class="routing-row">
+    <span>
+     Key renegotiation
+    </span>
+    <strong id="profile-renegotiation" x-text="summary ? formatDuration(summary.renegotiate_after_seconds) : '—'">
+     —
+    </strong>
+   </div>
+  </article>
+  <article class="panel routing-summary">
+   <div class="eyebrow">
+    POLICY
+   </div>
+   <h3>
+    Authentication and routes
+   </h3>
+   <div class="routing-row">
+    <span>
+     Username/password
+    </span>
+    <strong id="profile-credentials" x-text="summary ? (summary.credentials_required ? 'Required' : 'Not required') : '—'">
+     —
+    </strong>
+   </div>
+   <div class="routing-row">
+    <span>
+     Certificate authority
+    </span>
+    <strong>
+     Inline CA required
+    </strong>
+   </div>
+   <div class="routing-row">
+    <span>
+     Server certificate purpose
+    </span>
+    <strong id="profile-server-purpose" x-text="summary ? (summary.server_certificate_purpose_required ? 'Server required' : 'Not specified') : '—'">
+     —
+    </strong>
+   </div>
+   <div class="routing-row">
+    <span>
+     Control protection
+    </span>
+    <strong>
+     tls-crypt v1
+    </strong>
+   </div>
+   <div class="routing-row">
+    <span>
+     IPv6 policy
+    </span>
+    <strong id="profile-ipv6" x-text="summary ? (summary.ipv6_blocked ? 'Blocked by profile' : 'Allowed if server provides it') : '—'">
+     —
+    </strong>
+   </div>
+  </article>
+ </div>
+ <article class="panel table-panel">
+  <div class="panel-heading">
+   <div>
+    <div class="eyebrow">
+     PROFILE DIRECTIVES
+    </div>
+    <h3>
+     VPN remotes
+    </h3>
+   </div>
+   <span class="muted" id="profile-status" x-text="status">
+    Loading profile summary…
+   </span>
+  </div>
+  <div class="table-scroll">
+   <table>
+    <thead>
+     <tr>
+      <th>
+       #
+      </th>
+      <th>
+       Hostname or IP
+      </th>
+      <th>
+       Port
+      </th>
+     </tr>
+    </thead>
+    <tbody id="profile-remotes">
+     <template :key="index" x-for="(remote, index) in summary?.remotes ?? []">
+      <tr>
+       <td x-text="index + 1">
+       </td>
+       <td x-text="remote.host">
+       </td>
+       <td x-text="remote.port">
+       </td>
+      </tr>
+     </template>
+    </tbody>
+   </table>
+  </div>
+ </article>
+</section>

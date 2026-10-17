@@ -1,0 +1,66 @@
+<section :hidden="$store.dashboard.tab !== 'logs'" aria-labelledby="tab-logs" class="tab-panel" hidden="" id="logs" role="tabpanel" x-data="logs">
+ <div class="section-heading">
+  <div>
+   <div class="eyebrow">
+    LIVE DIAGNOSTICS
+   </div>
+   <h2>
+    Logs
+   </h2>
+  </div>
+  <div aria-live="polite" class="range-pill" id="log-status" x-text="status">
+   Opens when this tab is selected
+  </div>
+ </div>
+ <article class="panel logs-panel">
+  <div class="logs-toolbar">
+   <span id="log-count" x-text="count">
+    0 recent events
+   </span>
+   <button :hidden="matching &lt;= visibleLimit" @click="older()" hidden="" id="logs-older" type="button">
+    Show older
+   </button>
+   <label for="log-level">
+    Minimum level
+   </label>
+   <select @change="render(true)" id="log-level" x-model="level">
+    <option value="ALL">
+     All
+    </option>
+    <option value="TRACE">
+     Trace
+    </option>
+    <option value="DEBUG">
+     Debug
+    </option>
+    <option value="INFO">
+     Info
+    </option>
+    <option value="WARN">
+     Warn
+    </option>
+    <option value="ERROR">
+     Error
+    </option>
+   </select>
+   <span :hidden="!dropped" class="log-dropped" hidden="" id="log-dropped" x-text="`${dropped.toLocaleString()} dropped during overload`">
+   </span>
+  </div>
+  <div aria-label="Recent application logs" class="logs-scroll" id="log-scroll" role="log" x-ref="scroll">
+   <div class="log-rows" id="log-rows">
+    <template :key="entry.sequence" x-for="entry in rows">
+     <div :data-sequence="entry.sequence" class="log-row">
+      <span class="log-time" x-text="time(entry.timestamp_ms)">
+      </span>
+      <span :class="entry.level" class="log-level" x-text="entry.level">
+      </span>
+      <span :title="entry.target" class="log-target" x-text="entry.target">
+      </span>
+      <span class="log-message" x-text="entry.message">
+      </span>
+     </div>
+    </template>
+   </div>
+  </div>
+ </article>
+</section>

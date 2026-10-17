@@ -22,6 +22,8 @@ html { min-width: 320px; height: 100%; background: var(--bg); }
 body { margin: 0; height: 100%; overflow: hidden; color: var(--text); background: radial-gradient(ellipse 75% 35% at 50% -12%, #1b3542 0%, transparent 75%), var(--bg); }
 button { font: inherit; }
 [hidden] { display: none !important; }
+[x-cloak] { display: none !important; }
+.boot-status { margin: 24px; color: var(--muted); font-size: 14px; }
 .shell { width: 100%; max-width: 1540px; height: 100dvh; min-height: 0; margin: 0 auto; padding: 0 24px 12px; display: grid; grid-template-rows: auto auto minmax(0, 1fr) auto; }
 
 .topbar { min-height: 68px; display: flex; align-items: center; justify-content: space-between; gap: 24px; border-bottom: 1px solid var(--border); }

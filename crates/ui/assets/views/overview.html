@@ -1,0 +1,158 @@
+<section :hidden="$store.dashboard.tab !== 'overview'" aria-labelledby="tab-overview" class="tab-panel" id="overview" role="tabpanel" x-data="overview">
+ <div class="section-heading">
+  <div>
+   <div class="eyebrow">
+    LIVE SYSTEM VIEW
+   </div>
+   <h2>
+    Overview
+   </h2>
+  </div>
+  <div class="range-pill">
+   Last 60 minutes
+   <span>
+    ·
+   </span>
+   1 min buckets
+  </div>
+ </div>
+ <div class="metric-grid">
+  <article class="metric-card">
+   <div class="metric-label">
+    Pool status
+   </div>
+   <div :class="tone" class="metric-value status-text" id="pool-phase" x-text="pool ? humanPhase(pool.phase) : 'Waiting'">
+    Waiting
+   </div>
+   <div :class="{ error: pool?.phase === 'failed' }" :title="detail" aria-live="polite" class="metric-detail" id="pool-detail" x-text="detail">
+    Waiting for first snapshot
+   </div>
+  </article>
+  <article class="metric-card">
+   <div class="metric-label">
+    Active routes
+   </div>
+   <div class="metric-value" id="active-routes" x-text="pool?.active_routes.toLocaleString() ?? '—'">
+    —
+   </div>
+   <div class="metric-detail">
+    Client routes in use
+   </div>
+  </article>
+  <article class="metric-card">
+   <div class="metric-label">
+    Download
+   </div>
+   <div class="metric-value" id="system-rx-rate" x-text="pool ? formatRate($store.dashboard.rates.pool.rx) : '—'">
+    —
+   </div>
+   <div class="metric-detail" id="system-rx-total" x-text="'Total ' + formatBytes(pool?.rx_bytes)">
+    Total —
+   </div>
+  </article>
+  <article class="metric-card">
+   <div class="metric-label">
+    Upload
+   </div>
+   <div class="metric-value" id="system-tx-rate" x-text="pool ? formatRate($store.dashboard.rates.pool.tx) : '—'">
+    —
+   </div>
+   <div class="metric-detail" id="system-tx-total" x-text="'Total ' + formatBytes(pool?.tx_bytes)">
+    Total —
+   </div>
+  </article>
+ </div>
+ <div class="chart-grid">
+  <article class="panel chart-panel" x-data="trafficChart('overview', 'traffic')" x-effect="refresh($store.dashboard.frame, $store.dashboard.selectedHostId, $store.dashboard.tab)">
+   <div class="panel-heading">
+    <div>
+     <div class="eyebrow">
+      TUNNEL THROUGHPUT
+     </div>
+     <h3>
+      System traffic
+     </h3>
+    </div>
+    <div class="legend">
+     <span class="legend-item">
+      <i class="swatch rx">
+      </i>
+      Download
+     </span>
+     <span class="legend-item">
+      <i class="swatch tx">
+      </i>
+      Upload
+     </span>
+    </div>
+   </div>
+   <div class="chart-wrap">
+    <canvas aria-label="Average system download and upload rate for each minute of the last hour" id="system-traffic-chart" x-ref="canvas">
+    </canvas>
+   </div>
+   <div class="chart-foot">
+    Average rate in each one-minute bucket. Current minute is partial.
+   </div>
+  </article>
+  <article class="panel chart-panel" x-data="trafficChart('overview', 'latency')" x-effect="refresh($store.dashboard.frame, $store.dashboard.selectedHostId, $store.dashboard.tab)">
+   <div class="panel-heading">
+    <div>
+     <div class="eyebrow">
+      TUNNEL RESPONSIVENESS
+     </div>
+     <h3>
+      System latency
+     </h3>
+    </div>
+    <div class="legend">
+     <span class="legend-item">
+      <i class="swatch latency">
+      </i>
+      Selected host mean
+     </span>
+    </div>
+   </div>
+   <div class="chart-wrap">
+    <canvas aria-label="Average selected host latency per minute for the last hour" id="system-latency-chart" x-ref="canvas">
+    </canvas>
+   </div>
+   <div class="chart-foot">
+    Mean of selected hosts' tunneled TCP probe scores.
+   </div>
+  </article>
+ </div>
+ <div class="panel overview-strip">
+  <div>
+   <span class="strip-label">
+    Hosts online
+   </span>
+   <strong id="hosts-ready" x-text="pool ? `${pool.ready_hosts} / ${pool.selected_hosts}` : '—'">
+    —
+   </strong>
+  </div>
+  <div>
+   <span class="strip-label">
+    Sticky groups
+   </span>
+   <strong id="sticky-count" x-text="pool?.sticky_groups.toLocaleString() ?? '—'">
+    —
+   </strong>
+  </div>
+  <div>
+   <span class="strip-label">
+    Candidates
+   </span>
+   <strong id="candidate-count" x-text="pool?.candidate_hosts.toLocaleString() ?? '—'">
+    —
+   </strong>
+  </div>
+  <div>
+   <span class="strip-label">
+    Active limit
+   </span>
+   <strong id="active-limit" x-text="pool?.max_active_hosts.toLocaleString() ?? '—'">
+    —
+   </strong>
+  </div>
+ </div>
+</section>

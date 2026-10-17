@@ -19,6 +19,7 @@ use tokio::net::TcpListener;
 use tokio::sync::{Semaphore, broadcast, watch};
 use tokio::time;
 
+use crate::assets;
 use crate::history::MinuteHistory;
 use crate::logs::{LogEntry, LogHub};
 use crate::{DashboardSnapshot, GroupPage, ProfileSummary};
@@ -31,10 +32,6 @@ const LOG_REPLAY_BATCH_SIZE: usize = 256;
 const MAX_GROUP_QUERIES: usize = 4;
 const MAX_CLIENT_MESSAGE_BYTES: usize = 1024;
 const GROUP_PAGE_SIZE: usize = 100;
-const UI_HTML: &str = include_str!("../assets/index.html");
-const UI_CSS: &str = include_str!("../assets/style.css");
-const UI_JS: &str = include_str!("../assets/app.js");
-const UI_FAVICON: &str = include_str!("../assets/favicon.svg");
 
 /// A source of read-only dashboard data. Implementations must omit credentials.
 pub trait SnapshotSource: Send + Sync + 'static {
@@ -101,9 +98,8 @@ pub async fn serve<S: SnapshotSource>(
     };
     let router = Router::new()
         .route("/", get(index))
-        .route("/style.css", get(style))
-        .route("/app.js", get(script))
-        .route("/favicon.svg", get(favicon))
+        .route("/index.html", get(index))
+        .route("/{*path}", get(asset))
         .route("/api/hosts/{host_id}/groups", get(groups))
         .route("/api/profile", get(profile))
         .route("/ws", any(websocket))
@@ -160,19 +156,14 @@ async fn no_cache(mut response: Response) -> Response {
 }
 
 async fn index() -> impl IntoResponse {
-    Html(UI_HTML)
+    Html(assets::index())
 }
 
-async fn style() -> impl IntoResponse {
-    ([(CONTENT_TYPE, "text/css; charset=utf-8")], UI_CSS)
-}
-
-async fn script() -> impl IntoResponse {
-    ([(CONTENT_TYPE, "text/javascript; charset=utf-8")], UI_JS)
-}
-
-async fn favicon() -> impl IntoResponse {
-    ([(CONTENT_TYPE, "image/svg+xml")], UI_FAVICON)
+async fn asset(Path(path): Path<String>) -> Response {
+    match assets::get(&path) {
+        Some((content_type, body)) => ([(CONTENT_TYPE, content_type)], body).into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
 }
 
 async fn groups(

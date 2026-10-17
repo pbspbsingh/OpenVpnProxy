@@ -5,52 +5,59 @@ use std::pin::Pin;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ovpn_ui::{
-    DashboardSnapshot, GroupError, GroupPage, GroupSnapshot, HostPhase, HostSnapshot, LogEvent,
-    LogHub, PoolPhase, PoolSnapshot, ProfileRemote, ProfileSummary, SnapshotSource,
+    DashboardHistory, DashboardSnapshot, DashboardSource, GroupError, GroupPage, GroupSnapshot,
+    HostPhase, HostSnapshot, LogEvent, LogHub, PoolPhase, PoolSnapshot, ProfileRemote,
+    ProfileSummary,
 };
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 
-struct Fixture;
+struct Fixture {
+    updates: watch::Receiver<String>,
+}
 
-impl SnapshotSource for Fixture {
-    fn snapshot(&self) -> Pin<Box<dyn Future<Output = DashboardSnapshot> + Send + '_>> {
-        Box::pin(async {
-            let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
-            let rx = now.as_secs() * 100_000;
-            DashboardSnapshot {
-                version: 1,
-                sampled_at_ms: now.as_millis() as u64,
-                message: None,
-                pool: PoolSnapshot {
-                    phase: PoolPhase::Ready,
-                    candidate_hosts: 2,
-                    selected_hosts: 2,
-                    ready_hosts: 2,
-                    max_active_hosts: 2,
-                    active_routes: 3,
-                    sticky_groups: 102,
-                    idle_remaining_seconds: None,
-                    tx_bytes: rx / 10,
-                    rx_bytes: rx,
-                },
-                hosts: (0..2)
-                    .map(|id| HostSnapshot {
-                        id,
-                        endpoint: format!("192.0.2.{}:1194", id + 1),
-                        phase: HostPhase::Ready,
-                        selected: true,
-                        active_routes: id + 1,
-                        sticky_groups: if id == 0 { 101 } else { 1 },
-                        latency_ms: Some(20.0 + id as f64 * 10.0),
-                        score_age_seconds: Some(5),
-                        ipv6: id == 0,
-                        tx_bytes: rx / 20,
-                        rx_bytes: rx / 2,
-                    })
-                    .collect(),
-            }
-        })
+impl Fixture {
+    fn snapshot() -> DashboardSnapshot {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+        let rx = now.as_secs() * 100_000;
+        DashboardSnapshot {
+            version: 1,
+            sampled_at_ms: now.as_millis() as u64,
+            message: None,
+            pool: PoolSnapshot {
+                phase: PoolPhase::Ready,
+                candidate_hosts: 2,
+                selected_hosts: 2,
+                ready_hosts: 2,
+                max_active_hosts: 2,
+                active_routes: 3,
+                sticky_groups: 102,
+                idle_remaining_seconds: None,
+                tx_bytes: rx / 10,
+                rx_bytes: rx,
+            },
+            hosts: (0..2)
+                .map(|id| HostSnapshot {
+                    id,
+                    endpoint: format!("192.0.2.{}:1194", id + 1),
+                    phase: HostPhase::Ready,
+                    selected: true,
+                    active_routes: id + 1,
+                    sticky_groups: if id == 0 { 101 } else { 1 },
+                    latency_ms: Some(20.0 + id as f64 * 10.0),
+                    score_age_seconds: Some(5),
+                    ipv6: id == 0,
+                    tx_bytes: rx / 20,
+                    rx_bytes: rx / 2,
+                })
+                .collect(),
+        }
+    }
+}
+
+impl DashboardSource for Fixture {
+    fn subscribe(&self) -> watch::Receiver<String> {
+        self.updates.clone()
     }
 
     fn group_page(
@@ -139,6 +146,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         let _ = shutdown.send(true);
     });
-    ovpn_ui::serve(listener, Fixture, receiver, logs, shutdown_request).await?;
+    let mut history = DashboardHistory::new();
+    let (updates, feed) = watch::channel(history.serialize(Fixture::snapshot())?);
+    let mut stopped = receiver.clone();
+    let sampler = tokio::spawn(async move {
+        let period = std::time::Duration::from_secs(5);
+        let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+        loop {
+            tokio::select! {
+                _ = tick.tick() => { updates.send_replace(history.serialize(Fixture::snapshot()).unwrap()); }
+                _ = stopped.changed() => break,
+            }
+        }
+    });
+    let result = ovpn_ui::serve(
+        listener,
+        Fixture { updates: feed },
+        receiver,
+        logs,
+        shutdown_request,
+    )
+    .await;
+    sampler.abort();
+    let _ = sampler.await;
+    result?;
     Ok(())
 }

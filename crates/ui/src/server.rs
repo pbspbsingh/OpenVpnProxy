@@ -20,11 +20,9 @@ use tokio::sync::{Semaphore, broadcast, watch};
 use tokio::time;
 
 use crate::assets;
-use crate::history::MinuteHistory;
 use crate::logs::{LogEntry, LogHub};
-use crate::{DashboardSnapshot, GroupPage, ProfileSummary};
+use crate::{GroupPage, ProfileSummary};
 
-const SNAPSHOT_INTERVAL: Duration = Duration::from_secs(5);
 const MAX_WEBSOCKET_CLIENTS: usize = 32;
 const MAX_LOG_CLIENTS: usize = 8;
 const LOG_DROPPED_UPDATE_INTERVAL: Duration = Duration::from_secs(1);
@@ -34,8 +32,8 @@ const MAX_CLIENT_MESSAGE_BYTES: usize = 1024;
 const GROUP_PAGE_SIZE: usize = 100;
 
 /// A source of read-only dashboard data. Implementations must omit credentials.
-pub trait SnapshotSource: Send + Sync + 'static {
-    fn snapshot(&self) -> Pin<Box<dyn Future<Output = DashboardSnapshot> + Send + '_>>;
+pub trait DashboardSource: Send + Sync + 'static {
+    fn subscribe(&self) -> watch::Receiver<String>;
     fn group_page(
         &self,
         host_id: usize,
@@ -62,8 +60,8 @@ pub enum UiError {
 
 #[derive(Clone)]
 struct UiState {
-    source: Arc<dyn SnapshotSource>,
-    updates: watch::Sender<String>,
+    source: Arc<dyn DashboardSource>,
+    updates: watch::Receiver<String>,
     connections: Arc<Semaphore>,
     log_connections: Arc<Semaphore>,
     logs: LogHub,
@@ -79,20 +77,18 @@ struct GroupQuery {
 
 /// Serve the embedded dashboard and its live WebSocket feed.
 /// Shutdown requests are sent to the application; `shutdown` stops this server after cleanup.
-pub async fn serve<S: SnapshotSource>(
+pub async fn serve<S: DashboardSource>(
     listener: TcpListener,
     source: S,
     shutdown: watch::Receiver<bool>,
     logs: LogHub,
     shutdown_request: watch::Sender<bool>,
 ) -> Result<(), UiError> {
-    let source: Arc<dyn SnapshotSource> = Arc::new(source);
-    let mut history = MinuteHistory::new();
-    let initial = serde_json::to_string(&history.observe(source.snapshot().await))?;
-    let (updates, _) = watch::channel(initial);
+    let source: Arc<dyn DashboardSource> = Arc::new(source);
+    let updates = source.subscribe();
     let state = UiState {
-        source: Arc::clone(&source),
-        updates: updates.clone(),
+        source,
+        updates,
         connections: Arc::new(Semaphore::new(MAX_WEBSOCKET_CLIENTS)),
         log_connections: Arc::new(Semaphore::new(MAX_LOG_CLIENTS)),
         logs,
@@ -113,35 +109,10 @@ pub async fn serve<S: SnapshotSource>(
         .with_state(state);
     tracing::info!(address = %listener.local_addr()?, "dashboard listening");
 
-    let sampler = tokio::spawn(sample(source, updates, shutdown.clone(), history));
     let result = axum::serve(listener, router)
         .with_graceful_shutdown(wait_for_shutdown(shutdown))
         .await;
-    sampler.abort();
-    let _ = sampler.await;
     result.map_err(UiError::from)
-}
-
-async fn sample(
-    source: Arc<dyn SnapshotSource>,
-    updates: watch::Sender<String>,
-    mut shutdown: watch::Receiver<bool>,
-    mut history: MinuteHistory,
-) {
-    let mut interval =
-        time::interval_at(time::Instant::now() + SNAPSHOT_INTERVAL, SNAPSHOT_INTERVAL);
-    interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
-    loop {
-        tokio::select! {
-            _ = interval.tick() => match serde_json::to_string(&history.observe(source.snapshot().await)) {
-                Ok(snapshot) => { updates.send_replace(snapshot); }
-                Err(error) => tracing::error!(%error, "dashboard snapshot serialization failed"),
-            },
-            changed = shutdown.changed() => {
-                if changed.is_err() || *shutdown.borrow() { break; }
-            }
-        }
-    }
 }
 
 async fn wait_for_shutdown(mut shutdown: watch::Receiver<bool>) {
@@ -240,7 +211,7 @@ async fn websocket(
         .on_upgrade(move |socket| async move {
             let _permit = permit;
             tracing::debug!("dashboard WebSocket client connected");
-            stream_snapshots(socket, state.updates.subscribe(), state.shutdown).await;
+            stream_snapshots(socket, state.updates.clone(), state.shutdown).await;
             tracing::debug!("dashboard WebSocket client disconnected");
         })
 }

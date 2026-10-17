@@ -1,23 +1,20 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use ovpn_netstack::Stack;
 use ovpn_socks5::DestinationHost;
-use ovpn_ui::{
-    DashboardSnapshot, GroupError, GroupPage, GroupSnapshot, HostPhase as UiHostPhase,
-    HostSnapshot, PoolPhase, PoolSnapshot, ProfileSummary,
-};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time;
 
 use super::probe::LatencyScore;
-use super::telemetry::HostTraffic;
+use super::telemetry::{
+    HostObservation, HostPhase, Observation, POOL_IDLE_TIMEOUT, PoolObservation,
+    STICKY_IDLE_TIMEOUT, StickyDestination, StickyKey, Telemetry,
+};
 
 const MAX_STICKY_GROUPS: usize = 100_000;
-const STICKY_IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
-const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const STICKY_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 const ROUTING_COMMAND_QUEUE: usize = 2048;
 const LOAD_SCORE_SCALE: u128 = 8;
@@ -27,7 +24,6 @@ const LATENCY_SAMPLE_WEIGHT: u32 = 1;
 #[derive(Clone)]
 pub(crate) struct RouterHandle {
     pub(super) shared: Arc<Shared>,
-    pub(super) profile_summary: Arc<ProfileSummary>,
 }
 
 pub(crate) struct HostLease {
@@ -44,15 +40,6 @@ struct PoolReservation {
 struct StickyReservation {
     releases: mpsc::UnboundedSender<Release>,
     sticky: Option<(StickyKey, u64, usize)>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum HostPhase {
-    Dormant,
-    Connecting,
-    Ready,
-    Backoff,
-    Stopped,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -78,7 +65,6 @@ pub(super) struct Host {
     phase: HostPhase,
     stack: Option<Stack>,
     active: usize,
-    traffic: Arc<HostTraffic>,
     enabled: watch::Sender<HostActivation>,
     selected: bool,
     unhealthy: bool,
@@ -92,18 +78,6 @@ struct PoolUsage {
     idle_since: Option<Instant>,
 }
 
-#[derive(Clone, Hash, Eq, PartialEq, Debug)]
-struct StickyKey {
-    source: IpAddr,
-    destination: StickyDestination,
-}
-
-#[derive(Clone, Hash, Eq, PartialEq, Debug)]
-enum StickyDestination {
-    Ip(IpAddr),
-    Domain(String),
-}
-
 struct StickyEntry {
     host_id: usize,
     active: usize,
@@ -114,7 +88,7 @@ struct StickyEntry {
 struct RoutingState {
     hosts: Vec<Host>,
     sticky: HashMap<StickyKey, StickyEntry>,
-    groups_by_host: Vec<BTreeMap<(String, String), StickyKey>>,
+    groups_by_host: Vec<HashSet<StickyKey>>,
     pool_tokens: HashSet<u64>,
     next_pool_token: u64,
     next_choice: usize,
@@ -122,13 +96,13 @@ struct RoutingState {
     pool_usage: PoolUsage,
     pool_epoch: Option<u64>,
     next_pool_epoch: u64,
+    telemetry: Telemetry,
 }
 
 pub(super) struct Shared {
     commands: mpsc::Sender<RoutingCommand>,
     ready: watch::Sender<usize>,
     acquire_timeout: Duration,
-    max_active_vpn_hosts: usize,
 }
 
 /// Owns the routing task independently of any cloned request handles.
@@ -194,8 +168,8 @@ enum RoutingCommand {
         reply: oneshot::Sender<SelectReply>,
     },
     Update(RoutingUpdate, oneshot::Sender<()>),
-    Snapshot(oneshot::Sender<DashboardSnapshot>),
-    GroupPage(usize, usize, usize, oneshot::Sender<Option<GroupPage>>),
+    #[cfg(test)]
+    Inspect(oneshot::Sender<usize>),
     StopAccepting(oneshot::Sender<()>),
 }
 
@@ -238,7 +212,6 @@ impl Host {
             phase: HostPhase::Dormant,
             stack: None,
             active: 0,
-            traffic: Arc::new(HostTraffic::default()),
             enabled,
             selected,
             unhealthy: false,
@@ -251,15 +224,11 @@ impl Host {
     pub(super) fn activation(&self) -> watch::Receiver<HostActivation> {
         self.enabled.subscribe()
     }
-
-    pub(super) fn traffic(&self) -> Arc<HostTraffic> {
-        Arc::clone(&self.traffic)
-    }
 }
 
 impl RoutingState {
     fn new(hosts: Vec<Host>) -> Self {
-        let groups_by_host = (0..hosts.len()).map(|_| BTreeMap::new()).collect();
+        let groups_by_host = (0..hosts.len()).map(|_| HashSet::new()).collect();
         Self {
             hosts,
             sticky: HashMap::new(),
@@ -271,29 +240,78 @@ impl RoutingState {
             pool_usage: PoolUsage::default(),
             pool_epoch: None,
             next_pool_epoch: 0,
+            telemetry: Telemetry::default(),
         }
     }
 
     fn remove_sticky(&mut self, key: &StickyKey) {
-        if let Some(entry) = self.sticky.remove(key) {
-            self.groups_by_host[entry.host_id].remove(&group_sort_key(key));
+        if let Some((key, entry)) = self.sticky.remove_entry(key) {
+            self.groups_by_host[entry.host_id].remove(&key);
+            self.telemetry.emit(|| Observation::AssignmentRemoved(key));
         }
     }
 
     fn clear_host(&mut self, host_id: usize) -> usize {
         let groups = std::mem::take(&mut self.groups_by_host[host_id]);
         let count = groups.len();
-        for (_, key) in groups {
+        for key in groups {
             self.sticky.remove(&key);
         }
+        self.telemetry
+            .emit(|| Observation::HostAssignmentsCleared(host_id));
         count
     }
 
     fn clear_sticky(&mut self) {
+        self.telemetry.emit(|| Observation::AssignmentsCleared);
         self.sticky.clear();
         for groups in &mut self.groups_by_host {
             groups.clear();
         }
+    }
+
+    fn observe_host(&self, id: usize) {
+        self.telemetry.emit(|| Observation::Host {
+            id,
+            state: self.host_observation(id),
+        });
+    }
+
+    fn host_observation(&self, id: usize) -> HostObservation {
+        let host = &self.hosts[id];
+        HostObservation {
+            endpoint: host.endpoint,
+            phase: host.phase,
+            selected: host.selected,
+            active_routes: host.active,
+            latency_score: host.latency_score,
+            score_measured_at: host.score_measured_at,
+            ready: host.phase == HostPhase::Ready
+                && host.stack.as_ref().is_some_and(Stack::is_ready),
+            ipv6: host.stack.as_ref().is_some_and(Stack::supports_ipv6),
+        }
+    }
+
+    fn observe_pool(&self) {
+        self.telemetry.emit(|| {
+            Observation::Pool(PoolObservation {
+                awake: self.pool_epoch.is_some(),
+                has_requests: !self.pool_tokens.is_empty(),
+                idle_since: self.pool_usage.idle_since,
+            })
+        });
+    }
+
+    fn observe_assignment(&self, key: &StickyKey) {
+        self.telemetry.emit(|| {
+            let entry = &self.sticky[key];
+            Observation::Assignment {
+                key: key.clone(),
+                host_id: entry.host_id,
+                active: entry.active,
+                idle_since: entry.idle_since,
+            }
+        });
     }
 }
 
@@ -302,6 +320,7 @@ impl RoutingOwner {
         hosts: Vec<Host>,
         acquire_timeout: Duration,
         max_active_vpn_hosts: usize,
+        telemetry: Telemetry,
     ) -> Self {
         let (ready, _) = watch::channel(0);
         let (commands, command_rx) = mpsc::channel(ROUTING_COMMAND_QUEUE);
@@ -311,10 +330,17 @@ impl RoutingOwner {
             commands,
             ready: ready.clone(),
             acquire_timeout,
-            max_active_vpn_hosts,
+        });
+        let mut state = RoutingState::new(hosts);
+        state.telemetry = telemetry;
+        state.telemetry.emit(|| Observation::Initialized {
+            hosts: (0..state.hosts.len())
+                .map(|id| state.host_observation(id))
+                .collect(),
+            max_active_hosts: max_active_vpn_hosts,
         });
         let actor = RoutingActor {
-            state: RoutingState::new(hosts),
+            state,
             ready,
             releases,
             max_active_vpn_hosts,
@@ -449,11 +475,9 @@ impl RoutingActor {
                         self.update(update);
                         let _ = reply.send(());
                     }
-                    RoutingCommand::Snapshot(reply) => {
-                        let _ = reply.send(self.snapshot());
-                    }
-                    RoutingCommand::GroupPage(host_id, offset, limit, reply) => {
-                        let _ = reply.send(self.group_page(host_id, offset, limit));
+                    #[cfg(test)]
+                    RoutingCommand::Inspect(reply) => {
+                        let _ = reply.send(self.state.pool_tokens.len());
                     }
                     RoutingCommand::StopAccepting(reply) => {
                         accepting = false;
@@ -502,6 +526,9 @@ impl RoutingActor {
                     tracing::debug!(host_id = id, epoch, "waking selected VPN host");
                 }
             }
+            for id in 0..self.state.hosts.len() {
+                self.state.observe_host(id);
+            }
             tracing::info!(
                 epoch,
                 selected = self.state.hosts.iter().filter(|host| host.selected).count(),
@@ -509,6 +536,7 @@ impl RoutingActor {
                 "VPN pool waking"
             );
         }
+        self.state.observe_pool();
         Some(token)
     }
 
@@ -535,6 +563,7 @@ impl RoutingActor {
             self.state.pool_usage.idle_since = Some(Instant::now());
             tracing::info!(?POOL_IDLE_TIMEOUT, "VPN pool idle timer started");
         }
+        self.state.observe_pool();
     }
 
     fn park_pool(&mut self) {
@@ -555,6 +584,10 @@ impl RoutingActor {
         state.pool_epoch = None;
         state.clear_sticky();
         state.pool_usage.idle_since = None;
+        for id in 0..state.hosts.len() {
+            state.observe_host(id);
+        }
+        state.observe_pool();
         self.notify_ready();
         tracing::info!("VPN pool idle timeout reached; closing all sessions");
     }
@@ -581,6 +614,14 @@ impl RoutingActor {
     }
 
     fn update(&mut self, update: RoutingUpdate) {
+        let id = match &update {
+            RoutingUpdate::Phase(id, _)
+            | RoutingUpdate::Probe(id, ..)
+            | RoutingUpdate::Parked(id)
+            | RoutingUpdate::Down(id, _)
+            | RoutingUpdate::Baseline(id, ..)
+            | RoutingUpdate::Ready { id, .. } => *id,
+        };
         match update {
             RoutingUpdate::Phase(id, phase) => {
                 let host = &mut self.state.hosts[id];
@@ -679,6 +720,7 @@ impl RoutingActor {
                 }
             }
         }
+        self.state.observe_host(id);
         self.notify_ready();
     }
 
@@ -726,6 +768,8 @@ impl RoutingActor {
                     preferred_endpoint: host.endpoint,
                 });
             }
+            state.observe_host(id);
+            state.observe_host(next);
             tracing::warn!(
                 failed_host_id = id,
                 replacement_host_id = next,
@@ -798,11 +842,13 @@ impl RoutingActor {
                     generation,
                 },
             );
-            state.groups_by_host[id].insert(group_sort_key(key), key.clone());
+            state.groups_by_host[id].insert(key.clone());
             tracing::info!(source = %key.source, destination = ?key.destination, host_id = id, endpoint = %state.hosts[id].endpoint, latency_score = ?state.hosts[id].latency_score, score_age = ?state.hosts[id].score_measured_at.map(|at| at.elapsed()), active = next_active, "assigned destination group to VPN host");
             generation
         };
         state.hosts[id].active = next_active;
+        state.observe_host(id);
+        state.observe_assignment(key);
         Ok(Some(SelectedRoute {
             stack,
             reservation: StickyReservation {
@@ -819,6 +865,7 @@ impl RoutingActor {
         } else {
             host.active -= 1;
         }
+        self.state.observe_host(host_id);
         if let Some(entry) = self.state.sticky.get_mut(key) {
             if entry.generation != generation {
                 return;
@@ -831,114 +878,8 @@ impl RoutingActor {
             if entry.active == 0 {
                 entry.idle_since = Some(Instant::now());
             }
+            self.state.observe_assignment(key);
         }
-    }
-
-    fn snapshot(&self) -> DashboardSnapshot {
-        let state = &self.state;
-        let sampled_at_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
-            .unwrap_or_default();
-        let mut tx_bytes = 0_u64;
-        let mut rx_bytes = 0_u64;
-        let mut ready_hosts = 0;
-        let mut selected_hosts = 0;
-        let mut active_routes = 0_usize;
-        let hosts = state
-            .hosts
-            .iter()
-            .enumerate()
-            .map(|(id, host)| {
-                let (tx, rx) = host.traffic.snapshot();
-                tx_bytes = tx_bytes.saturating_add(tx);
-                rx_bytes = rx_bytes.saturating_add(rx);
-                ready_hosts += usize::from(
-                    host.phase == HostPhase::Ready
-                        && host.stack.as_ref().is_some_and(Stack::is_ready),
-                );
-                selected_hosts += usize::from(host.selected);
-                active_routes = active_routes.saturating_add(host.active);
-                HostSnapshot {
-                    id,
-                    endpoint: host.endpoint.to_string(),
-                    phase: match host.phase {
-                        HostPhase::Dormant => UiHostPhase::Dormant,
-                        HostPhase::Connecting => UiHostPhase::Connecting,
-                        HostPhase::Ready => UiHostPhase::Ready,
-                        HostPhase::Backoff => UiHostPhase::Backoff,
-                        HostPhase::Stopped => UiHostPhase::Stopped,
-                    },
-                    selected: host.selected,
-                    active_routes: host.active,
-                    sticky_groups: state.groups_by_host[id].len(),
-                    latency_ms: host.latency_score.map(|score| score.as_secs_f64() * 1000.0),
-                    score_age_seconds: host.score_measured_at.map(|at| at.elapsed().as_secs()),
-                    ipv6: host.stack.as_ref().is_some_and(Stack::supports_ipv6),
-                    tx_bytes: tx,
-                    rx_bytes: rx,
-                }
-            })
-            .collect();
-        let phase = if state.pool_epoch.is_none() {
-            PoolPhase::Dormant
-        } else if state.pool_tokens.is_empty() {
-            PoolPhase::Idle
-        } else if ready_hosts == 0 {
-            PoolPhase::Waking
-        } else if ready_hosts < selected_hosts {
-            PoolPhase::Degraded
-        } else {
-            PoolPhase::Ready
-        };
-        DashboardSnapshot {
-            version: 1,
-            sampled_at_ms,
-            message: None,
-            pool: PoolSnapshot {
-                phase,
-                candidate_hosts: state.hosts.len(),
-                selected_hosts,
-                ready_hosts,
-                max_active_hosts: self.max_active_vpn_hosts,
-                active_routes,
-                sticky_groups: state.sticky.len(),
-                idle_remaining_seconds: state
-                    .pool_usage
-                    .idle_since
-                    .map(|since| POOL_IDLE_TIMEOUT.saturating_sub(since.elapsed()).as_secs()),
-                tx_bytes,
-                rx_bytes,
-            },
-            hosts,
-        }
-    }
-
-    fn group_page(&self, host_id: usize, offset: usize, limit: usize) -> Option<GroupPage> {
-        let groups = self.state.groups_by_host.get(host_id)?;
-        let page = groups
-            .iter()
-            .skip(offset)
-            .take(limit)
-            .filter_map(|(_, key)| {
-                let entry = self.state.sticky.get(key)?;
-                Some(GroupSnapshot {
-                    source: key.source.to_string(),
-                    destination: destination_label(&key.destination),
-                    active_connections: entry.active,
-                    idle_remaining_seconds: entry.idle_since.map(|since| {
-                        STICKY_IDLE_TIMEOUT
-                            .saturating_sub(since.elapsed())
-                            .as_secs()
-                    }),
-                })
-            })
-            .collect();
-        Some(GroupPage {
-            total: groups.len(),
-            offset,
-            groups: page,
-        })
     }
 }
 
@@ -976,52 +917,6 @@ impl Drop for StickyReservation {
 impl HostLease {
     pub(crate) fn stack(&self) -> &Stack {
         &self.stack
-    }
-}
-
-impl RouterHandle {
-    pub(super) async fn dashboard_snapshot(&self) -> DashboardSnapshot {
-        let (reply, received) = oneshot::channel();
-        if self.shared.command(RoutingCommand::Snapshot(reply)).await
-            && let Ok(snapshot) = received.await
-        {
-            return snapshot;
-        }
-        DashboardSnapshot {
-            version: 1,
-            sampled_at_ms: 0,
-            message: Some("VPN routing state unavailable".into()),
-            pool: PoolSnapshot {
-                phase: PoolPhase::Unavailable,
-                candidate_hosts: 0,
-                selected_hosts: 0,
-                ready_hosts: 0,
-                max_active_hosts: self.shared.max_active_vpn_hosts,
-                active_routes: 0,
-                sticky_groups: 0,
-                idle_remaining_seconds: None,
-                tx_bytes: 0,
-                rx_bytes: 0,
-            },
-            hosts: Vec::new(),
-        }
-    }
-
-    pub(super) async fn dashboard_group_page(
-        &self,
-        host_id: usize,
-        offset: usize,
-        limit: usize,
-    ) -> Result<Option<GroupPage>, GroupError> {
-        let (reply, received) = oneshot::channel();
-        if !self
-            .shared
-            .command(RoutingCommand::GroupPage(host_id, offset, limit, reply))
-            .await
-        {
-            return Err(GroupError::Unavailable);
-        }
-        received.await.map_err(|_| GroupError::Unavailable)
     }
 }
 
@@ -1105,17 +1000,6 @@ async fn wait_for_update(updates: &mut watch::Receiver<usize>, deadline: Instant
 
 fn sticky_expired(entry: &StickyEntry) -> bool {
     sticky_expired_at(entry, Instant::now())
-}
-
-fn destination_label(destination: &StickyDestination) -> String {
-    match destination {
-        StickyDestination::Ip(ip) => ip.to_string(),
-        StickyDestination::Domain(domain) => domain.clone(),
-    }
-}
-
-fn group_sort_key(key: &StickyKey) -> (String, String) {
-    (destination_label(&key.destination), key.source.to_string())
 }
 
 fn sticky_expired_at(entry: &StickyEntry, at: Instant) -> bool {
@@ -1262,11 +1146,11 @@ mod tests {
 
     #[tokio::test]
     async fn routing_shutdown_completes_with_surviving_request_handles() {
-        let owner = RoutingOwner::start(vec![], Duration::from_secs(1), 1);
+        let owner = RoutingOwner::start(vec![], Duration::from_secs(1), 1, Telemetry::default());
         let shared = owner.shared();
         owner.shutdown().await;
         let (reply, _received) = oneshot::channel();
-        assert!(!shared.command(RoutingCommand::Snapshot(reply)).await);
+        assert!(!shared.command(RoutingCommand::Inspect(reply)).await);
     }
 
     #[test]
@@ -1379,14 +1263,14 @@ mod tests {
                 generation: 2,
             },
         );
-        actor.state.groups_by_host[0].insert(group_sort_key(&key), key.clone());
+        actor.state.groups_by_host[0].insert(key.clone());
         actor.release_sticky(&key, 1, 0);
         assert_eq!(actor.state.hosts[0].active, 1);
         assert_eq!(actor.state.sticky[&key].active, 1);
         actor.release_sticky(&key, 2, 0);
         assert_eq!(actor.state.hosts[0].active, 0);
         assert_eq!(actor.state.sticky[&key].active, 0);
-        assert_eq!(actor.group_page(0, 0, 100).unwrap().total, 1);
+        assert_eq!(actor.state.groups_by_host[0].len(), 1);
     }
 
     #[tokio::test]
@@ -1395,6 +1279,7 @@ mod tests {
             vec![Host::new("127.0.0.1:1194".parse().unwrap(), true, None)],
             Duration::from_secs(1),
             1,
+            Telemetry::default(),
         );
         let shared = owner.shared();
         let (reply, received) = oneshot::channel();
@@ -1407,11 +1292,11 @@ mod tests {
         let (reply, received) = oneshot::channel();
         shared
             .commands
-            .send(RoutingCommand::Snapshot(reply))
+            .send(RoutingCommand::Inspect(reply))
             .await
             .unwrap();
         let snapshot = received.await.unwrap();
-        assert!(matches!(snapshot.pool.phase, PoolPhase::Idle));
+        assert_eq!(snapshot, 0);
     }
 
     #[tokio::test]
@@ -1420,6 +1305,7 @@ mod tests {
             vec![Host::new("127.0.0.1:1194".parse().unwrap(), true, None)],
             Duration::from_secs(1),
             1,
+            Telemetry::default(),
         );
         let shared = owner.shared();
         let (reply, received) = oneshot::channel();
@@ -1431,7 +1317,7 @@ mod tests {
         let (barrier, processed) = oneshot::channel();
         shared
             .commands
-            .send(RoutingCommand::Snapshot(barrier))
+            .send(RoutingCommand::Inspect(barrier))
             .await
             .unwrap();
         let _ = processed.await.unwrap();
@@ -1441,10 +1327,10 @@ mod tests {
                 let (reply, received) = oneshot::channel();
                 shared
                     .commands
-                    .send(RoutingCommand::Snapshot(reply))
+                    .send(RoutingCommand::Inspect(reply))
                     .await
                     .unwrap();
-                if matches!(received.await.unwrap().pool.phase, PoolPhase::Idle) {
+                if received.await.unwrap() == 0 {
                     break;
                 }
                 tokio::task::yield_now().await;
@@ -1500,43 +1386,97 @@ mod tests {
         assert_eq!(actor.state.sticky[&key].active, 0);
     }
 
-    #[test]
-    fn group_page_preserves_display_order() {
+    #[tokio::test]
+    async fn dashboard_observes_routes_failures_and_stale_releases_without_querying_routing() {
+        let dashboard = crate::dashboard::Dashboard::start().unwrap();
+        let view = dashboard.handle();
+        view.running();
+        let telemetry = view.telemetry();
         let (ready, _) = watch::channel(0);
-        let (releases, _) = mpsc::unbounded_channel();
+        let (releases, mut release_rx) = mpsc::unbounded_channel();
+        let endpoint = "127.0.0.1:1194".parse().unwrap();
         let mut actor = RoutingActor {
-            state: RoutingState::new(vec![Host::new(
-                "127.0.0.1:1194".parse().unwrap(),
-                true,
-                None,
-            )]),
+            state: RoutingState::new(vec![Host::new(endpoint, true, Some(score(20)))]),
             ready,
             releases,
             max_active_vpn_hosts: 1,
         };
-        for destination in ["10.0.0.2", "abc.com", "10.0.0.10"] {
-            let key = StickyKey {
-                source: IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-                destination: destination
-                    .parse()
-                    .map(StickyDestination::Ip)
-                    .unwrap_or_else(|_| StickyDestination::Domain(destination.into())),
-            };
-            actor.state.groups_by_host[0].insert(group_sort_key(&key), key.clone());
-            actor.state.sticky.insert(
-                key,
-                StickyEntry {
-                    host_id: 0,
-                    active: 0,
-                    idle_since: None,
-                    generation: 1,
-                },
-            );
-        }
-        let page = actor.group_page(0, 1, 1).unwrap();
-        assert_eq!(page.total, 3);
-        assert_eq!(page.groups.len(), 1);
-        assert_eq!(page.groups[0].destination, "10.0.0.2");
+        actor.state.telemetry = telemetry.clone();
+        telemetry.emit(|| Observation::Initialized {
+            hosts: vec![actor.state.host_observation(0)],
+            max_active_hosts: 1,
+        });
+        let token = actor.begin().unwrap();
+        let stack = test_stack().await;
+        let epoch = actor.state.pool_epoch.unwrap();
+        actor.update(RoutingUpdate::Ready {
+            id: 0,
+            epoch,
+            endpoint,
+            stack: stack.client(),
+            elapsed: Duration::ZERO,
+            score: score(10),
+        });
+        let destination = DestinationHost::Domain("example.com".into());
+        let key = sticky_key("127.0.0.1".parse().unwrap(), &destination).unwrap();
+        let first = actor
+            .select(token, &key, &destination)
+            .ok()
+            .flatten()
+            .unwrap();
+        view.flush_observations().await;
+        let snapshot = view.snapshot().await;
+        assert_eq!(snapshot.pool.active_routes, 1);
+        assert_eq!(snapshot.pool.sticky_groups, 1);
+        assert!(matches!(snapshot.pool.phase, ovpn_ui::PoolPhase::Ready));
+
+        // A host failure clears assignments while the old lease is still alive.
+        actor.update(RoutingUpdate::Down(0, false));
+        view.flush_observations().await;
+        let snapshot = view.snapshot().await;
+        assert_eq!(snapshot.pool.active_routes, 1);
+        assert_eq!(snapshot.pool.sticky_groups, 0);
+        assert_eq!(snapshot.pool.ready_hosts, 0);
+        actor.update(RoutingUpdate::Ready {
+            id: 0,
+            epoch,
+            endpoint,
+            stack: stack.client(),
+            elapsed: Duration::ZERO,
+            score: score(10),
+        });
+        let second = actor
+            .select(token, &key, &destination)
+            .ok()
+            .flatten()
+            .unwrap();
+        drop(first);
+        actor.release(release_rx.recv().await.unwrap());
+        view.flush_observations().await;
+        let snapshot = view.snapshot().await;
+        assert_eq!(snapshot.pool.active_routes, 1);
+        assert_eq!(snapshot.pool.sticky_groups, 1);
+        let page = ovpn_ui::DashboardSource::group_page(&view, 0, 0, 100)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(page.groups[0].active_connections, 1);
+        drop(second);
+        actor.release(release_rx.recv().await.unwrap());
+        actor.release_pool(token);
+        view.flush_observations().await;
+        let snapshot = view.snapshot().await;
+        assert_eq!(snapshot.pool.active_routes, 0);
+        assert!(matches!(snapshot.pool.phase, ovpn_ui::PoolPhase::Idle));
+        actor.state.pool_usage.idle_since = Some(Instant::now() - POOL_IDLE_TIMEOUT);
+        actor.park_pool();
+        view.flush_observations().await;
+        let snapshot = view.snapshot().await;
+        assert!(matches!(snapshot.pool.phase, ovpn_ui::PoolPhase::Dormant));
+        assert_eq!(snapshot.pool.sticky_groups, 0);
+        drop(actor);
+        stack.shutdown().await;
+        dashboard.shutdown().await;
     }
 
     #[test]

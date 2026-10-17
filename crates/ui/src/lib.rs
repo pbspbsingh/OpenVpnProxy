@@ -6,8 +6,9 @@ mod logs;
 mod server;
 mod types;
 
+pub use history::DashboardHistory;
 pub use logs::{LogEvent, LogHub, LogInput};
-pub use server::{GroupError, SnapshotSource, UiError, serve};
+pub use server::{DashboardSource, GroupError, UiError, serve};
 pub use types::{
     DashboardSnapshot, GroupPage, GroupSnapshot, HostPhase, HostSnapshot, PoolPhase, PoolSnapshot,
     ProfileRemote, ProfileSummary,

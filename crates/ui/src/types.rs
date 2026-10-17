@@ -59,7 +59,7 @@ pub struct GroupSnapshot {
 }
 
 /// Safe, operational settings from the loaded OpenVPN profile.
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, Default)]
 pub struct ProfileSummary {
     pub remotes: Vec<ProfileRemote>,
     pub credentials_required: bool,

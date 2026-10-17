@@ -12,8 +12,8 @@ use tokio::time;
 
 use super::discovery::HostCandidate;
 use super::probe::{LatencyScore, PROBE_INTERVAL, measure, measure_with_session};
-use super::routing::{HostActivation, HostPhase, Shared};
-use super::telemetry::HostTraffic;
+use super::routing::{HostActivation, Shared};
+use super::telemetry::{HostPhase, HostTraffic};
 
 const TUNNEL_PACKET_QUEUE_CAPACITY: usize = 1024;
 pub(super) const CONTROL_SETUP_ALLOWANCE: Duration = Duration::from_secs(30);
@@ -33,7 +33,7 @@ pub(super) struct HostWorker {
     pub dns_override: Option<Ipv4Addr>,
     pub permits: Arc<Semaphore>,
     pub enabled: watch::Receiver<HostActivation>,
-    pub traffic: Arc<HostTraffic>,
+    pub traffic: HostTraffic,
     pub shared: Arc<Shared>,
     pub stop: watch::Receiver<bool>,
 }
@@ -333,7 +333,7 @@ impl HostSession {
         let session = &mut self.session;
         let outbound = &mut self.outbound;
         let shared = &worker.shared;
-        let traffic = &worker.traffic;
+        let traffic = &mut worker.traffic;
         let enabled = &mut worker.enabled;
         let stop = &mut worker.stop;
         let started = Instant::now();
@@ -348,6 +348,8 @@ impl HostSession {
             PROBE_INTERVAL,
         );
         probe_interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+        let mut traffic_tick = time::interval(Duration::from_secs(1));
+        traffic_tick.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
         let mut probes = JoinSet::new();
         let mut sent_packets = 0_u64;
         let mut received_packets = 0_u64;
@@ -402,6 +404,7 @@ impl HostSession {
                             received_bytes += packet_bytes as u64;
                         }
                     }
+                    _ = traffic_tick.tick(), if traffic.is_enabled() => traffic.publish(),
                     _ = status.tick() => {
                         if sent_bytes != last_sent_bytes || received_bytes != last_received_bytes {
                             tracing::debug!(host_id = id, %endpoint, stack_id, window = ?last_status.elapsed(), sent_packets, received_packets, sent_bytes, received_bytes, window_sent_bytes = sent_bytes - last_sent_bytes, window_received_bytes = received_bytes - last_received_bytes, ?max_send_time, "VPN host traffic");
@@ -414,6 +417,7 @@ impl HostSession {
                 }
             }
         }.await;
+        traffic.publish();
         probes.shutdown().await;
         tracing::debug!(host_id = id, %endpoint, stack_id, elapsed = ?started.elapsed(), sent_packets, received_packets, sent_bytes, received_bytes, outcome = match &result { Ok(HostExit::Idle) => "idle", Ok(HostExit::Shutdown) => "shutdown", Err(_) => "error" }, "VPN host traffic summary");
         result

@@ -29,6 +29,12 @@ The request channel is separate from the dashboard's stop notification so the
 HTTP response can finish while the application cleans up. The UI stops its feeds
 and polling once the request is accepted.
 
+The application dashboard actor owns status aggregation and chart history. The Rust
+HTTP server consumes `DashboardSource`: a watch receiver of serialized frames,
+assignment page queries, and safe profile settings. It does not poll routing or
+run a snapshot sampler. `DashboardHistory` builds the wire frame and minute buckets;
+production uses it inside the actor, while the browser fixture supplies its own feed.
+
 ## Checks
 
 ```sh

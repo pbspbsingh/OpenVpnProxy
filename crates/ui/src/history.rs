@@ -5,7 +5,7 @@ use crate::types::{DashboardFrame, DashboardSnapshot, HostMinuteSample, MinuteSa
 const MILLIS_PER_MINUTE: u64 = 60_000;
 const HISTORY_MINUTES: usize = 60;
 
-pub(crate) struct MinuteHistory {
+pub struct DashboardHistory {
     buckets: VecDeque<MinuteBucket>,
     previous_sample_ms: Option<u64>,
     previous_tx: Option<u64>,
@@ -31,8 +31,14 @@ struct HostAggregate {
     latency_samples: u64,
 }
 
-impl MinuteHistory {
-    pub(crate) fn new() -> Self {
+impl Default for DashboardHistory {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DashboardHistory {
+    pub fn new() -> Self {
         Self {
             buckets: VecDeque::with_capacity(HISTORY_MINUTES),
             previous_sample_ms: None,
@@ -40,6 +46,11 @@ impl MinuteHistory {
             previous_rx: None,
             previous_hosts: BTreeMap::new(),
         }
+    }
+
+    /// Update minute aggregates and encode the complete dashboard frame.
+    pub fn serialize(&mut self, snapshot: DashboardSnapshot) -> Result<String, serde_json::Error> {
+        serde_json::to_string(&self.observe(snapshot))
     }
 
     pub(crate) fn observe(&mut self, snapshot: DashboardSnapshot) -> DashboardFrame {
@@ -187,7 +198,7 @@ mod tests {
 
     #[test]
     fn aggregates_deltas_and_selection_at_sample_time() {
-        let mut history = MinuteHistory::new();
+        let mut history = DashboardHistory::new();
         history.observe(snapshot(30_000, 10, 20, 40.0, true));
         history.observe(snapshot(31_000, 30, 50, 60.0, true));
         let frame = history.observe(snapshot(32_000, 35, 65, 100.0, false));
@@ -205,7 +216,7 @@ mod tests {
 
     #[test]
     fn drops_buckets_older_than_the_last_hour_even_after_a_gap() {
-        let mut history = MinuteHistory::new();
+        let mut history = DashboardHistory::new();
         history.observe(snapshot(0, 0, 0, 40.0, true));
         let frame = history.observe(snapshot(60 * MILLIS_PER_MINUTE, 20, 30, 50.0, true));
         assert_eq!(frame.history.len(), 1);

@@ -2,7 +2,7 @@ mod discovery;
 mod host;
 mod probe;
 mod routing;
-mod telemetry;
+pub(crate) mod telemetry;
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::num::NonZeroUsize;
@@ -11,9 +11,6 @@ use std::time::Instant;
 
 use anyhow::{Result, anyhow, bail};
 use ovpn_profile::Profile;
-use ovpn_ui::{
-    DashboardSnapshot, GroupError, GroupPage, ProfileRemote, ProfileSummary, SnapshotSource,
-};
 use tokio::sync::{Semaphore, watch};
 use tokio::task::JoinSet;
 
@@ -21,6 +18,7 @@ use self::discovery::{HostCandidate, MAX_ENDPOINTS, resolve_candidates};
 use self::host::{CONTROL_SETUP_ALLOWANCE, HostWorker, benchmark_host};
 use self::probe::LatencyScore;
 use self::routing::{Host, RoutingOwner, Shared};
+use self::telemetry::{HostTraffic, Telemetry};
 
 const MAX_ACTIVE_VPN_HOSTS: usize = MAX_ENDPOINTS;
 const DEFAULT_MAX_ACTIVE_VPN_HOSTS: usize = 16;
@@ -31,7 +29,6 @@ pub(crate) use self::routing::RouterHandle;
 
 pub(crate) struct ConnectionManager {
     shared: Arc<Shared>,
-    profile_summary: Arc<ProfileSummary>,
     stop: watch::Sender<bool>,
     workers: JoinSet<WorkerExit>,
     routing: RoutingOwner,
@@ -44,8 +41,8 @@ impl ConnectionManager {
         password: String,
         dns_override: Option<Ipv4Addr>,
         max_active_vpn_hosts: Option<NonZeroUsize>,
+        telemetry: Telemetry,
     ) -> Result<Self> {
-        let profile_summary = Arc::new(summarize_profile(&profile));
         let mut candidates = resolve_candidates(&profile).await?;
         let max_active_vpn_hosts = max_active_vpn_hosts
             .map(NonZeroUsize::get)
@@ -117,17 +114,19 @@ impl ConnectionManager {
             })
             .collect::<Result<Vec<_>>>()?;
         let enabled: Vec<_> = hosts.iter().map(Host::activation).collect();
-        let traffic: Vec<_> = hosts.iter().map(Host::traffic).collect();
         let acquire_timeout = profile
             .handshake_window
             .saturating_add(CONTROL_SETUP_ALLOWANCE);
-        let routing = RoutingOwner::start(hosts, acquire_timeout, max_active_vpn_hosts);
+        let routing = RoutingOwner::start(
+            hosts,
+            acquire_timeout,
+            max_active_vpn_hosts,
+            telemetry.clone(),
+        );
         let shared = routing.shared();
         let (stop, _) = watch::channel(false);
         let mut workers = JoinSet::new();
-        for (id, ((candidate, enabled), traffic)) in
-            candidates.into_iter().zip(enabled).zip(traffic).enumerate()
-        {
+        for (id, (candidate, enabled)) in candidates.into_iter().zip(enabled).enumerate() {
             let worker = HostWorker {
                 id,
                 candidate,
@@ -137,7 +136,7 @@ impl ConnectionManager {
                 dns_override,
                 permits: Arc::clone(&permits),
                 enabled,
-                traffic,
+                traffic: HostTraffic::new(id, telemetry.clone()),
                 shared: Arc::clone(&shared),
                 stop: stop.subscribe(),
             };
@@ -163,7 +162,6 @@ impl ConnectionManager {
         );
         Ok(Self {
             shared,
-            profile_summary,
             stop,
             workers,
             routing,
@@ -173,7 +171,6 @@ impl ConnectionManager {
     pub(crate) fn router(&self) -> RouterHandle {
         RouterHandle {
             shared: Arc::clone(&self.shared),
-            profile_summary: Arc::clone(&self.profile_summary),
         }
     }
 
@@ -202,48 +199,6 @@ impl ConnectionManager {
         }
         self.routing.shutdown().await;
         tracing::info!("VPN host pool stopped");
-    }
-}
-
-pub(crate) fn summarize_profile(profile: &Profile) -> ProfileSummary {
-    ProfileSummary {
-        remotes: profile
-            .remotes
-            .iter()
-            .map(|(host, port)| ProfileRemote {
-                host: host.clone(),
-                port: *port,
-            })
-            .collect(),
-        credentials_required: profile.needs_credentials,
-        ipv6_blocked: profile.block_ipv6,
-        server_certificate_purpose_required: profile.require_server_certificate_purpose,
-        renegotiate_after_seconds: profile.renegotiate_after.map(|duration| duration.as_secs()),
-        handshake_window_seconds: profile.handshake_window.as_secs(),
-        transition_window_seconds: profile.transition_window.as_secs(),
-    }
-}
-
-impl SnapshotSource for RouterHandle {
-    fn snapshot(
-        &self,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = DashboardSnapshot> + Send + '_>> {
-        Box::pin(self.dashboard_snapshot())
-    }
-
-    fn group_page(
-        &self,
-        host_id: usize,
-        offset: usize,
-        limit: usize,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<Option<GroupPage>, GroupError>> + Send + '_>,
-    > {
-        Box::pin(self.dashboard_group_page(host_id, offset, limit))
-    }
-
-    fn profile(&self) -> ProfileSummary {
-        (*self.profile_summary).clone()
     }
 }
 

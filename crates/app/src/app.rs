@@ -8,8 +8,8 @@ use tokio::sync::watch;
 use tokio::task::{JoinError, JoinHandle, JoinSet};
 
 use crate::config::AppConfig;
-use crate::dashboard::DashboardSource;
-use crate::manager::{ConnectionManager, RouterHandle, summarize_profile};
+use crate::dashboard::{Dashboard, DashboardHandle, summarize_profile};
+use crate::manager::{ConnectionManager, RouterHandle};
 
 pub(crate) async fn run(config: AppConfig, logs: Option<LogHub>) -> Result<()> {
     match config.webui_address {
@@ -25,7 +25,18 @@ async fn run_with_dashboard(config: AppConfig, address: SocketAddr, logs: LogHub
     let webui_listener = TcpListener::bind(address)
         .await
         .with_context(|| format!("cannot bind dashboard on {address}"))?;
-    let source = DashboardSource::new();
+    let dashboard = Dashboard::start()?;
+    let result = serve_with_dashboard(config, webui_listener, dashboard.handle(), logs).await;
+    dashboard.shutdown().await;
+    result
+}
+
+async fn serve_with_dashboard(
+    config: AppConfig,
+    webui_listener: TcpListener,
+    source: DashboardHandle,
+    logs: LogHub,
+) -> Result<()> {
     let (shutdown, _) = watch::channel(false);
     let (shutdown_request, mut requested) = watch::channel(false);
     let mut ui_task = tokio::spawn(ovpn_ui::serve(
@@ -53,7 +64,7 @@ async fn run_with_dashboard(config: AppConfig, address: SocketAddr, logs: LogHub
             return show_failure(error, &source, &shutdown, &mut requested, &mut ui_task).await;
         }
     };
-    source.running(manager.router());
+    source.running();
     let mut socks = SocksServer::new(socks_listener, manager.router());
     let mut ui_finished = false;
     let proxy_result = tokio::select! {
@@ -114,7 +125,7 @@ async fn run_without_dashboard(config: AppConfig) -> Result<()> {
 
 async fn initialize(
     config: AppConfig,
-    dashboard: Option<&DashboardSource>,
+    dashboard: Option<&DashboardHandle>,
 ) -> Result<(TcpListener, ConnectionManager)> {
     if let Some(dashboard) = dashboard {
         dashboard.starting("Loading OpenVPN profile");
@@ -151,6 +162,9 @@ async fn initialize(
         config.password,
         config.dns_override,
         config.max_active_vpn_hosts,
+        dashboard
+            .map(DashboardHandle::telemetry)
+            .unwrap_or_default(),
     )
     .await?;
     Ok((socks_listener, manager))
@@ -158,7 +172,7 @@ async fn initialize(
 
 async fn show_failure(
     error: anyhow::Error,
-    source: &DashboardSource,
+    source: &DashboardHandle,
     shutdown: &watch::Sender<bool>,
     requested: &mut watch::Receiver<bool>,
     ui_task: &mut JoinHandle<std::result::Result<(), ovpn_ui::UiError>>,

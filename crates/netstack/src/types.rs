@@ -120,9 +120,10 @@ impl TunnelConfig {
 
 /// An event emitted by a virtual TCP connection.
 #[derive(Debug)]
-pub enum StreamEvent {
+pub(crate) enum StreamEvent {
     Connected,
     Data(Vec<u8>),
+    ReadClosed,
     Closed,
 }
 
@@ -131,7 +132,6 @@ pub enum StreamEvent {
 #[repr(u8)]
 pub enum StackPhase {
     Offline = 0,
-    Configured = 1,
     Ready = 2,
     Failed = 3,
 }
@@ -139,7 +139,6 @@ pub enum StackPhase {
 impl StackPhase {
     pub(crate) fn from_raw(value: u8) -> Self {
         match value {
-            value if value == Self::Configured as u8 => Self::Configured,
             value if value == Self::Ready as u8 => Self::Ready,
             value if value == Self::Failed as u8 => Self::Failed,
             _ => Self::Offline,

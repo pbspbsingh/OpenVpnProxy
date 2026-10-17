@@ -20,19 +20,21 @@ use tokio::task::JoinSet;
 use self::discovery::{HostCandidate, MAX_ENDPOINTS, resolve_candidates};
 use self::host::{CONTROL_SETUP_ALLOWANCE, HostWorker, benchmark_host};
 use self::probe::LatencyScore;
-use self::routing::{Host, Shared};
+use self::routing::{Host, RoutingOwner, Shared};
 
 const MAX_ACTIVE_VPN_HOSTS: usize = MAX_ENDPOINTS;
 const DEFAULT_MAX_ACTIVE_VPN_HOSTS: usize = 16;
 const INITIAL_PROBE_PARALLELISM: usize = 4;
 
+pub(crate) use self::routing::HostLease;
 pub(crate) use self::routing::RouterHandle;
 
 pub(crate) struct ConnectionManager {
     shared: Arc<Shared>,
     profile_summary: Arc<ProfileSummary>,
     stop: watch::Sender<bool>,
-    workers: JoinSet<()>,
+    workers: JoinSet<WorkerExit>,
+    routing: RoutingOwner,
 }
 
 impl ConnectionManager {
@@ -55,7 +57,7 @@ impl ConnectionManager {
         let username: Arc<str> = username.into();
         let password: Arc<str> = password.into();
         let probe_permits = Arc::new(Semaphore::new(INITIAL_PROBE_PARALLELISM));
-        let baselines = benchmark_hosts(
+        let (baselines, assessments) = benchmark_hosts(
             &candidates,
             Arc::clone(&profile),
             Arc::clone(&username),
@@ -63,7 +65,7 @@ impl ConnectionManager {
             dns_override,
             probe_permits,
         )
-        .await;
+        .await?;
         let mut ranked: Vec<_> = baselines
             .iter()
             .enumerate()
@@ -119,28 +121,37 @@ impl ConnectionManager {
         let acquire_timeout = profile
             .handshake_window
             .saturating_add(CONTROL_SETUP_ALLOWANCE);
-        let shared = Shared::new(hosts, acquire_timeout, max_active_vpn_hosts);
+        let routing = RoutingOwner::start(hosts, acquire_timeout, max_active_vpn_hosts);
+        let shared = routing.shared();
         let (stop, _) = watch::channel(false);
         let mut workers = JoinSet::new();
         for (id, ((candidate, enabled), traffic)) in
             candidates.into_iter().zip(enabled).zip(traffic).enumerate()
         {
-            workers.spawn(
-                HostWorker {
-                    id,
-                    candidate,
-                    profile: Arc::clone(&profile),
-                    username: Arc::clone(&username),
-                    password: Arc::clone(&password),
-                    dns_override,
-                    permits: Arc::clone(&permits),
-                    enabled,
-                    traffic,
-                    shared: Arc::clone(&shared),
-                    stop: stop.subscribe(),
-                }
-                .run(),
-            );
+            let worker = HostWorker {
+                id,
+                candidate,
+                profile: Arc::clone(&profile),
+                username: Arc::clone(&username),
+                password: Arc::clone(&password),
+                dns_override,
+                permits: Arc::clone(&permits),
+                enabled,
+                traffic,
+                shared: Arc::clone(&shared),
+                stop: stop.subscribe(),
+            };
+            workers.spawn(async move {
+                worker.run().await;
+                WorkerExit::Host(id)
+            });
+        }
+        if !assessments.is_empty() {
+            workers.spawn(finish_assessments(
+                assessments,
+                Arc::clone(&shared),
+                stop.subscribe(),
+            ));
         }
         tracing::info!(
             candidates = candidate_count,
@@ -148,13 +159,14 @@ impl ConnectionManager {
             selected = selected.len(),
             max_active = max_active_vpn_hosts,
             initial_probe_parallelism = INITIAL_PROBE_PARALLELISM,
-            "VPN host pool initialized; selected hosts connect on demand"
+            "VPN pool initialized after first healthy host; remaining ranking continues in background"
         );
         Ok(Self {
             shared,
             profile_summary,
             stop,
             workers,
+            routing,
         })
     }
 
@@ -162,6 +174,21 @@ impl ConnectionManager {
         RouterHandle {
             shared: Arc::clone(&self.shared),
             profile_summary: Arc::clone(&self.profile_summary),
+        }
+    }
+
+    /// Observe task completion while serving, rather than discovering failures at shutdown.
+    pub(crate) async fn wait_for_failure(&mut self) -> Result<()> {
+        loop {
+            tokio::select! {
+                result = self.routing.wait_for_exit() => return result,
+                result = self.workers.join_next() => match result {
+                    Some(Ok(WorkerExit::Ranked)) => continue,
+                    Some(Ok(WorkerExit::Host(id))) => bail!("VPN host actor {id} stopped unexpectedly"),
+                    Some(Err(error)) => return Err(error.into()),
+                    None => bail!("VPN host actors stopped unexpectedly"),
+                }
+            }
         }
     }
 
@@ -173,6 +200,7 @@ impl ConnectionManager {
                 tracing::error!(%error, "VPN host task stopped unexpectedly");
             }
         }
+        self.routing.shutdown().await;
         tracing::info!("VPN host pool stopped");
     }
 }
@@ -219,6 +247,34 @@ impl SnapshotSource for RouterHandle {
     }
 }
 
+enum WorkerExit {
+    Host(usize),
+    Ranked,
+}
+
+type ProbeTasks = JoinSet<(usize, Result<(SocketAddr, LatencyScore)>)>;
+type Baselines = Vec<Option<(SocketAddr, LatencyScore)>>;
+
+async fn finish_assessments(
+    mut tasks: ProbeTasks,
+    shared: Arc<Shared>,
+    mut stop: watch::Receiver<bool>,
+) -> WorkerExit {
+    loop {
+        tokio::select! {
+            _ = stop.changed() => break,
+            result = tasks.join_next() => match result {
+                Some(Ok((id, Ok((endpoint, score))))) => shared.baseline(id, endpoint, score).await,
+                Some(Ok((id, Err(error)))) => tracing::warn!(host_id = id, %error, "VPN host baseline unavailable"),
+                Some(Err(error)) => tracing::error!(%error, "VPN baseline task failed"),
+                None => break,
+            }
+        }
+    }
+    // JoinSet drop cancels unfinished probes, whose owners cancel their stacks.
+    WorkerExit::Ranked
+}
+
 async fn benchmark_hosts(
     candidates: &[HostCandidate],
     profile: Arc<Profile>,
@@ -226,7 +282,7 @@ async fn benchmark_hosts(
     password: Arc<str>,
     dns_override: Option<Ipv4Addr>,
     permits: Arc<Semaphore>,
-) -> Vec<Option<(SocketAddr, LatencyScore)>> {
+) -> Result<(Baselines, ProbeTasks)> {
     let started = Instant::now();
     let mut tasks = JoinSet::new();
     for (id, candidate) in candidates.iter().cloned().enumerate() {
@@ -246,17 +302,72 @@ async fn benchmark_hosts(
             (id, result)
         });
     }
+    let result = wait_for_first_healthy(tasks, candidates.len()).await;
+    tracing::info!(hosts = candidates.len(), elapsed = ?started.elapsed(), parallelism = INITIAL_PROBE_PARALLELISM, "initial VPN readiness assessment completed");
+    result
+}
+
+async fn wait_for_first_healthy(
+    mut tasks: ProbeTasks,
+    host_count: usize,
+) -> Result<(Baselines, ProbeTasks)> {
     let mut scores: Vec<Option<(SocketAddr, LatencyScore)>> =
-        (0..candidates.len()).map(|_| None).collect();
+        (0..host_count).map(|_| None).collect();
     while let Some(result) = tasks.join_next().await {
         match result {
-            Ok((id, Ok(score))) => scores[id] = Some(score),
+            Ok((id, Ok(score))) => {
+                scores[id] = Some(score);
+                break;
+            }
             Ok((id, Err(error))) => {
                 tracing::warn!(host_id = id, %error, "VPN host baseline unavailable");
             }
             Err(error) => tracing::error!(%error, "VPN host baseline task failed"),
         }
     }
-    tracing::info!(hosts = candidates.len(), measured = scores.iter().filter(|score| score.is_some()).count(), elapsed = ?started.elapsed(), parallelism = INITIAL_PROBE_PARALLELISM, "VPN baseline round completed");
-    scores
+    if scores.iter().all(Option::is_none) {
+        bail!("no VPN host passed the startup latency probe");
+    }
+    Ok((scores, tasks))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn first_healthy_host_does_not_wait_for_pending_candidates() {
+        let mut tasks = JoinSet::new();
+        tasks.spawn(std::future::pending());
+        tasks.spawn(async {
+            (
+                1,
+                Ok((
+                    "127.0.0.1:1194".parse().unwrap(),
+                    LatencyScore {
+                        median: Duration::from_millis(20),
+                        elapsed: Duration::ZERO,
+                        successful_samples: 3,
+                        measured_at: Instant::now(),
+                    },
+                )),
+            )
+        });
+        let (baselines, remaining) =
+            tokio::time::timeout(Duration::from_secs(1), wait_for_first_healthy(tasks, 2))
+                .await
+                .unwrap()
+                .unwrap();
+        assert!(baselines[0].is_none());
+        assert!(baselines[1].is_some());
+        assert_eq!(remaining.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn startup_fails_when_every_candidate_fails() {
+        let mut tasks = JoinSet::new();
+        tasks.spawn(async { (0, Err(anyhow!("unreachable"))) });
+        assert!(wait_for_first_healthy(tasks, 1).await.is_err());
+    }
 }

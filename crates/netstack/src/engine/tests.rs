@@ -8,7 +8,9 @@ use smoltcp::wire::{
 };
 
 use super::*;
-use crate::stack::{Stack, StreamEvents};
+use crate::stack::{Stack, StackOwner};
+use crate::stream::{StreamEvents, TunnelStream};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const MSS: usize = 1360;
 const TEST_TIMEOUT: Duration = Duration::from_secs(2);
@@ -30,21 +32,29 @@ struct Peer {
 
 impl Peer {
     fn packet(&self, ack: i32, syn: bool, payload: &[u8]) -> Vec<u8> {
+        self.control_packet(
+            ack,
+            if syn {
+                TcpControl::Syn
+            } else {
+                TcpControl::None
+            },
+            payload,
+        )
+    }
+
+    fn control_packet(&self, ack: i32, control: TcpControl, payload: &[u8]) -> Vec<u8> {
         let src = Ipv4Addr::new(1, 1, 1, 1);
         let dst = Ipv4Addr::new(10, 8, 0, 2);
         let tcp = TcpRepr {
             src_port: 443,
             dst_port: self.port,
-            control: if syn {
-                TcpControl::Syn
-            } else {
-                TcpControl::None
-            },
+            control,
             seq_number: TcpSeqNumber(self.next_seq),
             ack_number: Some(TcpSeqNumber(ack)),
             window_len: u16::MAX,
             window_scale: None,
-            max_seg_size: syn.then_some(MSS as u16),
+            max_seg_size: (control == TcpControl::Syn).then_some(MSS as u16),
             sack_permitted: false,
             sack_ranges: [None; 3],
             timestamp: None,
@@ -70,7 +80,11 @@ impl Peer {
     }
 
     fn send(&mut self, ack: i32, payload: &[u8]) {
-        self.stack.packet(self.packet(ack, false, payload)).unwrap();
+        self.stack
+            .tx
+            .try_send(Command::Packet(self.packet(ack, false, payload)))
+            .ok()
+            .unwrap();
         self.next_seq = self.next_seq.wrapping_add(payload.len() as i32);
     }
 
@@ -106,27 +120,61 @@ impl Peer {
         }
         ack
     }
+
+    fn finish(&mut self, ack: i32, payload: &[u8]) {
+        self.stack
+            .tx
+            .try_send(Command::Packet(self.control_packet(
+                ack,
+                TcpControl::Fin,
+                payload,
+            )))
+            .ok()
+            .unwrap();
+        self.next_seq = self.next_seq.wrapping_add(payload.len() as i32 + 1);
+    }
+
+    async fn receive_until_fin(&mut self) {
+        loop {
+            let raw = self.next_packet().await;
+            let ip = Ipv4Packet::new_checked(&raw[..]).unwrap();
+            let tcp = TcpPacket::new_checked(ip.payload()).unwrap();
+            if tcp.payload().is_empty() && !tcp.fin() {
+                continue;
+            }
+            assert_eq!(
+                tcp.seq_number().0,
+                self.initial_ack.wrapping_add(self.uploaded.len() as i32)
+            );
+            self.uploaded.extend_from_slice(tcp.payload());
+            let ack = self
+                .initial_ack
+                .wrapping_add(self.uploaded.len() as i32 + i32::from(tcp.fin()));
+            self.send(ack, &[]);
+            if tcp.fin() {
+                return;
+            }
+        }
+    }
 }
 
-async fn connected() -> (Stack, u64, StreamEvents, Peer) {
-    let stack = Stack::start();
+async fn connected() -> (StackOwner, u64, StreamEvents, Peer) {
     let (tx, outbound) = mpsc::channel(1024);
-    stack
-        .configure(
-            TunnelConfig::new(
-                Ipv4Addr::new(10, 8, 0, 2),
-                Ipv4Addr::new(10, 8, 0, 1),
-                vec![],
-                1400,
-                None,
-            )
-            .unwrap(),
-            tx,
+    let owner = StackOwner::start(
+        TunnelConfig::new(
+            Ipv4Addr::new(10, 8, 0, 2),
+            Ipv4Addr::new(10, 8, 0, 1),
+            vec![],
+            1400,
+            None,
         )
-        .await
-        .unwrap();
-    stack.activate().unwrap();
-    let (id, mut events) = stack.connect("1.1.1.1:443".parse().unwrap()).await.unwrap();
+        .unwrap(),
+        tx,
+    )
+    .await
+    .unwrap();
+    let stack = owner.client();
+    let (id, mut events) = stack.open("1.1.1.1:443".parse().unwrap()).await.unwrap();
     let mut peer = Peer {
         stack: stack.clone(),
         outbound,
@@ -141,7 +189,7 @@ async fn connected() -> (Stack, u64, StreamEvents, Peer) {
     assert!(tcp.syn());
     peer.port = tcp.src_port();
     peer.initial_ack = tcp.seq_number().0.wrapping_add(1);
-    stack
+    owner
         .packet(peer.packet(peer.initial_ack, true, &[]))
         .unwrap();
     peer.next_seq += 1;
@@ -149,7 +197,7 @@ async fn connected() -> (Stack, u64, StreamEvents, Peer) {
         time::timeout(TEST_TIMEOUT, events.recv()).await.unwrap(),
         Some(StreamEvent::Connected)
     ));
-    (stack, id, events, peer)
+    (owner, id, events, peer)
 }
 
 #[test]
@@ -161,24 +209,58 @@ fn ready_work_yields_without_a_timer() {
     assert_eq!(wait.as_mut().poll(&mut context), Poll::Ready(()));
 }
 
+#[test]
+fn pending_connect_waits_for_protocol_progress_instead_of_spinning() {
+    let config = TunnelConfig::new(
+        "10.8.0.2".parse().unwrap(),
+        "10.8.0.1".parse().unwrap(),
+        vec![],
+        1400,
+        None,
+    )
+    .unwrap();
+    let (io, _outbound) = mpsc::channel(1024);
+    let mut engine = Engine::new(0, config, io).unwrap();
+    let (events, _received) = mpsc::channel(32);
+    let (_writer, writes) = mpsc::channel(32);
+    let (write_finished, _finished) = oneshot::channel();
+    engine.handle(Command::Connect(ConnectRequest {
+        id: 0,
+        address: "1.1.1.1:443".parse().unwrap(),
+        events,
+        wake_needed: Arc::new(AtomicBool::new(false)),
+        writes,
+        write_finished,
+    }));
+    engine.tick(Instant::ZERO).unwrap();
+    assert!(
+        engine
+            .next_delay(Instant::ZERO)
+            .is_some_and(|delay| !delay.is_zero())
+    );
+}
+
 #[tokio::test]
 async fn blocked_upload_receives_responses_and_resumes_after_ack() {
-    let (stack, id, mut events, mut peer) = connected().await;
+    let (stack, id, events, mut peer) = connected().await;
     let payload = test_payload(1024 * 1024);
     let expected = payload.clone();
-    let writer = events.writer();
-    let upload = tokio::spawn(async move { writer.write(payload).await });
+    let (mut reader, mut writer) = tokio::io::split(TunnelStream::new(id, events));
+    let upload = tokio::spawn(async move { writer.write_all(&payload).await });
     let ack = peer.fill_send_buffer().await;
     assert!(!upload.is_finished());
 
     // Withhold upload ACKs while sending a response in the reverse direction.
-    peer.send(peer.initial_ack, b"response during blocked upload");
-    match time::timeout(TEST_TIMEOUT, events.recv()).await.unwrap() {
-        Some(StreamEvent::Data(data)) => assert_eq!(data, b"response during blocked upload"),
-        event => panic!("unexpected connection event: {event:?}"),
-    }
+    let response = b"response during blocked upload";
+    peer.send(peer.initial_ack, response);
+    let mut data = vec![0; response.len()];
+    time::timeout(TEST_TIMEOUT, reader.read_exact(&mut data))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(data, response);
     assert!(!upload.is_finished());
-    assert!(stack.is_ready());
+    assert!(stack.client().is_ready());
 
     peer.send(ack, &[]);
     while peer.uploaded.len() < expected.len() {
@@ -191,8 +273,8 @@ async fn blocked_upload_receives_responses_and_resumes_after_ack() {
         .unwrap()
         .unwrap();
     assert_eq!(peer.uploaded, expected);
-    assert!(stack.is_ready());
-    stack.close(id).unwrap();
+    assert!(stack.client().is_ready());
+    stack.client().tx.send(Command::Close(id)).await.unwrap();
 }
 
 #[tokio::test]
@@ -213,8 +295,10 @@ async fn blocked_upload_is_released_when_connection_ends() {
         peer.fill_send_buffer().await;
         assert!(!upload.is_finished());
         match termination {
-            Termination::Close => stack.close(id).unwrap(),
-            Termination::Reset => stack.reset().await.unwrap(),
+            Termination::Close => {
+                stack.client().tx.send(Command::Close(id)).await.unwrap();
+            }
+            Termination::Reset => stack.shutdown().await,
             Termination::DropEvents => drop(events),
         }
         let result = time::timeout(TEST_TIMEOUT, upload).await.unwrap().unwrap();
@@ -251,8 +335,8 @@ async fn buffered_download_resumes_after_consumer_queue_fills() {
         }
     }
     assert_eq!(received, expected);
-    assert!(stack.is_ready());
-    stack.close(id).unwrap();
+    assert!(stack.client().is_ready());
+    stack.client().tx.send(Command::Close(id)).await.unwrap();
 }
 
 #[tokio::test]
@@ -277,5 +361,167 @@ async fn download_preserves_data_across_receive_buffer_wraps() {
         }
     }
     assert_eq!(received, expected);
-    stack.close(id).unwrap();
+    stack.client().tx.send(Command::Close(id)).await.unwrap();
+}
+
+#[tokio::test]
+async fn local_half_close_drains_upload_then_receives_response_and_fin() {
+    let (owner, id, events, mut peer) = connected().await;
+    let mut stream = TunnelStream::new(id, events);
+    let expected = test_payload(128 * 1024 + 17);
+    stream.write_all(&expected).await.unwrap();
+    let (shutdown, ()) = tokio::join!(stream.shutdown(), peer.receive_until_fin());
+    shutdown.unwrap();
+    assert_eq!(peer.uploaded, expected);
+
+    let response = test_payload(19 * 1024 + 3);
+    let ack = peer.initial_ack.wrapping_add(expected.len() as i32 + 1);
+    for chunk in response.chunks(MSS) {
+        peer.send(ack, chunk);
+    }
+    peer.finish(ack, &[]);
+    let mut received = Vec::new();
+    time::timeout(TEST_TIMEOUT, stream.read_to_end(&mut received))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(received, response);
+    owner.shutdown().await;
+}
+
+#[tokio::test]
+async fn remote_half_close_allows_remaining_upload_to_finish() {
+    let (owner, id, events, mut peer) = connected().await;
+    let mut stream = TunnelStream::new(id, events);
+    peer.finish(peer.initial_ack, b"last response");
+    let mut received = Vec::new();
+    time::timeout(TEST_TIMEOUT, stream.read_to_end(&mut received))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(received, b"last response");
+
+    let expected = test_payload(65 * 1024 + 3);
+    stream.write_all(&expected).await.unwrap();
+    let (shutdown, ()) = tokio::join!(stream.shutdown(), peer.receive_until_fin());
+    shutdown.unwrap();
+    assert_eq!(peer.uploaded, expected);
+    owner.shutdown().await;
+}
+
+#[tokio::test]
+async fn completed_tcp_close_preserves_download_waiting_for_the_reader() {
+    let (owner, id, events, mut peer) = connected().await;
+    let mut stream = TunnelStream::new(id, events);
+    let response = test_payload(190 * 1024 + 17);
+    for chunk in response.chunks(MSS) {
+        peer.send(peer.initial_ack, chunk);
+    }
+    peer.finish(peer.initial_ack, &[]);
+    // Ensure the peer FIN arrived before closing our write half. This takes
+    // smoltcp through CLOSE-WAIT / LAST-ACK / CLOSED with unread receive data.
+    loop {
+        let raw = peer.next_packet().await;
+        let ip = Ipv4Packet::new_checked(&raw[..]).unwrap();
+        let tcp = TcpPacket::new_checked(ip.payload()).unwrap();
+        if tcp.ack_number() == TcpSeqNumber(peer.next_seq) {
+            break;
+        }
+    }
+    let (shutdown, ()) = tokio::join!(stream.shutdown(), peer.receive_until_fin());
+    shutdown.unwrap();
+    let mut received = Vec::new();
+    time::timeout(TEST_TIMEOUT, stream.read_to_end(&mut received))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(received, response);
+    owner.shutdown().await;
+}
+
+#[tokio::test]
+async fn peer_reset_after_fin_rejects_unacknowledged_upload() {
+    for reset_claims_ack in [false, true] {
+        let (owner, id, events, mut peer) = connected().await;
+        let mut stream = TunnelStream::new(id, events);
+        peer.finish(peer.initial_ack, b"response EOF");
+        let mut response = Vec::new();
+        time::timeout(TEST_TIMEOUT, stream.read_to_end(&mut response))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(response, b"response EOF");
+
+        stream.write_all(b"unacknowledged upload").await.unwrap();
+        let reset_peer = async {
+            let uploaded = peer.receive_upload().await;
+            // Even an RST carrying an ACK number does not acknowledge TCP data.
+            let ack = if reset_claims_ack {
+                uploaded
+            } else {
+                peer.initial_ack
+            };
+            peer.stack
+                .tx
+                .try_send(Command::Packet(peer.control_packet(
+                    ack,
+                    TcpControl::Rst,
+                    &[],
+                )))
+                .ok()
+                .unwrap();
+        };
+        let (shutdown, ()) = time::timeout(TEST_TIMEOUT, async {
+            tokio::join!(stream.shutdown(), reset_peer)
+        })
+        .await
+        .unwrap();
+        assert!(
+            shutdown.is_err(),
+            "reset discarded upload bytes but shutdown reported success"
+        );
+        assert_eq!(shutdown.unwrap_err().kind(), std::io::ErrorKind::BrokenPipe);
+        owner.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn owner_shutdown_invalidates_surviving_handles_and_wakes_streams() {
+    let (owner, id, events, _peer) = connected().await;
+    let client = owner.client();
+    let mut stream = TunnelStream::new(id, events);
+    owner.shutdown().await;
+    assert!(!client.is_ready());
+    assert!(matches!(
+        client.connect("1.1.1.1:443".parse().unwrap()).await,
+        Err(StackError::VpnDown)
+    ));
+    let mut byte = [0];
+    assert!(
+        time::timeout(TEST_TIMEOUT, stream.read(&mut byte))
+            .await
+            .unwrap()
+            .is_err()
+    );
+    assert!(
+        time::timeout(TEST_TIMEOUT, stream.write(b"data"))
+            .await
+            .unwrap()
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn dropping_owner_cancels_worker_while_handles_remain() {
+    let (owner, _id, events, _peer) = connected().await;
+    let client = owner.client();
+    drop(owner);
+    time::timeout(TEST_TIMEOUT, async {
+        while client.is_ready() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    drop(events);
 }

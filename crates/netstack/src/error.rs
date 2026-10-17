@@ -15,8 +15,6 @@ pub enum StackError {
     RouteTableFull,
     #[error("packet stack worker stopped")]
     WorkerStopped,
-    #[error("packet stack configuration timed out")]
-    ConfigurationTimeout,
     #[error("VPN is down")]
     VpnDown,
     #[error("tunneled DNS timed out")]
@@ -31,12 +29,12 @@ pub enum StackError {
     DnsFailed,
     #[error("VPN disconnected")]
     Disconnected,
+    #[error("tunnel TCP connection timed out")]
+    ConnectTimeout,
     #[error("tunnel command queue is full")]
     CommandQueueFull,
     #[error("VPN packet delivery failed")]
     PacketDelivery,
-    #[error("packet stack cannot transition to ready from its current state")]
-    InvalidState,
 }
 
 /// Result returned by the userspace packet stack.

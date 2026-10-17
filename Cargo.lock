@@ -976,7 +976,6 @@ name = "ovpn-socks5"
 version = "0.1.0"
 dependencies = [
  "idna",
- "ovpn-netstack",
  "thiserror",
  "tokio",
  "tracing",

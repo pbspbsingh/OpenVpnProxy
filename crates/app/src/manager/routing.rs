@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ovpn_netstack::Stack;
-use ovpn_socks5::{DestinationHost, RouteLease, RouteProvider};
+use ovpn_socks5::DestinationHost;
 use ovpn_ui::{
     DashboardSnapshot, GroupError, GroupPage, GroupSnapshot, HostPhase as UiHostPhase,
     HostSnapshot, PoolPhase, PoolSnapshot, ProfileSummary,
@@ -37,7 +37,7 @@ pub(crate) struct HostLease {
 
 struct PoolReservation {
     releases: mpsc::UnboundedSender<Release>,
-    token: u64,
+    token: Option<u64>,
     sticky: Option<(StickyKey, u64, usize)>,
 }
 
@@ -58,7 +58,19 @@ pub(super) enum HostPhase {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum HostActivation {
     Dormant,
-    Active(u64),
+    Active {
+        epoch: u64,
+        preferred_endpoint: SocketAddr,
+    },
+}
+
+impl HostActivation {
+    pub(super) fn epoch(self) -> Option<u64> {
+        match self {
+            Self::Dormant => None,
+            Self::Active { epoch, .. } => Some(epoch),
+        }
+    }
 }
 
 pub(super) struct Host {
@@ -119,6 +131,53 @@ pub(super) struct Shared {
     max_active_vpn_hosts: usize,
 }
 
+/// Owns the routing task independently of any cloned request handles.
+pub(super) struct RoutingOwner {
+    shared: Arc<Shared>,
+    stop: Option<oneshot::Sender<()>>,
+    worker: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl RoutingOwner {
+    pub(super) fn shared(&self) -> Arc<Shared> {
+        Arc::clone(&self.shared)
+    }
+
+    pub(super) async fn wait_for_exit(&mut self) -> anyhow::Result<()> {
+        let Some(worker) = self.worker.as_mut() else {
+            return std::future::pending().await;
+        };
+        let result = worker.await;
+        self.worker.take();
+        result.map_err(anyhow::Error::from)?;
+        anyhow::bail!("routing actor stopped unexpectedly")
+    }
+
+    pub(super) async fn shutdown(mut self) {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        if let Some(worker) = self.worker.as_mut() {
+            let result = worker.await;
+            self.worker.take();
+            if let Err(error) = result {
+                tracing::error!(%error, "routing actor failed during shutdown");
+            }
+        }
+    }
+}
+
+impl Drop for RoutingOwner {
+    fn drop(&mut self) {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        if let Some(worker) = &self.worker {
+            worker.abort();
+        }
+    }
+}
+
 struct RoutingActor {
     state: RoutingState,
     ready: watch::Sender<usize>,
@@ -142,10 +201,18 @@ enum RoutingCommand {
 
 enum RoutingUpdate {
     Phase(usize, HostPhase),
-    Ready(usize, SocketAddr, Stack, Duration, LatencyScore),
+    Ready {
+        id: usize,
+        epoch: u64,
+        endpoint: SocketAddr,
+        stack: Stack,
+        elapsed: Duration,
+        score: LatencyScore,
+    },
     Probe(usize, u64, anyhow::Result<LatencyScore>, Duration),
     Parked(usize),
     Down(usize, bool),
+    Baseline(usize, SocketAddr, LatencyScore),
 }
 
 enum Release {
@@ -230,33 +297,37 @@ impl RoutingState {
     }
 }
 
-impl Shared {
-    pub(super) fn new(
+impl RoutingOwner {
+    pub(super) fn start(
         hosts: Vec<Host>,
         acquire_timeout: Duration,
         max_active_vpn_hosts: usize,
-    ) -> Arc<Self> {
+    ) -> Self {
         let (ready, _) = watch::channel(0);
         let (commands, command_rx) = mpsc::channel(ROUTING_COMMAND_QUEUE);
         let (releases, release_rx) = mpsc::unbounded_channel();
-        let shared = Arc::new(Self {
+        let (stop, stopped) = oneshot::channel();
+        let shared = Arc::new(Shared {
             commands,
             ready: ready.clone(),
             acquire_timeout,
             max_active_vpn_hosts,
         });
-        tokio::spawn(
-            RoutingActor {
-                state: RoutingState::new(hosts),
-                ready,
-                releases: releases.clone(),
-                max_active_vpn_hosts,
-            }
-            .run(command_rx, release_rx),
-        );
-        shared
+        let actor = RoutingActor {
+            state: RoutingState::new(hosts),
+            ready,
+            releases,
+            max_active_vpn_hosts,
+        };
+        Self {
+            shared,
+            stop: Some(stop),
+            worker: Some(tokio::spawn(actor.run(command_rx, release_rx, stopped))),
+        }
     }
+}
 
+impl Shared {
     async fn command(&self, command: RoutingCommand) -> bool {
         self.commands.send(command).await.is_ok()
     }
@@ -275,18 +346,20 @@ impl Shared {
     pub(super) async fn ready(
         &self,
         id: usize,
+        epoch: u64,
         endpoint: SocketAddr,
         stack: &Stack,
         elapsed: Duration,
         score: LatencyScore,
     ) {
-        self.update(RoutingUpdate::Ready(
+        self.update(RoutingUpdate::Ready {
             id,
+            epoch,
             endpoint,
-            stack.clone(),
+            stack: stack.clone(),
             elapsed,
             score,
-        ))
+        })
         .await;
     }
 
@@ -309,6 +382,11 @@ impl Shared {
         self.update(RoutingUpdate::Down(id, shutdown)).await;
     }
 
+    pub(super) async fn baseline(&self, id: usize, endpoint: SocketAddr, score: LatencyScore) {
+        self.update(RoutingUpdate::Baseline(id, endpoint, score))
+            .await;
+    }
+
     pub(super) async fn stop_accepting(&self) {
         let (reply, received) = oneshot::channel();
         if self.command(RoutingCommand::StopAccepting(reply)).await {
@@ -322,6 +400,7 @@ impl RoutingActor {
         mut self,
         mut commands: mpsc::Receiver<RoutingCommand>,
         mut releases: mpsc::UnboundedReceiver<Release>,
+        mut stop: oneshot::Receiver<()>,
     ) {
         let mut accepting = true;
         let mut sweep = time::interval(STICKY_SWEEP_INTERVAL);
@@ -340,17 +419,23 @@ impl RoutingActor {
                 .idle_since
                 .map(|since| since + POOL_IDLE_TIMEOUT);
             tokio::select! {
+                _ = &mut stop => break,
                 Some(release) = releases.recv() => self.release(release),
                 Some(command) = commands.recv() => match command {
                     RoutingCommand::Begin(reply) => {
                         let reservation = accepting.then(|| self.begin()).flatten().map(|token| {
                             PoolReservation {
                                 releases: self.releases.clone(),
-                                token,
+                                token: Some(token),
                                 sticky: None,
                             }
                         });
-                        let _ = reply.send(reservation);
+                        if let Err(Some(reservation)) = reply.send(reservation) {
+                            // The actor already owns this abandoned reservation:
+                            // release it before processing any later command.
+                            let mut reservation = reservation;
+                            if let Some(token) = reservation.token.take() { self.release_pool(token); }
+                        }
                     }
                     RoutingCommand::Select { token, key, destination, reply } => {
                         let choice = if accepting {
@@ -410,7 +495,10 @@ impl RoutingActor {
                 host.unhealthy = false;
                 host.selected = selected.contains(&id);
                 if host.selected {
-                    host.enabled.send_replace(HostActivation::Active(epoch));
+                    host.enabled.send_replace(HostActivation::Active {
+                        epoch,
+                        preferred_endpoint: host.endpoint,
+                    });
                     tracing::debug!(host_id = id, epoch, "waking selected VPN host");
                 }
             }
@@ -499,8 +587,23 @@ impl RoutingActor {
                 host.phase = phase;
                 tracing::debug!(host_id = id, endpoint = %host.endpoint, ?phase, "VPN host state changed");
             }
-            RoutingUpdate::Ready(id, endpoint, stack, elapsed, score) => {
+            RoutingUpdate::Ready {
+                id,
+                epoch,
+                endpoint,
+                stack,
+                elapsed,
+                score,
+            } => {
                 let host = &mut self.state.hosts[id];
+                if !host.selected || host.enabled.borrow().epoch() != Some(epoch) {
+                    tracing::debug!(
+                        host_id = id,
+                        epoch,
+                        "discarded readiness from an inactive host session"
+                    );
+                    return;
+                }
                 host.endpoint = endpoint;
                 host.phase = HostPhase::Ready;
                 host.generation = host.generation.wrapping_add(1);
@@ -543,6 +646,38 @@ impl RoutingActor {
                 tracing::debug!(host_id = id, "VPN host parked");
             }
             RoutingUpdate::Down(id, shutdown) => self.down(id, shutdown),
+            RoutingUpdate::Baseline(id, endpoint, score) => {
+                let host = &mut self.state.hosts[id];
+                if host
+                    .score_measured_at
+                    .is_none_or(|previous| score.measured_at > previous)
+                    && host.stack.is_none()
+                {
+                    host.endpoint = endpoint;
+                    host.latency_score = Some(score.median);
+                    host.score_measured_at = Some(score.measured_at);
+                }
+                // Fill available slots without displacing hosts serving requests.
+                let selected = self.state.hosts.iter().filter(|host| host.selected).count();
+                if !self.state.hosts[id].selected && selected < self.max_active_vpn_hosts {
+                    let host = &mut self.state.hosts[id];
+                    host.selected = true;
+                    if let Some(epoch) = self.state.pool_epoch {
+                        host.enabled.send_replace(HostActivation::Active {
+                            epoch,
+                            preferred_endpoint: host.endpoint,
+                        });
+                    }
+                }
+                if !self.state.pool_tokens.is_empty()
+                    && let Some(failed) =
+                        self.state.hosts.iter().position(|host| {
+                            host.selected && host.unhealthy && host.stack.is_none()
+                        })
+                {
+                    self.replace_failed_host(failed);
+                }
+            }
         }
         self.notify_ready();
     }
@@ -560,37 +695,42 @@ impl RoutingActor {
         let endpoint = host.endpoint;
         let cleared = state.clear_host(id);
         if !shutdown && !state.pool_tokens.is_empty() && state.hosts[id].selected {
-            let replacement = state
-                .hosts
-                .iter()
-                .enumerate()
-                .filter(|(_, host)| {
-                    !host.selected
-                        && host.latency_score.is_some()
-                        && host.phase == HostPhase::Dormant
-                })
-                .min_by_key(|(_, host)| (host.unhealthy, host.latency_score))
-                .map(|(id, _)| id);
-            if let Some(next) = replacement {
-                state.hosts[id].selected = false;
-                state.hosts[id]
-                    .enabled
-                    .send_replace(HostActivation::Dormant);
-                state.hosts[next].selected = true;
-                if let Some(epoch) = state.pool_epoch {
-                    state.hosts[next]
-                        .enabled
-                        .send_replace(HostActivation::Active(epoch));
-                }
-                tracing::warn!(
-                    failed_host_id = id,
-                    replacement_host_id = next,
-                    "waking probed standby VPN host"
-                );
-            }
+            self.replace_failed_host(id);
         }
         if was_ready || cleared > 0 {
             tracing::warn!(host_id = id, %endpoint, cleared_groups = cleared, shutdown, "VPN host unavailable; sticky assignments cleared");
+        }
+    }
+
+    fn replace_failed_host(&mut self, id: usize) {
+        let state = &mut self.state;
+        let replacement = state
+            .hosts
+            .iter()
+            .enumerate()
+            .filter(|(_, host)| {
+                !host.selected && host.latency_score.is_some() && host.phase == HostPhase::Dormant
+            })
+            .min_by_key(|(_, host)| (host.unhealthy, host.latency_score))
+            .map(|(id, _)| id);
+        if let Some(next) = replacement {
+            state.hosts[id].selected = false;
+            state.hosts[id]
+                .enabled
+                .send_replace(HostActivation::Dormant);
+            state.hosts[next].selected = true;
+            if let Some(epoch) = state.pool_epoch {
+                let host = &mut state.hosts[next];
+                host.enabled.send_replace(HostActivation::Active {
+                    epoch,
+                    preferred_endpoint: host.endpoint,
+                });
+            }
+            tracing::warn!(
+                failed_host_id = id,
+                replacement_host_id = next,
+                "waking probed standby VPN host"
+            );
         }
     }
 
@@ -804,10 +944,13 @@ impl RoutingActor {
 
 impl Drop for PoolReservation {
     fn drop(&mut self) {
+        let Some(token) = self.token.take() else {
+            return;
+        };
         if self
             .releases
             .send(Release::Pool {
-                token: self.token,
+                token,
                 sticky: self.sticky.take(),
             })
             .is_err()
@@ -830,8 +973,8 @@ impl Drop for StickyReservation {
     }
 }
 
-impl RouteLease for HostLease {
-    fn stack(&self) -> &Stack {
+impl HostLease {
+    pub(crate) fn stack(&self) -> &Stack {
         &self.stack
     }
 }
@@ -882,10 +1025,12 @@ impl RouterHandle {
     }
 }
 
-impl RouteProvider for RouterHandle {
-    type Lease = HostLease;
-
-    async fn select(&self, source: IpAddr, destination: DestinationHost) -> Option<Self::Lease> {
+impl RouterHandle {
+    pub(crate) async fn select(
+        &self,
+        source: IpAddr,
+        destination: DestinationHost,
+    ) -> Option<HostLease> {
         let key = sticky_key(source, &destination)?;
         let deadline = Instant::now() + self.shared.acquire_timeout;
         let deadline_tokio = time::Instant::from_std(deadline);
@@ -901,7 +1046,7 @@ impl RouteProvider for RouterHandle {
         .ok()
         .flatten()?;
         let mut pool = pool;
-        let token = pool.token;
+        let token = pool.token?;
         loop {
             let (reply, received) = oneshot::channel();
             let choice = time::timeout_at(deadline_tokio, async {
@@ -1059,6 +1204,153 @@ fn destination_supported(stack: &Stack, destination: &DestinationHost) -> bool {
 mod tests {
     use super::*;
 
+    async fn test_stack() -> ovpn_netstack::StackOwner {
+        let (tx, _rx) = mpsc::channel(1024);
+        ovpn_netstack::StackOwner::start(
+            ovpn_netstack::TunnelConfig::new(
+                "10.8.0.2".parse().unwrap(),
+                "10.8.0.1".parse().unwrap(),
+                vec![],
+                1400,
+                None,
+            )
+            .unwrap(),
+            tx,
+        )
+        .await
+        .unwrap()
+    }
+
+    fn score(milliseconds: u64) -> LatencyScore {
+        LatencyScore {
+            median: Duration::from_millis(milliseconds),
+            elapsed: Duration::ZERO,
+            successful_samples: 3,
+            measured_at: Instant::now(),
+        }
+    }
+
+    #[test]
+    fn background_assessments_fill_pool_without_displacing_selected_hosts() {
+        let (ready, _) = watch::channel(0);
+        let (releases, _) = mpsc::unbounded_channel();
+        let mut actor = RoutingActor {
+            state: RoutingState::new(vec![
+                Host::new("127.0.0.1:1194".parse().unwrap(), true, Some(score(20))),
+                Host::new("127.0.0.2:1194".parse().unwrap(), false, None),
+                Host::new("127.0.0.3:1194".parse().unwrap(), false, None),
+            ]),
+            ready,
+            releases,
+            max_active_vpn_hosts: 2,
+        };
+        actor.begin().unwrap();
+        let preferred = "127.0.0.2:443".parse().unwrap();
+        actor.update(RoutingUpdate::Baseline(1, preferred, score(10)));
+        actor.update(RoutingUpdate::Baseline(
+            2,
+            "127.0.0.3:1194".parse().unwrap(),
+            score(5),
+        ));
+        assert!(actor.state.hosts[0].selected);
+        assert!(actor.state.hosts[1].selected);
+        assert!(!actor.state.hosts[2].selected);
+        assert!(
+            matches!(*actor.state.hosts[1].enabled.borrow(), HostActivation::Active { preferred_endpoint, .. } if preferred_endpoint == preferred)
+        );
+    }
+
+    #[tokio::test]
+    async fn routing_shutdown_completes_with_surviving_request_handles() {
+        let owner = RoutingOwner::start(vec![], Duration::from_secs(1), 1);
+        let shared = owner.shared();
+        owner.shutdown().await;
+        let (reply, _received) = oneshot::channel();
+        assert!(!shared.command(RoutingCommand::Snapshot(reply)).await);
+    }
+
+    #[test]
+    fn late_baseline_replaces_failed_selected_host() {
+        let (ready, _) = watch::channel(0);
+        let (releases, _) = mpsc::unbounded_channel();
+        let mut actor = RoutingActor {
+            state: RoutingState::new(vec![
+                Host::new("127.0.0.1:1194".parse().unwrap(), true, Some(score(20))),
+                Host::new("127.0.0.2:1194".parse().unwrap(), false, None),
+            ]),
+            ready,
+            releases,
+            max_active_vpn_hosts: 1,
+        };
+        actor.begin().unwrap();
+        actor.down(0, false);
+        assert!(actor.state.hosts[0].selected);
+        actor.update(RoutingUpdate::Baseline(
+            1,
+            "127.0.0.2:443".parse().unwrap(),
+            score(10),
+        ));
+        assert!(!actor.state.hosts[0].selected);
+        assert_eq!(
+            *actor.state.hosts[0].enabled.borrow(),
+            HostActivation::Dormant
+        );
+        assert!(actor.state.hosts[1].selected);
+        assert!(actor.state.hosts[1].enabled.borrow().epoch().is_some());
+    }
+
+    #[tokio::test]
+    async fn old_readiness_and_probe_cannot_replace_current_session() {
+        let (ready, _) = watch::channel(0);
+        let (releases, _) = mpsc::unbounded_channel();
+        let endpoint = "127.0.0.1:1194".parse().unwrap();
+        let mut actor = RoutingActor {
+            state: RoutingState::new(vec![Host::new(endpoint, true, Some(score(20)))]),
+            ready,
+            releases,
+            max_active_vpn_hosts: 1,
+        };
+        actor.state.hosts[0]
+            .enabled
+            .send_replace(HostActivation::Active {
+                epoch: 2,
+                preferred_endpoint: endpoint,
+            });
+        let old = test_stack().await;
+        let current = test_stack().await;
+        actor.update(RoutingUpdate::Ready {
+            id: 0,
+            epoch: 1,
+            endpoint,
+            stack: old.client(),
+            elapsed: Duration::ZERO,
+            score: score(50),
+        });
+        assert!(actor.state.hosts[0].stack.is_none());
+        actor.update(RoutingUpdate::Ready {
+            id: 0,
+            epoch: 2,
+            endpoint,
+            stack: current.client(),
+            elapsed: Duration::ZERO,
+            score: score(10),
+        });
+        actor.update(RoutingUpdate::Probe(
+            0,
+            old.client().id(),
+            Ok(score(100)),
+            Duration::ZERO,
+        ));
+        assert_eq!(
+            actor.state.hosts[0].stack.as_ref().unwrap().id(),
+            current.client().id()
+        );
+        assert_eq!(
+            actor.state.hosts[0].latency_score,
+            Some(Duration::from_millis(10))
+        );
+    }
+
     #[test]
     fn stale_lease_release_keeps_new_assignment() {
         let (ready, _) = watch::channel(0);
@@ -1099,11 +1391,12 @@ mod tests {
 
     #[tokio::test]
     async fn abandoned_begin_releases_pool_reservation() {
-        let shared = Shared::new(
+        let owner = RoutingOwner::start(
             vec![Host::new("127.0.0.1:1194".parse().unwrap(), true, None)],
             Duration::from_secs(1),
             1,
         );
+        let shared = owner.shared();
         let (reply, received) = oneshot::channel();
         drop(received);
         shared
@@ -1123,11 +1416,12 @@ mod tests {
 
     #[tokio::test]
     async fn delivered_begin_releases_pool_when_receiver_is_dropped() {
-        let shared = Shared::new(
+        let owner = RoutingOwner::start(
             vec![Host::new("127.0.0.1:1194".parse().unwrap(), true, None)],
             Duration::from_secs(1),
             1,
         );
+        let shared = owner.shared();
         let (reply, received) = oneshot::channel();
         shared
             .commands
@@ -1188,10 +1482,11 @@ mod tests {
                 generation: 1,
             },
         );
+        let stack_owner = test_stack().await;
         let (reply, received) = oneshot::channel::<SelectReply>();
         reply
             .send(Ok(Some(SelectedRoute {
-                stack: Stack::start(),
+                stack: stack_owner.client(),
                 reservation: StickyReservation {
                     releases,
                     sticky: Some((key.clone(), 1, 0)),

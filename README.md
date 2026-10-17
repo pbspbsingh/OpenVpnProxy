@@ -32,22 +32,22 @@ Only applications configured to use this SOCKS5 proxy follow this path. The proj
 | --- | --- | --- |
 | `ovpn-profile` | Parses the supported `.ovpn` directives into remotes, CA, `tls-crypt` key, and timing settings. | Profile text in; typed `Profile` out. No network runtime. |
 | `ovpn-client` | OpenVPN UDP session, protected control channel, TLS, authentication exchange, pushed settings, encrypted data packets, keepalives, and key rotation. | Plain IP packets in/out through `Session`; no knowledge of SOCKS5 or `smoltcp`. |
-| `ovpn-netstack` | Virtual IP interface, DNS queries, TCP connections, and IP packet production/consumption using `smoltcp`. | `Stack` commands and `StreamEvent`s for callers; plain IPv4 or IPv6 packets for the app. |
-| `ovpn-socks5` | SOCKS5 negotiation and forwarding between a client socket and its assigned `Stack`. | One async handler per accepted client; it asks a routing provider to select a stack before DNS. No OpenVPN dependency. |
+| `ovpn-netstack` | Virtual IP interface, DNS queries, TCP connections, and IP packet production/consumption using `smoltcp`. | An exclusive `StackOwner` for the host; cloneable `Stack` connection handles and standard async `TunnelStream`s for clients. |
+| `ovpn-socks5` | SOCKS5 negotiation and bidirectional stream forwarding, including TCP half-close. | An application-supplied `Connector` returns an async stream. No VPN or packet-stack dependency. |
 | `ovpn-ui` | Embedded dashboard with shutdown control, WebSocket feeds, bounded log buffer, and in-memory one-minute chart history. | Receives typed snapshots and log events; no VPN or SOCKS dependency. |
 | `openvpn-proxy-app` | TOML config, host discovery, connection manager, sticky routing, tunnel supervision, SOCKS and dashboard listeners, and shutdown. | Executable and composition root. |
 
-The dependency direction is `app → profile/client/netstack/socks5/ui` and `socks5 → netstack`. The app owns one OpenVPN session and one packet stack **per active VPN host**, and connects their plain IP packet streams. Reusable crates expose typed errors with `thiserror`; the app adds context with `anyhow` and logs through `tracing`.
+The dependency direction is `app → profile/client/netstack/socks5/ui`. The app owns one OpenVPN session and one packet stack **per active VPN host**, connects their plain IP packet streams, and supplies routing/DNS/connection policy to SOCKS through its connector. Reusable crates expose typed errors with `thiserror`; the app adds context with `anyhow` and logs through `tracing`.
 
 ### Connection manager and sticky routing
 
-The app resolves every profile `remote` to IPv4 endpoints, deduplicates them, and groups ports under each server IP. Before accepting SOCKS connections, it probes every candidate with at most four probes running concurrently. Each baseline tunnel closes after measurement. The fastest healthy `max_active_vpn_hosts` (default: 16) become the selected pool; the remaining scored hosts stay dormant as failover candidates. The first client request wakes all selected hosts together. Each worker tries its host's ports in turn, establishes a VPN session and packet stack, obtains a fresh tunneled score, then becomes available for routing. A failed selected host yields its slot to a dormant candidate, preferring candidates that have not failed during the current wake. If none remains, the failed host retries with bounded exponential backoff.
+The app resolves every profile `remote` to IPv4 endpoints, deduplicates them, and groups ports under each server IP. It assesses candidates with at most four probes running concurrently and begins accepting SOCKS connections after the first successful baseline. Remaining assessments continue in the background, filling available pool slots without displacing selected hosts. Each baseline tunnel closes after measurement. On each pool wake, the fastest scored `max_active_vpn_hosts` (default: 16) become selected; other scored hosts remain dormant as failover candidates. Each worker tries its preferred port first, establishes a VPN session and packet stack, obtains a fresh tunneled score, then becomes available for routing. A failed selected host yields its slot to a dormant candidate, preferring candidates that have not failed during the current wake. If none remains, the failed host retries with bounded exponential backoff.
 
 The initial score is the median of three tunneled TCP connection times to `1.1.1.1:443`; at least two must succeed. Logs report tunnel setup time, time spent obtaining the score, and total time for each host. Connected hosts refresh the score every minute on staggered schedules, smoothing new samples with the previous score; probes do not count as client activity. A dormant replacement gets a fresh score before receiving traffic. Scores remain in memory only and are measured again on app restart.
 
-For a SOCKS hostname, the handler asks the manager for a route **before DNS**. The manager uses the Public Suffix List to group a registrable domain and its subdomains: `abc.com` and `xyz.abc.com` share an assignment for the same client source IP. Direct IP requests use `(source IP, destination IP)` as the sticky key. A new group chooses among ready selected hosts using latency and current connection count. IPv6 requests require a matching IPv6 route on the selected tunnel. Existing assignments remain fixed until their host fails or they have no TCP connections for 30 minutes. On failure, the manager removes that host's assignments and resets its stack, closing existing proxied TCP connections. When the entire pool has no client routes for 30 minutes, all VPN sessions close and sticky state clears. The next request reopens the selected pool.
+For a SOCKS hostname, the application connector acquires a route **before DNS**. The manager uses the Public Suffix List to group a registrable domain and its subdomains: `abc.com` and `xyz.abc.com` share an assignment for the same client source IP. Direct IP requests use `(source IP, destination IP)` as the sticky key. A new group chooses among ready selected hosts using latency and current connection count. IPv6 requests require a matching IPv6 route on the selected tunnel. Existing assignments remain fixed until their host fails or they have no TCP connections for 30 minutes. On failure, the manager removes that host's assignments and shuts down its stack, closing existing proxied TCP connections. When the entire pool has no client routes for 30 minutes, all VPN sessions close and sticky state clears. The next request reopens the selected pool.
 
-The sticky table is bounded. If it fills, new groups fail closed rather than silently losing their assignment. DNS for a hostname runs through its assigned host's packet stack, so DNS and TCP use the same VPN.
+The sticky table is bounded. If it fills, new groups fail closed rather than silently losing their assignment. DNS for a hostname runs through its assigned host's packet stack, so DNS and TCP use the same VPN. On IPv6-capable tunnels, IPv4 resolution/connection starts first and an IPv6 attempt starts after 250 ms, or immediately if IPv4 fails. The first successful attempt wins; cancellation releases the losing query or socket.
 
 ### Inside the OpenVPN client
 
@@ -84,10 +84,10 @@ sequenceDiagram
     Profile-->>App: Remotes, CA, keys, options
     App->>Listener: Bind socks5_address
     App->>Manager: Resolve all remotes; group endpoints by server IP
-    Manager->>Manager: Probe all candidates, four at a time
-    Manager->>Manager: Rank healthy hosts; select configured active limit
-    Manager-->>App: Scored host pool ready; tunnels dormant
+    Manager->>Manager: Start candidate assessments, four at a time
+    Manager-->>App: First healthy host found; serving tunnels dormant
     App->>Listener: Begin accepting SOCKS5 clients
+    Manager->>Manager: Continue assessments; fill selected pool slots
 ```
 
 Profile or host discovery errors prevent proxy serving; an enabled dashboard remains available to show the failure. A candidate that fails its baseline probe is ineligible; proxy startup fails if none pass. The manager does not benchmark throughput or refresh remote DNS records after startup yet.
@@ -100,6 +100,7 @@ This diagram uses `curl --socks5-hostname`, so curl sends the hostname to the pr
 sequenceDiagram
     participant Client as Application
     participant Socks as SOCKS5 handler
+    participant Connector as Application connector
     participant Manager as Connection manager
     participant Stack as smoltcp engine
     participant App as Host worker packet loop
@@ -108,23 +109,24 @@ sequenceDiagram
     participant Site as Website
 
     Client->>Socks: Local TCP; SOCKS5 CONNECT example.com:443
-    Socks->>Manager: Select sticky host for (source IP, example.com)
+    Socks->>Connector: Connect example.com:443
+    Connector->>Manager: Select sticky host for (source IP, example.com)
     Manager->>VPN: Wake selected pool; start sessions if dormant
     VPN->>Server: Protected reset, TLS handshake, credentials, PUSH_REQUEST
     Server-->>VPN: Tunnel settings
     VPN-->>Manager: Session established; activate stack and probe latency
-    Manager-->>Socks: Lease for one ready host and its stack
+    Manager-->>Connector: Lease for one ready host and its stack
     opt Destination is a hostname
-        Socks->>Stack: Resolve A or AAAA record
+        Connector->>Stack: Resolve A or AAAA record
         Stack->>App: DNS query as IP packet
         App->>VPN: Encrypt packet
         VPN->>Server: UDP data packet
         Server-->>VPN: Encrypted DNS response
         VPN-->>App: Plain IP packet
         App-->>Stack: Deliver DNS response
-        Stack-->>Socks: Destination IP address
+        Stack-->>Connector: Destination IP address
     end
-    Socks->>Stack: Open virtual TCP connection to address:443
+    Connector->>Stack: Connect virtual TCP stream to address:443
     Stack->>App: TCP SYN as IP packet
     App->>VPN: Encrypt packet
     VPN->>Server: UDP data packet
@@ -133,7 +135,8 @@ sequenceDiagram
     Server-->>VPN: Encrypted IP packet
     VPN-->>App: Decrypt packet
     App-->>Stack: Deliver TCP response
-    Stack-->>Socks: Connected event
+    Stack-->>Connector: Connected stream
+    Connector-->>Socks: Stream owning its route lease
     Socks-->>Client: SOCKS5 success
     loop HTTPS byte stream
         Client->>Socks: TLS / HTTP bytes
@@ -146,12 +149,16 @@ sequenceDiagram
         Server-->>VPN: Encrypted data
         VPN-->>App: Decrypted IP packets
         App-->>Stack: Deliver packets
-        Stack-->>Socks: Stream data event
+        Stack-->>Socks: Async stream read
         Socks-->>Client: TLS / HTTP bytes
     end
 ```
 
-The app's serving loop accepts SOCKS clients and handles shutdown. Each accepted client gets an async task. Each active VPN host worker multiplexes outbound stack packets, inbound OpenVPN packets, keepalive/status work, probes, and shutdown. One routing task owns host selection, sticky assignments, pool idle time, and sticky expiry; the dashboard requests snapshots and group pages from that task. Each packet stack has one owning task for its TCP and DNS state.
+The application owns a `JoinSet` of client tasks and the connection manager. Shutdown stops accepting clients, cancels and joins client handlers, stops host workers, then stops and joins routing. The manager observes unexpected routing/host task completion while serving. Dropping an owner cancels its task as a fallback during startup cancellation or error unwinding.
+
+Each host worker owns a `HostSession`: its OpenVPN session, packet output receiver, and exclusive `StackOwner`. The stack actor alone changes stack lifecycle state and owns TCP/DNS state. Client `Stack` handles carry immutable session routes and connection access; they cannot configure, reset, or inject packets. A reconnect creates a new stack identity. Probe results from an old identity are rejected by routing. Probe tasks are children of their host session and are cancelled and joined on exit.
+
+One routing actor owns selection policy, sticky assignments, lease accounting, pool idle time, and sticky expiry. Activation messages describe desired membership and preferred endpoints; host workers report actual connection state. Each connected client owns its route lease through its `LeasedStream`. Tokio's bidirectional forwarding allows upload and download to progress independently; write shutdown keeps the socket alive until queued bytes are acknowledged and its TCP write half closes, while reads can continue. A reset with unacknowledged upload data fails the stream. The dashboard still requests snapshots and group pages from routing; its actor migration is deferred.
 
 ## Key rotation and failure behavior
 
@@ -159,8 +166,8 @@ OpenVPN may request a new data key, or the client may start renegotiation when i
 
 The design fails closed for **traffic handled by this proxy**:
 
-- The SOCKS listener begins accepting after baseline probing but before serving tunnels connect. A request waits for a selected host up to the profile handshake window plus 30 seconds for control setup (60 seconds with the default 30-second handshake window). A failed host clears its assignment; a scored standby may take its slot after a fresh probe. If no host becomes ready, the proxy returns a SOCKS5 network failure. A profile's `hand-window` setting overrides the default handshake window and also limits key renegotiation.
-- During a session, SOCKS requests can select only a ready host. A VPN or stack error marks that host unhealthy, clears its sticky assignments, resets its stack, and closes its client connections. Other hosts continue serving. Full packet or command queues mark the affected stack failed; full per-connection upload queues apply backpressure.
+- The SOCKS listener begins accepting after the first successful baseline but before serving tunnels connect. A request waits for a selected host up to the profile handshake window plus 30 seconds for control setup (60 seconds with the default 30-second handshake window). A failed host clears its assignment; a scored standby may take its slot after a fresh probe. If no host becomes ready, the proxy returns a SOCKS5 network failure. A profile's `hand-window` setting overrides the default handshake window and also limits key renegotiation.
+- During a session, SOCKS requests can select only a ready host. A VPN or stack error marks that host unhealthy, clears its sticky assignments, shuts down its stack, and closes its client connections. Other hosts continue serving. Packet ingress or egress delivery failure ends the affected host session; full per-connection upload queues apply backpressure.
 - There is no direct-to-destination fallback in the SOCKS or stack crates. If every selected host is unavailable, new requests fail. The manager can activate a scored standby, retries failed hosts when no standby remains, and tries alternate ports; automatic DNS rediscovery and migration of existing TCP connections are not implemented.
 
 This guarantee applies only to traffic sent to the proxy. An application that ignores its proxy setting can still use the ordinary network connection.
@@ -193,7 +200,7 @@ The current chart minute is partial; history, counters, and buffered logs reset 
 
 `RUST_LOG=info` shows discovered hosts, connection attempts, ready/down transitions, idle closures, and new domain assignments. `RUST_LOG=debug` adds route requests, retries, and per-host activity. `RUST_LOG=trace` adds packet flow details. `socks5_address = "0.0.0.0:1080"` accepts clients from other machines. The proxy has **no SOCKS authentication**, so choose the bind address and network exposure accordingly. `config.toml` contains credentials; it and `*.ovpn` are ignored by Git.
 
-For a browser speed test, run the release build with `RUST_LOG=debug`. `stack_id` links route, SOCKS, VPN host, and packet stack logs. A `SOCKS5 transfer summary` reports route, DNS, TCP connect, and transfer times plus bytes in each direction; `first_response` measures the first tunneled bytes after the SOCKS connection, which may be a TLS handshake. Active transfers and packet stacks also report 10-second traffic windows. `packet stack activity` includes command, timer, and consumer wakeups, timer lateness, time spent per pass, full 4 KiB reads, event queue stalls, and the largest queued TCP write. Share these summaries and the matching `VPN host traffic` lines when investigating a slow request; debug logs also contain destination names.
+For a browser speed test, run the release build with `RUST_LOG=debug`. `VPN route acquired` and `VPN destination connected` include `stack_id`, route acquisition time, and total connection setup time. `SOCKS5 connection finished` reports total elapsed time and transferred bytes in each direction. Hosts and packet stacks report 10-second traffic windows. `packet stack activity` includes command, timer, and consumer wakeups, timer lateness, time spent per pass, full 4 KiB reads, event queue stalls, and the largest queued TCP write. Share these summaries and the matching `VPN host traffic` lines when investigating a slow request; debug logs also contain destination names.
 
 ## Current scope
 

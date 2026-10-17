@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use ovpn_client::Session;
-use ovpn_netstack::{Stack, StreamEvent};
+use ovpn_netstack::{Stack, StackOwner};
 use tokio::sync::mpsc;
 use tokio::time;
 
@@ -59,10 +59,11 @@ pub(super) async fn measure(stack: &Stack) -> Result<LatencyScore> {
 
 pub(super) async fn measure_with_session(
     session: &mut Session,
-    stack: &Stack,
+    owner: &StackOwner,
     outbound: &mut mpsc::Receiver<Vec<u8>>,
 ) -> Result<LatencyScore> {
-    let probe = measure(stack);
+    let stack = owner.client();
+    let probe = measure(&stack);
     tokio::pin!(probe);
     loop {
         tokio::select! {
@@ -73,7 +74,7 @@ pub(super) async fn measure_with_session(
             }
             received = session.step() => {
                 if let Some(packet) = received? {
-                    stack.packet(packet)?;
+                    owner.packet(packet)?;
                 }
             }
         }
@@ -82,32 +83,9 @@ pub(super) async fn measure_with_session(
 
 async fn connect_once(stack: &Stack, destination: SocketAddr) -> Result<Duration> {
     let started = Instant::now();
-    let (id, mut events) = stack
+    let _connection = stack
         .connect(destination)
         .await
-        .context("cannot start tunneled probe connection")?;
-    let _connection = ProbeConnection {
-        stack: stack.clone(),
-        id,
-    };
-    loop {
-        match events.recv().await {
-            Some(StreamEvent::Connected) => return Ok(started.elapsed()),
-            Some(StreamEvent::Data(_)) => {}
-            Some(StreamEvent::Closed) | None => bail!("tunneled probe connection closed"),
-        }
-    }
-}
-
-struct ProbeConnection {
-    stack: Stack,
-    id: u64,
-}
-
-impl Drop for ProbeConnection {
-    fn drop(&mut self) {
-        if let Err(error) = self.stack.close(self.id) {
-            tracing::debug!(id = self.id, %error, "VPN probe connection cleanup failed");
-        }
-    }
+        .context("cannot connect tunneled probe")?;
+    Ok(started.elapsed())
 }

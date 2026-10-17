@@ -5,7 +5,7 @@ use ovpn_profile::Profile;
 use ovpn_ui::LogHub;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
-use tokio::task::{JoinError, JoinHandle};
+use tokio::task::{JoinError, JoinHandle, JoinSet};
 
 use crate::config::AppConfig;
 use crate::dashboard::DashboardSource;
@@ -47,16 +47,18 @@ async fn run_with_dashboard(config: AppConfig, address: SocketAddr, logs: LogHub
         }
     };
 
-    let (socks_listener, manager) = match startup {
+    let (socks_listener, mut manager) = match startup {
         Ok(started) => started,
         Err(error) => {
             return show_failure(error, &source, &shutdown, &mut requested, &mut ui_task).await;
         }
     };
     source.running(manager.router());
+    let mut socks = SocksServer::new(socks_listener, manager.router());
     let mut ui_finished = false;
     let proxy_result = tokio::select! {
-        result = serve_socks(socks_listener, manager.router()) => result,
+        result = socks.run() => result,
+        result = manager.wait_for_failure() => result,
         result = &mut ui_task => {
             ui_finished = true;
             dashboard_ended(result)
@@ -72,6 +74,7 @@ async fn run_with_dashboard(config: AppConfig, address: SocketAddr, logs: LogHub
     {
         source.failed(format!("{error:#}"));
     }
+    socks.shutdown().await;
     manager.shutdown().await;
 
     match proxy_result {
@@ -90,15 +93,21 @@ async fn run_with_dashboard(config: AppConfig, address: SocketAddr, logs: LogHub
 
 async fn run_without_dashboard(config: AppConfig) -> Result<()> {
     tracing::info!("dashboard disabled; webui_address not configured");
-    let (socks_listener, manager) = initialize(config, None).await?;
+    let (socks_listener, mut manager) = tokio::select! {
+        result = initialize(config, None) => result?,
+        signal = tokio::signal::ctrl_c() => { signal?; return Ok(()); }
+    };
+    let mut socks = SocksServer::new(socks_listener, manager.router());
     let result = tokio::select! {
-        result = serve_socks(socks_listener, manager.router()) => result,
+        result = socks.run() => result,
+        result = manager.wait_for_failure() => result,
         signal = tokio::signal::ctrl_c() => {
             signal?;
             tracing::info!("shutdown requested");
             Ok(())
         }
     };
+    socks.shutdown().await;
     manager.shutdown().await;
     result
 }
@@ -185,19 +194,45 @@ fn dashboard_ended(
     }
 }
 
-async fn serve_socks(listener: TcpListener, router: RouterHandle) -> Result<()> {
-    tracing::info!(address = %listener.local_addr()?, "SOCKS5 listening");
-    loop {
-        let (stream, peer) = listener.accept().await?;
-        tracing::debug!(%peer, "SOCKS5 client accepted");
-        let router = router.clone();
-        tokio::spawn(async move {
-            if let Err(error) = ovpn_socks5::handle(stream, router).await {
-                tracing::debug!(%peer, %error, "SOCKS5 client ended with error");
-            } else {
-                tracing::debug!(%peer, "SOCKS5 handler finished");
+/// Owns every accepted client task across cancellation of the accept loop.
+struct SocksServer {
+    listener: TcpListener,
+    router: RouterHandle,
+    clients: JoinSet<()>,
+}
+
+impl SocksServer {
+    fn new(listener: TcpListener, router: RouterHandle) -> Self {
+        Self {
+            listener,
+            router,
+            clients: JoinSet::new(),
+        }
+    }
+
+    async fn run(&mut self) -> Result<()> {
+        tracing::info!(address = %self.listener.local_addr()?, "SOCKS5 listening");
+        loop {
+            tokio::select! {
+                accepted = self.listener.accept() => {
+                    let (stream, peer) = accepted?;
+                    let router = self.router.clone();
+                    self.clients.spawn(async move {
+                        if let Err(error) = ovpn_socks5::handle(stream, router).await {
+                            tracing::debug!(%peer, %error, "SOCKS5 client ended with error");
+                        }
+                    });
+                }
+                Some(result) = self.clients.join_next(), if !self.clients.is_empty() => {
+                    if let Err(error) = result { tracing::error!(%error, "SOCKS5 client task failed"); }
+                }
             }
-        });
+        }
+    }
+
+    async fn shutdown(mut self) {
+        self.clients.abort_all();
+        while self.clients.join_next().await.is_some() {}
     }
 }
 

@@ -1,221 +1,154 @@
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use bytes::Bytes;
 use tokio::sync::{Notify, mpsc, oneshot};
+use tokio::task::JoinHandle;
 use tokio::time;
 
-use crate::engine::run;
+use crate::engine::Worker;
 use crate::error::{Result, StackError};
+use crate::stream::{StreamEvents, TunnelStream};
 use crate::types::{IpVersion, Ipv6Route, StackPhase, StreamEvent, TunnelConfig};
 
 const COMMAND_QUEUE_CAPACITY: usize = 2048;
 const CONNECTION_EVENT_QUEUE_CAPACITY: usize = 32;
-const STREAM_WRITE_CHUNK_BYTES: usize = 8192;
+pub(crate) const STREAM_WRITE_CHUNK_BYTES: usize = 8192;
 const STREAM_WRITE_QUEUE_CAPACITY: usize = 256 * 1024 / STREAM_WRITE_CHUNK_BYTES;
-const CONFIGURATION_TIMEOUT: Duration = Duration::from_secs(5);
 const DNS_RESPONSE_TIMEOUT: Duration = Duration::from_secs(12);
+const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(16);
 static NEXT_STACK_ID: AtomicU64 = AtomicU64::new(1);
 
-/// Events from one virtual TCP connection.
-pub struct StreamEvents {
-    rx: mpsc::Receiver<StreamEvent>,
-    wake: Arc<Notify>,
-    wake_needed: Arc<AtomicBool>,
-    writer: StreamWriter,
+/// Exclusive owner of one tunnel's packet worker.
+///
+/// Clients receive a restricted [`Stack`] handle. Dropping the owner cancels its
+/// worker; normal teardown should call [`Self::shutdown`] and await completion.
+pub struct StackOwner {
+    client: Stack,
+    stop: Option<oneshot::Sender<()>>,
+    worker: Option<JoinHandle<()>>,
 }
 
-impl StreamEvents {
-    /// Returns a writer with bounded buffering for this connection.
-    pub fn writer(&self) -> StreamWriter {
-        self.writer.clone()
-    }
-
-    /// Waits for the next connection event.
-    pub async fn recv(&mut self) -> Option<StreamEvent> {
-        let event = self.rx.recv().await;
-        if event.is_some() && self.wake_needed.swap(false, Ordering::AcqRel) {
-            self.wake.notify_one();
+impl StackOwner {
+    /// Starts and configures a new worker for exactly one VPN session.
+    pub async fn start(config: TunnelConfig, io: mpsc::Sender<Vec<u8>>) -> Result<Self> {
+        let id = NEXT_STACK_ID.fetch_add(1, Ordering::Relaxed);
+        let (tx, commands) = mpsc::channel(COMMAND_QUEUE_CAPACITY);
+        let phase = Arc::new(AtomicU8::new(StackPhase::Offline as u8));
+        let wake = Arc::new(Notify::new());
+        let ipv6_routes = config
+            .ipv6
+            .as_ref()
+            .map_or_else(Vec::new, |ipv6| ipv6.routes.clone());
+        let (stop, stopped) = oneshot::channel();
+        let (ready, started) = oneshot::channel();
+        let worker = Worker {
+            id,
+            config,
+            io,
+            commands,
+            phase: Arc::clone(&phase),
+            wake: Arc::clone(&wake),
+            stop: stopped,
+            ready,
+        };
+        let owner = Self {
+            client: Stack {
+                id,
+                tx,
+                phase,
+                next_id: Arc::new(AtomicU64::new(1)),
+                wake,
+                ipv6_routes: ipv6_routes.into(),
+            },
+            stop: Some(stop),
+            worker: Some(tokio::spawn(worker.run())),
+        };
+        if let Err(error) = started.await.unwrap_or(Err(StackError::WorkerStopped)) {
+            owner.shutdown().await;
+            return Err(error);
         }
-        event
+        Ok(owner)
     }
-}
 
-/// Uploads bytes to one virtual TCP connection, waiting when its queue is full.
-#[derive(Clone)]
-pub struct StreamWriter {
-    tx: mpsc::Sender<Bytes>,
-    wake: Arc<Notify>,
-}
+    /// Grants connection access without granting lifecycle or packet ingress access.
+    pub fn client(&self) -> Stack {
+        self.client.clone()
+    }
 
-impl StreamWriter {
-    /// Queues bytes, applying backpressure independently of other streams.
-    /// Canceling a write can leave a prefix queued for transmission.
-    /// Large writes share their allocation until their queued chunks are consumed.
-    pub async fn write(&self, data: Vec<u8>) -> Result<()> {
-        let mut data = Bytes::from(data);
-        while !data.is_empty() {
-            let count = data.len().min(STREAM_WRITE_CHUNK_BYTES);
-            self.enqueue(data.split_to(count)).await?;
+    /// Delivers an IP packet decrypted by the owning VPN session.
+    pub fn packet(&self, packet: Vec<u8>) -> Result<()> {
+        if !self.client.is_ready() {
+            return Err(StackError::VpnDown);
         }
-        Ok(())
+        self.client
+            .tx
+            .try_send(Command::Packet(packet))
+            .map_err(|_| StackError::CommandQueueFull)
     }
 
-    async fn enqueue(&self, data: Bytes) -> Result<()> {
-        self.tx
-            .send(data)
-            .await
-            .map_err(|_| StackError::Disconnected)?;
-        self.wake.notify_one();
-        Ok(())
+    /// Stops the worker even if clients still hold handles, and awaits its exit.
+    pub async fn shutdown(mut self) {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        if let Some(worker) = self.worker.as_mut() {
+            let result = worker.await;
+            self.worker.take();
+            if let Err(error) = result {
+                tracing::error!(%error, "packet stack worker failed");
+            }
+        }
     }
 }
 
-impl Drop for StreamEvents {
+impl Drop for StackOwner {
     fn drop(&mut self) {
-        self.rx.close();
-        self.wake.notify_one();
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        if let Some(worker) = &self.worker {
+            worker.abort();
+        }
     }
 }
 
-/// Cloneable handle to an asynchronous userspace packet stack.
+/// Cloneable connection capability for one immutable VPN session.
 #[derive(Clone)]
 pub struct Stack {
     id: u64,
-    tx: mpsc::Sender<Command>,
+    pub(crate) tx: mpsc::Sender<Command>,
     phase: Arc<AtomicU8>,
     next_id: Arc<AtomicU64>,
     wake: Arc<Notify>,
-    ipv6_routes: Arc<RwLock<Vec<Ipv6Route>>>,
+    ipv6_routes: Arc<[Ipv6Route]>,
 }
 
 impl Stack {
-    /// Starts a packet stack worker in the current Tokio runtime.
-    pub fn start() -> Self {
-        let id = NEXT_STACK_ID.fetch_add(1, Ordering::Relaxed);
-        let (tx, rx) = mpsc::channel(COMMAND_QUEUE_CAPACITY);
-        let phase = Arc::new(AtomicU8::new(StackPhase::Offline as u8));
-        let worker_phase = phase.clone();
-        let wake = Arc::new(Notify::new());
-        tokio::spawn(run(id, rx, worker_phase, Arc::clone(&wake)));
-        Self {
-            id,
-            tx,
-            phase,
-            next_id: Arc::new(AtomicU64::new(1)),
-            wake,
-            ipv6_routes: Arc::new(RwLock::new(Vec::new())),
-        }
-    }
-
-    /// Returns the diagnostic identifier of this stack.
     pub fn id(&self) -> u64 {
         self.id
     }
-
-    /// Reports whether the tunnel can accept new traffic.
     pub fn is_ready(&self) -> bool {
         self.phase() == StackPhase::Ready
     }
-
-    /// Reports whether the tunnel has any IPv6 routes.
     pub fn supports_ipv6(&self) -> bool {
-        self.is_ready()
-            && self
-                .ipv6_routes
-                .read()
-                .is_ok_and(|routes| !routes.is_empty())
+        self.is_ready() && !self.ipv6_routes.is_empty()
     }
 
-    /// Reports whether the tunnel can route a specific IPv6 destination.
     pub fn can_route_ipv6(&self, address: Ipv6Addr) -> bool {
         !address.is_unspecified()
             && !address.is_multicast()
             && self.is_ready()
-            && self
-                .ipv6_routes
-                .read()
-                .is_ok_and(|routes| routes.iter().any(|route| route.contains(address)))
+            && self.ipv6_routes.iter().any(|route| route.contains(address))
     }
 
-    /// Returns the current lifecycle state.
     pub fn phase(&self) -> StackPhase {
         StackPhase::from_raw(self.phase.load(Ordering::Acquire))
     }
 
-    /// Makes a configured stack available to clients.
-    pub fn activate(&self) -> Result<()> {
-        self.phase
-            .compare_exchange(
-                StackPhase::Configured as u8,
-                StackPhase::Ready as u8,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .map(|_| ())
-            .map_err(|_| StackError::InvalidState)
-    }
-
-    /// Applies tunnel settings and the channel used to send IP packets.
-    pub async fn configure(&self, config: TunnelConfig, io: mpsc::Sender<Vec<u8>>) -> Result<()> {
-        self.phase
-            .store(StackPhase::Offline as u8, Ordering::Release);
-        self.ipv6_routes
-            .write()
-            .map_err(|_| StackError::InvalidState)?
-            .clear();
-        let ipv6_routes = config.ipv6.as_ref().map(|config| config.routes.clone());
-        let (tx, rx) = oneshot::channel();
-        self.tx
-            .send(Command::Configure(config, io, tx))
-            .await
-            .map_err(|_| StackError::WorkerStopped)?;
-        let result = time::timeout(CONFIGURATION_TIMEOUT, rx)
-            .await
-            .map_err(|_| StackError::ConfigurationTimeout)?
-            .map_err(|_| StackError::WorkerStopped)?;
-        if result.is_ok() {
-            *self
-                .ipv6_routes
-                .write()
-                .map_err(|_| StackError::InvalidState)? = ipv6_routes.unwrap_or_default();
-        }
-        result
-    }
-
-    /// Delivers a decrypted IP packet from the VPN server.
-    pub fn packet(&self, packet: Vec<u8>) -> Result<()> {
-        if !self.is_ready() {
-            return Err(StackError::VpnDown);
-        }
-        if self.tx.try_send(Command::Packet(packet)).is_err() {
-            self.phase
-                .store(StackPhase::Failed as u8, Ordering::Release);
-            tracing::error!(
-                "packet stack command queue rejected a VPN packet; tunnel marked failed"
-            );
-            return Err(StackError::CommandQueueFull);
-        }
-        Ok(())
-    }
-
-    /// Disables new traffic and requests a reset of the packet stack.
-    pub async fn reset(&self) -> Result<()> {
-        self.phase
-            .store(StackPhase::Offline as u8, Ordering::Release);
-        self.ipv6_routes
-            .write()
-            .map_err(|_| StackError::InvalidState)?
-            .clear();
-        self.tx
-            .send(Command::Reset)
-            .await
-            .map_err(|_| StackError::WorkerStopped)
-    }
-
-    /// Resolves a hostname through the configured tunneled DNS servers.
+    /// Resolves through this session's DNS servers, including mailbox wait in the deadline.
     pub async fn resolve(&self, host: &str, version: IpVersion) -> Result<IpAddr> {
         if !self.is_ready() {
             return Err(StackError::VpnDown);
@@ -223,19 +156,33 @@ impl Stack {
         if version == IpVersion::V6 && !self.supports_ipv6() {
             return Err(StackError::NoIpv6Route);
         }
-        let (tx, rx) = oneshot::channel();
-        self.tx
-            .send(Command::Resolve(host.to_owned(), version, tx))
-            .await
-            .map_err(|_| StackError::WorkerStopped)?;
-        time::timeout(DNS_RESPONSE_TIMEOUT, rx)
-            .await
-            .map_err(|_| StackError::DnsTimeout)?
-            .map_err(|_| StackError::WorkerStopped)?
+        time::timeout(DNS_RESPONSE_TIMEOUT, async {
+            let (reply, received) = oneshot::channel();
+            self.tx
+                .send(Command::Resolve(host.to_owned(), version, reply))
+                .await
+                .map_err(|_| StackError::WorkerStopped)?;
+            received.await.map_err(|_| StackError::WorkerStopped)?
+        })
+        .await
+        .map_err(|_| StackError::DnsTimeout)?
     }
 
-    /// Opens a virtual TCP connection to a routed destination.
-    pub async fn connect(&self, address: SocketAddr) -> Result<(u64, StreamEvents)> {
+    /// Connects and returns an independently owned, bidirectional TCP stream.
+    /// Dropping a pending connect or its resulting stream releases the socket.
+    pub async fn connect(&self, address: SocketAddr) -> Result<TunnelStream> {
+        time::timeout(TCP_CONNECT_TIMEOUT, async {
+            let (id, mut events) = self.open(address).await?;
+            match events.recv().await {
+                Some(StreamEvent::Connected) => Ok(TunnelStream::new(id, events)),
+                _ => Err(StackError::Disconnected),
+            }
+        })
+        .await
+        .map_err(|_| StackError::ConnectTimeout)?
+    }
+
+    pub(crate) async fn open(&self, address: SocketAddr) -> Result<(u64, StreamEvents)> {
         if !self.is_ready() {
             return Err(StackError::VpnDown);
         }
@@ -247,60 +194,43 @@ impl Stack {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = mpsc::channel(CONNECTION_EVENT_QUEUE_CAPACITY);
         let (write_tx, write_rx) = mpsc::channel(STREAM_WRITE_QUEUE_CAPACITY);
+        let (write_finished, finished) = oneshot::channel();
         let wake_needed = Arc::new(AtomicBool::new(false));
+        let events = StreamEvents::new(
+            rx,
+            Arc::clone(&self.wake),
+            Arc::clone(&wake_needed),
+            write_tx,
+            finished,
+        );
         self.tx
-            .send(Command::Connect(
+            .send(Command::Connect(ConnectRequest {
                 id,
                 address,
-                tx,
-                Arc::clone(&wake_needed),
-                write_rx,
-            ))
+                events: tx,
+                wake_needed,
+                writes: write_rx,
+                write_finished,
+            }))
             .await
             .map_err(|_| StackError::WorkerStopped)?;
-        Ok((
-            id,
-            StreamEvents {
-                rx,
-                wake: Arc::clone(&self.wake),
-                wake_needed,
-                writer: StreamWriter {
-                    tx: write_tx,
-                    wake: Arc::clone(&self.wake),
-                },
-            },
-        ))
-    }
-
-    /// Closes a virtual TCP connection.
-    pub fn close(&self, id: u64) -> Result<()> {
-        self.tx.try_send(Command::Close(id)).map_err(|_| {
-            self.phase
-                .store(StackPhase::Failed as u8, Ordering::Release);
-            tracing::error!(
-                id,
-                "packet stack command queue rejected TCP close; tunnel marked failed"
-            );
-            StackError::CommandQueueFull
-        })
+        Ok((id, events))
     }
 }
 
 pub(crate) enum Command {
-    Configure(
-        TunnelConfig,
-        mpsc::Sender<Vec<u8>>,
-        oneshot::Sender<Result<()>>,
-    ),
     Packet(Vec<u8>),
-    Reset,
     Resolve(String, IpVersion, oneshot::Sender<Result<IpAddr>>),
-    Connect(
-        u64,
-        SocketAddr,
-        mpsc::Sender<StreamEvent>,
-        Arc<AtomicBool>,
-        mpsc::Receiver<Bytes>,
-    ),
+    Connect(ConnectRequest),
+    #[cfg(test)]
     Close(u64),
+}
+
+pub(crate) struct ConnectRequest {
+    pub id: u64,
+    pub address: SocketAddr,
+    pub events: mpsc::Sender<StreamEvent>,
+    pub wake_needed: Arc<AtomicBool>,
+    pub writes: mpsc::Receiver<Bytes>,
+    pub write_finished: oneshot::Sender<()>,
 }

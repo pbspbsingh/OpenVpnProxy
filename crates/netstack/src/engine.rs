@@ -14,7 +14,7 @@ use tokio::time;
 
 use crate::device::PacketDevice;
 use crate::error::{Result, StackError};
-use crate::stack::Command;
+use crate::stack::{Command, ConnectRequest};
 use crate::types::{IpVersion, Ipv6Route, StackPhase, StreamEvent, TunnelConfig, matches_route};
 
 const TCP_RECEIVE_BUFFER_BYTES: usize = 256 * 1024;
@@ -28,103 +28,103 @@ const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const TCP_READ_BUFFER_BYTES: usize = 4096;
 const STACK_STATUS_INTERVAL: Duration = Duration::from_secs(10);
 
-pub(crate) async fn run(
-    id: u64,
-    mut rx: mpsc::Receiver<Command>,
-    phase: Arc<AtomicU8>,
-    wake: Arc<Notify>,
-) {
-    let started = Clock::now();
-    let mut engine: Option<Engine> = None;
-    let mut status = time::interval(STACK_STATUS_INTERVAL);
-    status.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
-    loop {
-        let delay = engine.as_mut().and_then(|active| {
-            let elapsed = started.elapsed().as_millis().min(i64::MAX as u128) as i64;
-            active.next_delay(Instant::from_millis(elapsed))
-        });
-        let timer_started = Clock::now();
-        let event = tokio::select! {
-            command = rx.recv() => Wake::Command(command),
-            _ = wait_for_timer(delay) => Wake::Timer,
-            _ = wake.notified() => Wake::Consumer,
-            _ = status.tick() => {
-                if let Some(active) = &mut engine {
-                    active.log_status();
-                }
-                continue;
+/// The host owns this worker; handles only submit connection commands.
+pub(crate) struct Worker {
+    pub id: u64,
+    pub config: TunnelConfig,
+    pub io: mpsc::Sender<Vec<u8>>,
+    pub commands: mpsc::Receiver<Command>,
+    pub phase: Arc<AtomicU8>,
+    pub wake: Arc<Notify>,
+    pub stop: oneshot::Receiver<()>,
+    pub ready: oneshot::Sender<Result<()>>,
+}
+
+// Also runs on task cancellation, so surviving handles cannot report ready.
+struct WorkerPhase(Arc<AtomicU8>);
+
+impl Drop for WorkerPhase {
+    fn drop(&mut self) {
+        let _ = self.0.compare_exchange(
+            StackPhase::Ready as u8,
+            StackPhase::Offline as u8,
+            Ordering::Release,
+            Ordering::Relaxed,
+        );
+    }
+}
+
+impl Worker {
+    pub(crate) async fn run(self) {
+        let Self {
+            id,
+            config,
+            io,
+            mut commands,
+            phase,
+            wake,
+            mut stop,
+            ready,
+        } = self;
+        let _lifecycle = WorkerPhase(Arc::clone(&phase));
+        let mut engine = match Engine::new(id, config, io) {
+            Ok(engine) => engine,
+            Err(error) => {
+                let _ = ready.send(Err(error));
+                return;
             }
         };
-        if let Some(active) = &mut engine {
+        phase.store(StackPhase::Ready as u8, Ordering::Release);
+        if ready.send(Ok(())).is_err() {
+            return;
+        }
+        let started = Clock::now();
+        let mut status = time::interval(STACK_STATUS_INTERVAL);
+        status.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+        loop {
+            let now =
+                Instant::from_millis(started.elapsed().as_millis().min(i64::MAX as u128) as i64);
+            let delay = engine.next_delay(now);
+            let timer_started = Clock::now();
+            let event = tokio::select! {
+                _ = &mut stop => break,
+                command = commands.recv() => Wake::Command(command),
+                _ = wait_for_timer(delay) => Wake::Timer,
+                _ = wake.notified() => Wake::Consumer,
+                _ = status.tick() => { engine.log_status(); continue; }
+            };
             match &event {
-                Wake::Command(_) => active.stats.command_wakeups += 1,
+                Wake::Command(_) => engine.stats.command_wakeups += 1,
                 Wake::Timer => {
-                    active.stats.timer_wakeups += 1;
+                    engine.stats.timer_wakeups += 1;
                     if let Some(delay) = delay {
-                        active.stats.max_timer_lateness = active
+                        engine.stats.max_timer_lateness = engine
                             .stats
                             .max_timer_lateness
                             .max(timer_started.elapsed().saturating_sub(delay));
                     }
                 }
-                Wake::Consumer => active.stats.consumer_wakeups += 1,
+                Wake::Consumer => engine.stats.consumer_wakeups += 1,
             }
-        }
-        match event {
-            Wake::Command(Some(Command::Configure(config, io, reply))) => {
-                phase.store(StackPhase::Offline as u8, Ordering::Release);
-                if let Some(old) = engine.take() {
-                    old.shutdown();
-                }
-                match Engine::new(id, config, io) {
-                    Ok(new) => {
-                        engine = Some(new);
-                        phase.store(StackPhase::Configured as u8, Ordering::Release);
-                        tracing::debug!("userspace packet stack configured");
-                        let _ = reply.send(Ok(()));
-                    }
-                    Err(error) => {
-                        tracing::error!(%error, "userspace packet stack configuration failed");
-                        let _ = reply.send(Err(error));
-                    }
-                }
+            match event {
+                Wake::Command(Some(command)) => engine.handle(command),
+                Wake::Command(None) => break,
+                Wake::Timer | Wake::Consumer => {}
             }
-            Wake::Command(Some(Command::Reset)) => {
-                tracing::debug!("resetting userspace packet stack");
-                phase.store(StackPhase::Offline as u8, Ordering::Release);
-                if let Some(old) = engine.take() {
-                    old.shutdown();
-                }
-            }
-            Wake::Command(Some(command)) => {
-                if let Some(engine) = &mut engine {
-                    engine.handle(command);
-                } else {
-                    reject_without_tunnel(command);
-                }
-            }
-            Wake::Command(None) => break,
-            Wake::Timer | Wake::Consumer => {}
-        }
-        if phase.load(Ordering::Acquire) == StackPhase::Failed as u8
-            && let Some(old) = engine.take()
-        {
-            old.shutdown();
-        }
-        if let Some(active) = &mut engine {
-            let elapsed = started.elapsed().as_millis().min(i64::MAX as u128) as i64;
-            if let Err(error) = active.tick(Instant::from_millis(elapsed)) {
+            let now =
+                Instant::from_millis(started.elapsed().as_millis().min(i64::MAX as u128) as i64);
+            if let Err(error) = engine.tick(now) {
                 tracing::error!(%error, "packet stack stopped");
                 phase.store(StackPhase::Failed as u8, Ordering::Release);
-                if let Some(old) = engine.take() {
-                    old.shutdown();
-                }
+                break;
             }
         }
-    }
-    phase.store(StackPhase::Offline as u8, Ordering::Release);
-    if let Some(old) = engine {
-        old.shutdown();
+        // Close admission before releasing sockets and waking their clients.
+        if phase.load(Ordering::Relaxed) != StackPhase::Failed as u8 {
+            phase.store(StackPhase::Offline as u8, Ordering::Release);
+        }
+        commands.close();
+        engine.shutdown();
     }
 }
 
@@ -147,6 +147,14 @@ struct StackStats {
     max_tick_time: Duration,
 }
 
+/// A received FIN starts draining; EOF is published only after buffered data.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ReadState {
+    Open,
+    Draining,
+    Closed,
+}
+
 struct Connection {
     socket: SocketHandle,
     events: mpsc::Sender<StreamEvent>,
@@ -154,6 +162,9 @@ struct Connection {
     writes: mpsc::Receiver<Bytes>,
     write_queue: Bytes,
     established: bool,
+    read_state: ReadState,
+    write_closed: bool,
+    write_finished: Option<oneshot::Sender<()>>,
     deadline: Clock,
 }
 
@@ -278,7 +289,14 @@ impl Engine {
                     }
                 }
             }
-            Command::Connect(id, address, events, wake_needed, writes) => {
+            Command::Connect(ConnectRequest {
+                id,
+                address,
+                events,
+                wake_needed,
+                writes,
+                write_finished,
+            }) => {
                 if !matches_route(&self.ipv6_routes, address.ip()) {
                     tracing::warn!(id, %address, "VPN has no IPv6 route for SOCKS destination");
                     let _ = events.try_send(StreamEvent::Closed);
@@ -317,6 +335,9 @@ impl Engine {
                                 writes,
                                 write_queue: Bytes::new(),
                                 established: false,
+                                read_state: ReadState::Open,
+                                write_closed: false,
+                                write_finished: Some(write_finished),
                                 deadline: Clock::now() + TCP_CONNECT_TIMEOUT,
                             },
                         );
@@ -328,8 +349,8 @@ impl Engine {
                     }
                 }
             }
+            #[cfg(test)]
             Command::Close(id) => self.close(id),
-            Command::Configure(_, _, _) | Command::Reset => unreachable!(),
         }
     }
 
@@ -395,7 +416,12 @@ impl Engine {
                 close.push(id);
                 continue;
             }
-            if !connection.established && socket.state() == tcp::State::Established {
+            if !connection.established
+                && matches!(
+                    socket.state(),
+                    tcp::State::Established | tcp::State::CloseWait
+                )
+            {
                 connection.established = true;
                 tracing::debug!(id, "userspace TCP connection established");
                 if connection.events.try_send(StreamEvent::Connected).is_err() {
@@ -404,7 +430,40 @@ impl Engine {
                     continue;
                 }
             }
-            if !socket.is_active() {
+            if connection.read_state == ReadState::Open
+                && matches!(
+                    socket.state(),
+                    tcp::State::CloseWait
+                        | tcp::State::LastAck
+                        | tcp::State::Closing
+                        | tcp::State::TimeWait
+                )
+            {
+                connection.read_state = ReadState::Draining;
+            }
+            // CLOSED also results from a reset, which leaves unacknowledged
+            // data in smoltcp's send queue. Never report that as a drained write.
+            if socket.state() == tcp::State::Closed && socket.send_queue() > 0 {
+                tracing::debug!(
+                    id,
+                    unacknowledged_bytes = socket.send_queue(),
+                    "TCP closed before upload was acknowledged"
+                );
+                close.push(id);
+                continue;
+            }
+            if connection.write_closed
+                && (matches!(socket.state(), tcp::State::FinWait2 | tcp::State::TimeWait)
+                    || (socket.state() == tcp::State::Closed
+                        && connection.read_state != ReadState::Open))
+                && let Some(finished) = connection.write_finished.take()
+            {
+                let _ = finished.send(());
+            }
+            if !socket.is_active()
+                && (connection.read_state != ReadState::Draining
+                    || (socket.state() == tcp::State::Closed && !connection.write_closed))
+            {
                 tracing::debug!(id, state = ?socket.state(), "userspace TCP socket became inactive");
                 close.push(id);
                 continue;
@@ -440,6 +499,24 @@ impl Engine {
                             close.push(id);
                             continue;
                         }
+                    }
+                }
+                // Dropping the write half queues FIN only after all accepted data
+                // has entered smoltcp, which drains its own send buffer before FIN.
+                if !connection.write_closed
+                    && connection.writes.is_closed()
+                    && connection.writes.is_empty()
+                    && connection.write_queue.is_empty()
+                {
+                    socket.close();
+                    connection.write_closed = true;
+                }
+                if connection.read_state == ReadState::Draining && !socket.may_recv() {
+                    if connection.events.capacity() > 0 {
+                        let _ = connection.events.try_send(StreamEvent::ReadClosed);
+                        connection.read_state = ReadState::Closed;
+                    } else {
+                        connection.wake_needed.store(true, Ordering::Release);
                     }
                 }
                 if socket.can_recv() && connection.events.capacity() == 0 {
@@ -487,6 +564,14 @@ impl Engine {
         if self.connections.values().any(|connection| {
             let socket = self.sockets.get::<tcp::Socket>(connection.socket);
             connection.events.is_closed()
+                || (!connection.write_closed
+                    && connection.writes.is_closed()
+                    && connection.writes.is_empty()
+                    && connection.write_queue.is_empty())
+                || (connection.established
+                    && connection.read_state == ReadState::Draining
+                    && !socket.may_recv()
+                    && connection.events.capacity() > 0)
                 || (socket.can_recv() && connection.events.capacity() > 0)
                 || (socket.can_send()
                     && (!connection.write_queue.is_empty() || !connection.writes.is_empty()))
@@ -573,18 +658,6 @@ async fn wait_for_timer(delay: Option<Duration>) {
         Some(delay) if delay.is_zero() => tokio::task::yield_now().await,
         Some(delay) => time::sleep(delay).await,
         None => std::future::pending().await,
-    }
-}
-
-fn reject_without_tunnel(command: Command) {
-    match command {
-        Command::Resolve(_, _, reply) => {
-            let _ = reply.send(Err(StackError::VpnDown));
-        }
-        Command::Connect(_, _, events, _, _) => {
-            let _ = events.try_send(StreamEvent::Closed);
-        }
-        _ => {}
     }
 }
 

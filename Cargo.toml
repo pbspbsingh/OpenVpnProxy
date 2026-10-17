@@ -42,6 +42,7 @@ psl = "2.1.238"
 idna = "1.1.0"
 
 # Async I/O and task scheduling
+bytes = "1.12.1"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util", "signal", "fs"] }
 
 # Structured logging

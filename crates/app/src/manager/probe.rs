@@ -73,7 +73,7 @@ pub(super) async fn measure_with_session(
             }
             received = session.step() => {
                 if let Some(packet) = received? {
-                    stack.packet(&packet)?;
+                    stack.packet(packet)?;
                 }
             }
         }

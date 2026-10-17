@@ -9,6 +9,7 @@ publish.workspace = true
 smoltcp.workspace = true
 
 # Async worker and channels
+bytes.workspace = true
 tokio.workspace = true
 
 # Typed errors and diagnostics

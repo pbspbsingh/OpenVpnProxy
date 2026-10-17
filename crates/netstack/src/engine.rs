@@ -1,9 +1,10 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::time::{Duration, Instant as Clock};
 
+use bytes::{Buf, Bytes};
 use smoltcp::iface::{Config, Interface, Route, SocketHandle, SocketSet};
 use smoltcp::socket::{dns, tcp};
 use smoltcp::time::Instant;
@@ -150,8 +151,8 @@ struct Connection {
     socket: SocketHandle,
     events: mpsc::Sender<StreamEvent>,
     wake_needed: Arc<AtomicBool>,
-    writes: mpsc::Receiver<Vec<u8>>,
-    write_queue: VecDeque<u8>,
+    writes: mpsc::Receiver<Bytes>,
+    write_queue: Bytes,
     established: bool,
     deadline: Clock,
 }
@@ -314,7 +315,7 @@ impl Engine {
                                 events,
                                 wake_needed,
                                 writes,
-                                write_queue: VecDeque::new(),
+                                write_queue: Bytes::new(),
                                 established: false,
                                 deadline: Clock::now() + TCP_CONNECT_TIMEOUT,
                             },
@@ -418,19 +419,21 @@ impl Engine {
                     && connection.write_queue.is_empty()
                     && let Ok(data) = connection.writes.try_recv()
                 {
-                    connection.write_queue.extend(data);
+                    connection.write_queue = data;
                     self.stats.max_write_queue_bytes = self
                         .stats
                         .max_write_queue_bytes
                         .max(connection.write_queue.len());
                 }
                 if socket.can_send() && !connection.write_queue.is_empty() {
-                    let data = connection.write_queue.make_contiguous();
-                    match socket.send_slice(data) {
+                    match socket.send_slice(&connection.write_queue) {
                         Ok(written) => {
                             self.stats.tcp_write_bytes += written as u64;
                             tracing::trace!(id, bytes = written, "userspace TCP data queued");
-                            connection.write_queue.drain(..written);
+                            connection.write_queue.advance(written);
+                            if connection.write_queue.is_empty() {
+                                connection.write_queue = Bytes::new();
+                            }
                         }
                         Err(error) => {
                             tracing::warn!(id, ?error, "userspace TCP send failed");
@@ -444,15 +447,17 @@ impl Engine {
                     connection.wake_needed.store(true, Ordering::Release);
                 }
                 if socket.can_recv() && connection.events.capacity() > 0 {
-                    let mut buffer = vec![0; TCP_READ_BUFFER_BYTES];
-                    match socket.recv_slice(&mut buffer) {
-                        Ok(read) => {
+                    match socket.recv(|data| {
+                        let count = data.len().min(TCP_READ_BUFFER_BYTES);
+                        (count, data[..count].to_vec())
+                    }) {
+                        Ok(buffer) => {
+                            let read = buffer.len();
                             self.stats.tcp_read_bytes += read as u64;
                             if read == TCP_READ_BUFFER_BYTES {
                                 self.stats.full_tcp_reads += 1;
                             }
                             tracing::trace!(id, bytes = read, "userspace TCP data received");
-                            buffer.truncate(read);
                             if read > 0
                                 && connection
                                     .events

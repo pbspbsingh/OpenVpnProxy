@@ -13,6 +13,12 @@ use crate::stack::{Stack, StreamEvents};
 const MSS: usize = 1360;
 const TEST_TIMEOUT: Duration = Duration::from_secs(2);
 
+fn test_payload(length: usize) -> Vec<u8> {
+    (0..length)
+        .map(|index| (index ^ (index >> 8) ^ (index >> 16)) as u8)
+        .collect()
+}
+
 struct Peer {
     stack: Stack,
     outbound: mpsc::Receiver<Vec<u8>>,
@@ -64,9 +70,7 @@ impl Peer {
     }
 
     fn send(&mut self, ack: i32, payload: &[u8]) {
-        self.stack
-            .packet(&self.packet(ack, false, payload))
-            .unwrap();
+        self.stack.packet(self.packet(ack, false, payload)).unwrap();
         self.next_seq = self.next_seq.wrapping_add(payload.len() as i32);
     }
 
@@ -138,7 +142,7 @@ async fn connected() -> (Stack, u64, StreamEvents, Peer) {
     peer.port = tcp.src_port();
     peer.initial_ack = tcp.seq_number().0.wrapping_add(1);
     stack
-        .packet(&peer.packet(peer.initial_ack, true, &[]))
+        .packet(peer.packet(peer.initial_ack, true, &[]))
         .unwrap();
     peer.next_seq += 1;
     assert!(matches!(
@@ -160,7 +164,7 @@ fn ready_work_yields_without_a_timer() {
 #[tokio::test]
 async fn blocked_upload_receives_responses_and_resumes_after_ack() {
     let (stack, id, mut events, mut peer) = connected().await;
-    let payload: Vec<u8> = (0..1024 * 1024).map(|index| index as u8).collect();
+    let payload = test_payload(1024 * 1024);
     let expected = payload.clone();
     let writer = events.writer();
     let upload = tokio::spawn(async move { writer.write(payload).await });
@@ -222,7 +226,7 @@ async fn blocked_upload_is_released_when_connection_ends() {
 async fn buffered_download_resumes_after_consumer_queue_fills() {
     let (stack, id, mut events, mut peer) = connected().await;
     let total = 32 * MSS + 60 * 1024;
-    let expected: Vec<u8> = (0..total).map(|index| index as u8).collect();
+    let expected = test_payload(total);
     for chunk in expected.chunks(MSS) {
         peer.send(peer.initial_ack, chunk);
     }
@@ -238,11 +242,40 @@ async fn buffered_download_resumes_after_consumer_queue_fills() {
     let mut received = Vec::new();
     while received.len() < total {
         match time::timeout(TEST_TIMEOUT, events.recv()).await.unwrap() {
-            Some(StreamEvent::Data(data)) => received.extend(data),
+            Some(StreamEvent::Data(data)) => {
+                assert_eq!(data.capacity(), data.len());
+                assert!(data.len() <= TCP_READ_BUFFER_BYTES);
+                received.extend(data);
+            }
             event => panic!("unexpected connection event: {event:?}"),
         }
     }
     assert_eq!(received, expected);
     assert!(stack.is_ready());
+    stack.close(id).unwrap();
+}
+
+#[tokio::test]
+async fn download_preserves_data_across_receive_buffer_wraps() {
+    let (stack, id, mut events, mut peer) = connected().await;
+    let expected = test_payload(TCP_RECEIVE_BUFFER_BYTES * 2 + 17);
+    let mut received = Vec::new();
+    for batch in expected.chunks(60 * 1024) {
+        for chunk in batch.chunks(MSS) {
+            peer.send(peer.initial_ack, chunk);
+        }
+        let target = received.len() + batch.len();
+        while received.len() < target {
+            match time::timeout(TEST_TIMEOUT, events.recv()).await.unwrap() {
+                Some(StreamEvent::Data(data)) => {
+                    assert_eq!(data.capacity(), data.len());
+                    assert!(data.len() <= TCP_READ_BUFFER_BYTES);
+                    received.extend(data);
+                }
+                event => panic!("unexpected connection event: {event:?}"),
+            }
+        }
+    }
+    assert_eq!(received, expected);
     stack.close(id).unwrap();
 }

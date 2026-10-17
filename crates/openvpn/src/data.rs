@@ -1,6 +1,6 @@
 use crate::error::{Error, Result, require};
-use aes_gcm::aead::{Aead, KeyInit, Payload};
-use aes_gcm::{Aes256Gcm, Nonce};
+use aes_gcm::aead::{AeadInPlace, KeyInit};
+use aes_gcm::{Aes256Gcm, Nonce, Tag};
 
 use crate::protocol::{
     DATA_KEY_MATERIAL_BYTES, DATA_V2_OPCODE, GCM_TAG_BYTES, MAX_KEY_ID, REPLAY_WINDOW_BITS,
@@ -84,20 +84,20 @@ impl DataChannel {
         let mut nonce = [0; GCM_NONCE_BYTES];
         nonce[..4].copy_from_slice(&header[PEER_ID_BYTES + 1..DATA_HEADER_BYTES]);
         nonce[4..].copy_from_slice(&self.send_iv);
-        let encrypted = self
+        let payload_start = DATA_HEADER_BYTES + GCM_TAG_BYTES;
+        let mut wire = Vec::with_capacity(payload_start + plain.len());
+        wire.extend_from_slice(&header);
+        wire.resize(payload_start, 0);
+        wire.extend_from_slice(plain);
+        let tag = self
             .send
-            .encrypt(
+            .encrypt_in_place_detached(
                 Nonce::from_slice(&nonce),
-                Payload {
-                    msg: plain,
-                    aad: &header,
-                },
+                &header,
+                &mut wire[payload_start..],
             )
             .map_err(|_| Error::Crypto)?;
-        let tag_start = encrypted.len() - GCM_TAG_BYTES;
-        let mut wire = header.to_vec();
-        wire.extend_from_slice(&encrypted[tag_start..]);
-        wire.extend_from_slice(&encrypted[..tag_start]);
+        wire[DATA_HEADER_BYTES..payload_start].copy_from_slice(&tag);
         Ok(wire)
     }
 
@@ -126,16 +126,14 @@ impl DataChannel {
         let mut nonce = [0; GCM_NONCE_BYTES];
         nonce[..4].copy_from_slice(&wire[PEER_ID_BYTES + 1..DATA_HEADER_BYTES]);
         nonce[4..].copy_from_slice(&self.recv_iv);
-        let mut encrypted = wire[DATA_HEADER_BYTES + GCM_TAG_BYTES..].to_vec();
-        encrypted.extend_from_slice(&wire[DATA_HEADER_BYTES..DATA_HEADER_BYTES + GCM_TAG_BYTES]);
-        let plain = self
-            .recv
-            .decrypt(
+        let payload_start = DATA_HEADER_BYTES + GCM_TAG_BYTES;
+        let mut plain = wire[payload_start..].to_vec();
+        self.recv
+            .decrypt_in_place_detached(
                 Nonce::from_slice(&nonce),
-                Payload {
-                    msg: &encrypted,
-                    aad: &wire[..DATA_HEADER_BYTES],
-                },
+                &wire[..DATA_HEADER_BYTES],
+                &mut plain,
+                Tag::from_slice(&wire[DATA_HEADER_BYTES..payload_start]),
             )
             .map_err(|_| Error::DataAuthenticationFailed)?;
         if id > self.highest_received {
@@ -156,6 +154,57 @@ impl DataChannel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aes_gcm::aead::{Aead, Payload};
+
+    #[test]
+    fn detached_crypto_matches_existing_wire_format() {
+        let key = std::array::from_fn(|index| index as u8);
+        let mut client = DataChannel::new(&key, 0x123456, 3).unwrap();
+        let mut server = DataChannel::new(&key, 0x123456, 3).unwrap();
+        std::mem::swap(&mut server.send, &mut server.recv);
+        std::mem::swap(&mut server.send_iv, &mut server.recv_iv);
+        let reference = Aes256Gcm::new_from_slice(&key[..CIPHER_KEY_BYTES]).unwrap();
+        for (index, length) in [0, 1, 15, 16, 17, 1360, 1400].into_iter().enumerate() {
+            let plain: Vec<u8> = (0..length).map(|byte| byte as u8).collect();
+            let header = [0x4b, 0x12, 0x34, 0x56, 0, 0, 0, index as u8 + 1];
+            let mut nonce = [0; GCM_NONCE_BYTES];
+            nonce[..4].copy_from_slice(&header[4..]);
+            nonce[4..].copy_from_slice(&key[64..72]);
+            let encrypted = reference
+                .encrypt(
+                    Nonce::from_slice(&nonce),
+                    Payload {
+                        msg: &plain,
+                        aad: &header,
+                    },
+                )
+                .unwrap();
+            let tag_start = encrypted.len() - GCM_TAG_BYTES;
+            let mut expected = header.to_vec();
+            expected.extend_from_slice(&encrypted[tag_start..]);
+            expected.extend_from_slice(&encrypted[..tag_start]);
+            assert_eq!(client.encrypt(&plain).unwrap(), expected);
+            assert_eq!(server.decrypt(&expected).unwrap(), plain);
+        }
+    }
+
+    #[test]
+    fn failed_authentication_does_not_advance_replay_window() {
+        let key = [3; DATA_KEY_MATERIAL_BYTES];
+        let mut client = DataChannel::new(&key, 12, 0).unwrap();
+        let mut server = DataChannel::new(&key, 12, 0).unwrap();
+        let wire = client.encrypt(b"authenticated payload").unwrap();
+        for offset in [7, DATA_HEADER_BYTES, DATA_HEADER_BYTES + GCM_TAG_BYTES] {
+            let mut corrupted = wire.clone();
+            corrupted[offset] ^= 0x10;
+            assert!(matches!(
+                server.decrypt(&corrupted),
+                Err(Error::DataAuthenticationFailed)
+            ));
+        }
+        assert_eq!(server.decrypt(&wire).unwrap(), b"authenticated payload");
+        assert!(matches!(server.decrypt(&wire), Err(Error::Replay)));
+    }
 
     #[test]
     fn data_channel_round_trip_and_replay() {

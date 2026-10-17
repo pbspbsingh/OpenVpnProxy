@@ -379,10 +379,11 @@ async fn drive_host(
                 received = session.step() => {
                     if let Some(packet) = received? {
                         tracing::trace!(host_id = id, %endpoint, bytes = packet.len(), "received VPN packet");
-                        stack.packet(&packet)?;
-                        traffic.add_rx(packet.len());
+                        let packet_bytes = packet.len();
+                        stack.packet(packet)?;
+                        traffic.add_rx(packet_bytes);
                         received_packets += 1;
-                        received_bytes += packet.len() as u64;
+                        received_bytes += packet_bytes as u64;
                     }
                 }
                 _ = status.tick() => {

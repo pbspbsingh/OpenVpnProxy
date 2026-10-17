@@ -938,6 +938,7 @@ dependencies = [
 name = "ovpn-netstack"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "smoltcp",
  "thiserror",
  "tokio",

@@ -407,7 +407,9 @@ async fn transfer(
     } = timing;
     let (mut reader, mut writer) = stream.into_split();
     let tunnel_writer = events.writer();
-    let mut pending_write = None;
+    let pending_write = tunnel_writer.write(Vec::new());
+    tokio::pin!(pending_write);
+    let mut writing = false;
     let transfer_started = Instant::now();
     let mut client_bytes = 0_u64;
     let mut server_bytes = 0_u64;
@@ -426,7 +428,7 @@ async fn transfer(
     let transfer = async {
         loop {
             tokio::select! {
-                read = reader.read(&mut buffer), if pending_write.is_none() => {
+                read = reader.read(&mut buffer), if !writing => {
                     match read {
                         Ok(0) => {
                             tracing::debug!(id, "SOCKS5 client closed its connection");
@@ -435,16 +437,17 @@ async fn transfer(
                         }
                         Ok(count) => {
                             tracing::trace!(id, bytes = count, "forwarding SOCKS5 client data into VPN");
-                            pending_write = Some(Box::pin(tunnel_writer.write(buffer[..count].to_vec())));
+                            pending_write.set(tunnel_writer.write(buffer[..count].to_vec()));
+                            writing = true;
                             first_client_data.get_or_insert_with(Instant::now);
                             client_bytes += count as u64;
                         }
                         Err(error) => return Err(SocksError::Io(error)),
                     }
                 }
-                result = async { pending_write.as_mut().expect("pending upload").await }, if pending_write.is_some() => {
+                result = &mut pending_write, if writing => {
                     result?;
-                    pending_write = None;
+                    writing = false;
                 }
                 event = events.recv() => match event {
                     Some(StreamEvent::Data(data)) => {

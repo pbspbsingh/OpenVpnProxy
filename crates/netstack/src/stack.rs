@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
+use bytes::Bytes;
 use tokio::sync::{Notify, mpsc, oneshot};
 use tokio::time;
 
@@ -45,24 +46,24 @@ impl StreamEvents {
 /// Uploads bytes to one virtual TCP connection, waiting when its queue is full.
 #[derive(Clone)]
 pub struct StreamWriter {
-    tx: mpsc::Sender<Vec<u8>>,
+    tx: mpsc::Sender<Bytes>,
     wake: Arc<Notify>,
 }
 
 impl StreamWriter {
     /// Queues bytes, applying backpressure independently of other streams.
     /// Canceling a write can leave a prefix queued for transmission.
+    /// Large writes share their allocation until their queued chunks are consumed.
     pub async fn write(&self, data: Vec<u8>) -> Result<()> {
-        if data.len() <= STREAM_WRITE_CHUNK_BYTES {
-            return self.enqueue(data).await;
-        }
-        for chunk in data.chunks(STREAM_WRITE_CHUNK_BYTES) {
-            self.enqueue(chunk.to_vec()).await?;
+        let mut data = Bytes::from(data);
+        while !data.is_empty() {
+            let count = data.len().min(STREAM_WRITE_CHUNK_BYTES);
+            self.enqueue(data.split_to(count)).await?;
         }
         Ok(())
     }
 
-    async fn enqueue(&self, data: Vec<u8>) -> Result<()> {
+    async fn enqueue(&self, data: Bytes) -> Result<()> {
         self.tx
             .send(data)
             .await
@@ -185,11 +186,11 @@ impl Stack {
     }
 
     /// Delivers a decrypted IP packet from the VPN server.
-    pub fn packet(&self, packet: &[u8]) -> Result<()> {
+    pub fn packet(&self, packet: Vec<u8>) -> Result<()> {
         if !self.is_ready() {
             return Err(StackError::VpnDown);
         }
-        if self.tx.try_send(Command::Packet(packet.to_vec())).is_err() {
+        if self.tx.try_send(Command::Packet(packet)).is_err() {
             self.phase
                 .store(StackPhase::Failed as u8, Ordering::Release);
             tracing::error!(
@@ -299,7 +300,7 @@ pub(crate) enum Command {
         SocketAddr,
         mpsc::Sender<StreamEvent>,
         Arc<AtomicBool>,
-        mpsc::Receiver<Vec<u8>>,
+        mpsc::Receiver<Bytes>,
     ),
     Close(u64),
 }

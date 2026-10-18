@@ -87,6 +87,7 @@ impl Worker {
         loop {
             let now =
                 Instant::from_millis(started.elapsed().as_millis().min(i64::MAX as u128) as i64);
+            let output_blocked = engine.device.output_blocked || engine.io.capacity() == 0;
             let delay = engine.next_delay(now);
             let timer_started = Clock::now();
             let event = tokio::select! {
@@ -94,7 +95,12 @@ impl Worker {
                 command = commands.recv() => Wake::Command(command),
                 _ = wait_for_timer(delay) => Wake::Timer,
                 _ = wake.notified() => Wake::Consumer,
-                _ = status.tick() => { engine.log_status(); continue; }
+                permit = engine.io.reserve(), if output_blocked => {
+                    drop(permit);
+                    Wake::Output
+                }
+                _ = engine.io.closed() => Wake::Output,
+                _ = status.tick() => Wake::Status,
             };
             match &event {
                 Wake::Command(_) => engine.stats.command_wakeups += 1,
@@ -108,11 +114,16 @@ impl Worker {
                     }
                 }
                 Wake::Consumer => engine.stats.consumer_wakeups += 1,
+                Wake::Output | Wake::Status => {}
             }
             match event {
                 Wake::Command(Some(command)) => engine.handle(command),
                 Wake::Command(None) => break,
-                Wake::Timer | Wake::Consumer => {}
+                Wake::Status => {
+                    engine.log_status();
+                    continue;
+                }
+                Wake::Timer | Wake::Consumer | Wake::Output => {}
             }
             let now =
                 Instant::from_millis(started.elapsed().as_millis().min(i64::MAX as u128) as i64);
@@ -136,8 +147,7 @@ struct StackStats {
     polls: u64,
     inbound_packets: u64,
     inbound_bytes: u64,
-    outbound_packets: u64,
-    outbound_bytes: u64,
+    inbound_dropped: u64,
     tcp_read_bytes: u64,
     tcp_write_bytes: u64,
     full_tcp_reads: u64,
@@ -197,7 +207,7 @@ struct Engine {
 
 impl Engine {
     fn new(id: u64, config: TunnelConfig, io: mpsc::Sender<Vec<u8>>) -> Result<Self> {
-        let mut device = PacketDevice::new(config.mtu);
+        let mut device = PacketDevice::new(config.mtu, io.clone());
         let mut iface =
             Interface::new(Config::new(HardwareAddress::Ip), &mut device, Instant::ZERO);
         let mut inserted = false;
@@ -264,7 +274,9 @@ impl Engine {
                 self.stats.inbound_packets += 1;
                 self.stats.inbound_bytes += packet.len() as u64;
                 tracing::trace!(bytes = packet.len(), "packet delivered to userspace stack");
-                self.device.inbound.push_back(packet);
+                if !self.device.receive_packet(packet) {
+                    self.stats.inbound_dropped += 1;
+                }
             }
             Command::Resolve(host, version, reply) => {
                 if !self.dns_available {
@@ -367,6 +379,9 @@ impl Engine {
     }
 
     fn tick(&mut self, now: Instant) -> Result<()> {
+        if self.io.is_closed() {
+            return Err(StackError::PacketDelivery);
+        }
         let started = Clock::now();
         self.stats.polls += 1;
         // smoltcp also checks its timeout on idle sockets. Enable it only while
@@ -377,15 +392,8 @@ impl Engine {
             let needs_progress = !connection.established || socket.send_queue() > 0;
             socket.set_timeout(needs_progress.then_some(TCP_PROGRESS_TIMEOUT));
         }
+        self.device.output_blocked = false;
         self.iface.poll(now, &mut self.device, &mut self.sockets);
-        while let Some(packet) = self.device.outbound.pop_front() {
-            self.stats.outbound_packets += 1;
-            self.stats.outbound_bytes += packet.len() as u64;
-            tracing::trace!(bytes = packet.len(), "userspace stack produced VPN packet");
-            self.io
-                .try_send(packet)
-                .map_err(|_| StackError::PacketDelivery)?;
-        }
         let mut pending = Vec::new();
         for request in self.pending_dns.drain(..) {
             let socket = self.sockets.get_mut::<dns::Socket>(self.dns_socket);
@@ -607,10 +615,16 @@ impl Engine {
                     .map(|connection| connection.deadline.saturating_duration_since(current)),
             )
             .min();
-        let protocol_delay = self
-            .iface
-            .poll_delay(now, &self.sockets)
-            .map(|delay| Duration::from_millis(delay.total_millis()));
+        // A full device remains immediately pollable inside smoltcp. Wait for
+        // channel capacity instead of spinning on protocol work it cannot send.
+        // Application deadlines still run, so stalled connects/DNS can expire.
+        let protocol_delay = if self.io.capacity() == 0 {
+            None
+        } else {
+            self.iface
+                .poll_delay(now, &self.sockets)
+                .map(|delay| Duration::from_millis(delay.total_millis()))
+        };
         protocol_delay.into_iter().chain(application_delay).min()
     }
 
@@ -618,8 +632,9 @@ impl Engine {
         let window = self.last_status.elapsed();
         self.last_status = Clock::now();
         let stats = std::mem::take(&mut self.stats);
-        if stats.inbound_packets == 0 && stats.outbound_packets == 0 && self.connections.is_empty()
-        {
+        let outbound_packets = std::mem::take(&mut self.device.transmitted_packets);
+        let outbound_bytes = std::mem::take(&mut self.device.transmitted_bytes);
+        if stats.inbound_packets == 0 && outbound_packets == 0 && self.connections.is_empty() {
             return;
         }
         tracing::debug!(
@@ -630,8 +645,9 @@ impl Engine {
             polls = stats.polls,
             inbound_packets = stats.inbound_packets,
             inbound_bytes = stats.inbound_bytes,
-            outbound_packets = stats.outbound_packets,
-            outbound_bytes = stats.outbound_bytes,
+            inbound_dropped = stats.inbound_dropped,
+            outbound_packets,
+            outbound_bytes,
             tcp_read_bytes = stats.tcp_read_bytes,
             tcp_write_bytes = stats.tcp_write_bytes,
             full_tcp_reads = stats.full_tcp_reads,
@@ -666,6 +682,8 @@ enum Wake {
     Command(Option<Command>),
     Timer,
     Consumer,
+    Output,
+    Status,
 }
 
 async fn wait_for_timer(delay: Option<Duration>) {

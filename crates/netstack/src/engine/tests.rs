@@ -15,6 +15,17 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 const MSS: usize = 1360;
 const TEST_TIMEOUT: Duration = Duration::from_secs(2);
 
+fn tunnel_config() -> TunnelConfig {
+    TunnelConfig::new(
+        "10.8.0.2".parse().unwrap(),
+        "10.8.0.1".parse().unwrap(),
+        vec![],
+        1400,
+        None,
+    )
+    .unwrap()
+}
+
 fn test_payload(length: usize) -> Vec<u8> {
     (0..length)
         .map(|index| (index ^ (index >> 8) ^ (index >> 16)) as u8)
@@ -211,6 +222,212 @@ fn ready_work_yields_without_a_timer() {
     assert_eq!(wait.as_mut().poll(&mut context), Poll::Pending);
     // No runtime or clock advancement is needed to resume ready work.
     assert_eq!(wait.as_mut().poll(&mut context), Poll::Ready(()));
+}
+
+#[test]
+fn concurrent_uploads_survive_full_packet_output_and_resume_without_data_loss() {
+    let (io, mut outbound) = mpsc::channel(1024);
+    let mut engine = Engine::new(0, tunnel_config(), io).unwrap();
+    let mut clients = Vec::new();
+    let mut peers = HashMap::new();
+    let mut now = 0;
+    for id in 0..128 {
+        let (events, received) = mpsc::channel(32);
+        let (writer, writes) = mpsc::channel(32);
+        let (write_finished, finished) = oneshot::channel();
+        clients.push((received, writer, finished));
+        engine.handle(Command::Connect(ConnectRequest {
+            id,
+            address: "1.1.1.1:443".parse().unwrap(),
+            events,
+            wake_needed: Arc::new(AtomicBool::new(false)),
+            writes,
+            write_finished,
+        }));
+        engine.tick(Instant::from_millis(now)).unwrap();
+        let syn = outbound.try_recv().unwrap();
+        let ip = Ipv4Packet::new_checked(&syn[..]).unwrap();
+        let tcp = TcpPacket::new_checked(ip.payload()).unwrap();
+        assert!(tcp.syn());
+        let port = tcp.src_port();
+        let ack = tcp.seq_number().0.wrapping_add(1);
+        peers.insert(port, (ack, Vec::new()));
+        engine.handle(Command::Packet(peer_packet(
+            port,
+            1000,
+            ack,
+            TcpControl::Syn,
+            &[],
+        )));
+        now += 1;
+        engine.tick(Instant::from_millis(now)).unwrap();
+        while outbound.try_recv().is_ok() {}
+        assert!(engine.connections[&id].established);
+        now += 1;
+    }
+    let expected = test_payload(TCP_SEND_BUFFER_BYTES);
+    for (_, writer, _) in &clients {
+        for chunk in expected.chunks(crate::stack::STREAM_WRITE_CHUNK_BYTES) {
+            writer.try_send(Bytes::copy_from_slice(chunk)).unwrap();
+        }
+    }
+    // A slow tunnel fills its output channel. The previously failing burst must
+    // keep every connection alive, with uploads retained in their bounded queues.
+    for _ in 0..10 {
+        engine.tick(Instant::from_millis(now)).unwrap();
+        now += 1;
+    }
+    assert_eq!(outbound.len(), 1024);
+    assert_eq!(engine.connections.len(), clients.len());
+    assert_eq!(engine.next_delay(Instant::from_millis(now)), None);
+
+    for _ in 0..100 {
+        while let Ok(raw) = outbound.try_recv() {
+            let ip = Ipv4Packet::new_checked(&raw[..]).unwrap();
+            let tcp = TcpPacket::new_checked(ip.payload()).unwrap();
+            if tcp.payload().is_empty() {
+                continue;
+            }
+            let (initial_ack, uploaded) = peers.get_mut(&tcp.src_port()).unwrap();
+            assert_eq!(
+                tcp.seq_number().0,
+                initial_ack.wrapping_add(uploaded.len() as i32)
+            );
+            uploaded.extend_from_slice(tcp.payload());
+            engine.handle(Command::Packet(peer_packet(
+                tcp.src_port(),
+                1001,
+                initial_ack.wrapping_add(uploaded.len() as i32),
+                TcpControl::None,
+                &[],
+            )));
+        }
+        engine.tick(Instant::from_millis(now)).unwrap();
+        now += 1;
+        if peers
+            .values()
+            .all(|(_, uploaded)| uploaded.len() == expected.len())
+        {
+            break;
+        }
+    }
+    for (_, uploaded) in peers.values() {
+        assert_eq!(uploaded, &expected);
+    }
+    assert_eq!(engine.connections.len(), clients.len());
+    assert_eq!(engine.stats.inbound_dropped, 0);
+}
+
+#[test]
+fn incoming_packets_remain_bounded_during_an_output_stall() {
+    let (io, mut outbound) = mpsc::channel(1);
+    io.try_send(vec![]).unwrap();
+    let mut engine = Engine::new(0, tunnel_config(), io).unwrap();
+    // ACKs for a closed port generate RSTs, exercising the device's coupled
+    // receive/transmit tokens while its output channel is full.
+    for _ in 0..2048 {
+        engine.handle(Command::Packet(peer_packet(
+            50_000,
+            1000,
+            1,
+            TcpControl::None,
+            &[],
+        )));
+    }
+    engine.tick(Instant::ZERO).unwrap();
+    assert_eq!(engine.stats.inbound_dropped, 1024);
+    assert_eq!(engine.next_delay(Instant::ZERO), None);
+    outbound.try_recv().unwrap();
+    for now in 1..=1024 {
+        engine.tick(Instant::from_millis(now)).unwrap();
+        let raw = outbound.try_recv().unwrap();
+        let ip = Ipv4Packet::new_checked(&raw[..]).unwrap();
+        let tcp = TcpPacket::new_checked(ip.payload()).unwrap();
+        assert!(tcp.rst());
+    }
+    engine.tick(Instant::from_millis(1025)).unwrap();
+    assert!(outbound.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn output_capacity_wakes_worker_and_full_output_does_not_block_shutdown() {
+    let (io, mut outbound) = mpsc::channel(1);
+    let owner = StackOwner::start(tunnel_config(), io).await.unwrap();
+    let stack = owner.client();
+    let (_first_id, _first_events) = stack.open("1.1.1.1:443".parse().unwrap()).await.unwrap();
+    let (_second_id, _second_events) = stack.open("1.1.1.1:443".parse().unwrap()).await.unwrap();
+    // This reply proves both preceding connect commands have been processed.
+    assert!(matches!(
+        stack.resolve("barrier.test", IpVersion::V4).await,
+        Err(StackError::NoDnsServer)
+    ));
+    assert_eq!(outbound.len(), 1);
+    let first = outbound.recv().await.unwrap();
+    let second = time::timeout(TEST_TIMEOUT, outbound.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let first_ip = Ipv4Packet::new_checked(&first[..]).unwrap();
+    let second_ip = Ipv4Packet::new_checked(&second[..]).unwrap();
+    let first_tcp = TcpPacket::new_checked(first_ip.payload()).unwrap();
+    let second_tcp = TcpPacket::new_checked(second_ip.payload()).unwrap();
+    assert!(first_tcp.syn() && second_tcp.syn());
+    assert_ne!(first_tcp.src_port(), second_tcp.src_port());
+    assert!(stack.is_ready());
+
+    let (_third_id, _third_events) = stack.open("1.1.1.1:443".parse().unwrap()).await.unwrap();
+    assert!(matches!(
+        stack.resolve("barrier.test", IpVersion::V4).await,
+        Err(StackError::NoDnsServer)
+    ));
+    assert_eq!(outbound.len(), 1);
+    time::timeout(TEST_TIMEOUT, owner.shutdown()).await.unwrap();
+    assert!(!stack.is_ready());
+}
+
+#[tokio::test]
+async fn retransmissions_resume_when_a_previously_full_output_is_drained() {
+    let (io, mut outbound) = mpsc::channel(1);
+    let owner = StackOwner::start(tunnel_config(), io).await.unwrap();
+    let stack = owner.client();
+    let (_id, _events) = stack.open("1.1.1.1:443".parse().unwrap()).await.unwrap();
+    assert!(matches!(
+        stack.resolve("barrier.test", IpVersion::V4).await,
+        Err(StackError::NoDnsServer)
+    ));
+    let first = outbound.recv().await.unwrap();
+    // With no new commands or incoming packets, capacity recovery must restore
+    // the protocol timer so an unanswered SYN is retransmitted.
+    let retry = time::timeout(TEST_TIMEOUT, outbound.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let first_ip = Ipv4Packet::new_checked(&first[..]).unwrap();
+    let retry_ip = Ipv4Packet::new_checked(&retry[..]).unwrap();
+    let first_tcp = TcpPacket::new_checked(first_ip.payload()).unwrap();
+    let retry_tcp = TcpPacket::new_checked(retry_ip.payload()).unwrap();
+    assert!(first_tcp.syn() && retry_tcp.syn());
+    assert_eq!(first_tcp.src_port(), retry_tcp.src_port());
+    assert_eq!(first_tcp.seq_number(), retry_tcp.seq_number());
+    assert!(stack.is_ready());
+    owner.shutdown().await;
+}
+
+#[tokio::test]
+async fn closed_packet_output_stops_an_otherwise_idle_worker() {
+    let (io, outbound) = mpsc::channel(1);
+    let owner = StackOwner::start(tunnel_config(), io).await.unwrap();
+    let stack = owner.client();
+    drop(outbound);
+    time::timeout(TEST_TIMEOUT, async {
+        while stack.is_ready() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(stack.phase(), StackPhase::Failed);
+    owner.shutdown().await;
 }
 
 #[test]

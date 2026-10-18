@@ -8,9 +8,9 @@ use std::net::IpAddr;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time;
 
-async fn test_stack() -> ovpn_netstack::StackOwner {
-    let (tx, _rx) = mpsc::channel(1024);
-    ovpn_netstack::StackOwner::start(
+async fn test_stack() -> (ovpn_netstack::StackOwner, mpsc::Receiver<Vec<u8>>) {
+    let (tx, rx) = mpsc::channel(1024);
+    let owner = ovpn_netstack::StackOwner::start(
         ovpn_netstack::TunnelConfig::new(
             "10.8.0.2".parse().unwrap(),
             "10.8.0.1".parse().unwrap(),
@@ -22,7 +22,8 @@ async fn test_stack() -> ovpn_netstack::StackOwner {
         tx,
     )
     .await
-    .unwrap()
+    .unwrap();
+    (owner, rx)
 }
 
 fn score(milliseconds: u64) -> LatencyScore {
@@ -53,7 +54,7 @@ async fn session_failure_clears_assignments_and_wakes_a_ranked_standby() {
     };
     let token = actor.state.begin().unwrap();
     let epoch = actor.state.pool_epoch.unwrap();
-    let owner = test_stack().await;
+    let (owner, _output) = test_stack().await;
     actor.update(RoutingUpdate::Ready {
         id: 0,
         epoch,
@@ -152,8 +153,8 @@ async fn old_readiness_and_probe_cannot_replace_current_session() {
             epoch: 2,
             preferred_endpoint: endpoint,
         });
-    let old = test_stack().await;
-    let current = test_stack().await;
+    let (old, _old_output) = test_stack().await;
+    let (current, _current_output) = test_stack().await;
     actor.update(RoutingUpdate::Ready {
         id: 0,
         epoch: 1,
@@ -318,7 +319,7 @@ async fn delivered_selection_releases_host_and_sticky_counts_when_receiver_is_dr
             generation: 1,
         },
     );
-    let stack_owner = test_stack().await;
+    let (stack_owner, _output) = test_stack().await;
     let (reply, received) = oneshot::channel::<SelectReply>();
     reply
         .send(Ok(Some(SelectedRoute {
@@ -360,7 +361,7 @@ async fn dashboard_observes_routes_failures_and_stale_releases_without_querying_
         max_active_hosts: 1,
     });
     let token = actor.state.begin().unwrap();
-    let stack = test_stack().await;
+    let (stack, _output) = test_stack().await;
     let epoch = actor.state.pool_epoch.unwrap();
     actor.update(RoutingUpdate::Ready {
         id: 0,

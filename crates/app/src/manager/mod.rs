@@ -30,7 +30,7 @@ pub(crate) use self::routing::RouterHandle;
 pub(crate) struct ConnectionManager {
     shared: Arc<Shared>,
     stop: watch::Sender<bool>,
-    workers: JoinSet<WorkerExit>,
+    workers: JoinSet<usize>,
     routing: RoutingOwner,
 }
 
@@ -54,7 +54,7 @@ impl ConnectionManager {
         let username: Arc<str> = username.into();
         let password: Arc<str> = password.into();
         let probe_permits = Arc::new(Semaphore::new(INITIAL_PROBE_PARALLELISM));
-        let (baselines, assessments) = benchmark_hosts(
+        let baselines = benchmark_hosts(
             &candidates,
             Arc::clone(&profile),
             Arc::clone(&username),
@@ -69,9 +69,6 @@ impl ConnectionManager {
             .filter_map(|(id, baseline)| baseline.as_ref().map(|(_, score)| (id, score.median)))
             .collect();
         ranked.sort_unstable_by_key(|&(id, latency)| (latency, id));
-        if ranked.is_empty() {
-            bail!("no VPN host passed the startup latency probe");
-        }
         let selected: Vec<_> = ranked
             .iter()
             .take(max_active_vpn_hosts)
@@ -142,15 +139,8 @@ impl ConnectionManager {
             };
             workers.spawn(async move {
                 worker.run().await;
-                WorkerExit::Host(id)
+                id
             });
-        }
-        if !assessments.is_empty() {
-            workers.spawn(finish_assessments(
-                assessments,
-                Arc::clone(&shared),
-                stop.subscribe(),
-            ));
         }
         tracing::info!(
             candidates = candidate_count,
@@ -158,7 +148,7 @@ impl ConnectionManager {
             selected = selected.len(),
             max_active = max_active_vpn_hosts,
             initial_probe_parallelism = INITIAL_PROBE_PARALLELISM,
-            "VPN pool initialized after first healthy host; remaining ranking continues in background"
+            "VPN host pool initialized after all startup assessments; selected hosts connect on demand"
         );
         Ok(Self {
             shared,
@@ -176,15 +166,12 @@ impl ConnectionManager {
 
     /// Observe task completion while serving, rather than discovering failures at shutdown.
     pub(crate) async fn wait_for_failure(&mut self) -> Result<()> {
-        loop {
-            tokio::select! {
-                result = self.routing.wait_for_exit() => return result,
-                result = self.workers.join_next() => match result {
-                    Some(Ok(WorkerExit::Ranked)) => continue,
-                    Some(Ok(WorkerExit::Host(id))) => bail!("VPN host actor {id} stopped unexpectedly"),
-                    Some(Err(error)) => return Err(error.into()),
-                    None => bail!("VPN host actors stopped unexpectedly"),
-                }
+        tokio::select! {
+            result = self.routing.wait_for_exit() => result,
+            result = self.workers.join_next() => match result {
+                Some(Ok(id)) => bail!("VPN host actor {id} stopped unexpectedly"),
+                Some(Err(error)) => Err(error.into()),
+                None => bail!("VPN host actors stopped unexpectedly"),
             }
         }
     }
@@ -202,33 +189,8 @@ impl ConnectionManager {
     }
 }
 
-enum WorkerExit {
-    Host(usize),
-    Ranked,
-}
-
 type ProbeTasks = JoinSet<(usize, Result<(SocketAddr, LatencyScore)>)>;
 type Baselines = Vec<Option<(SocketAddr, LatencyScore)>>;
-
-async fn finish_assessments(
-    mut tasks: ProbeTasks,
-    shared: Arc<Shared>,
-    mut stop: watch::Receiver<bool>,
-) -> WorkerExit {
-    loop {
-        tokio::select! {
-            _ = stop.changed() => break,
-            result = tasks.join_next() => match result {
-                Some(Ok((id, Ok((endpoint, score))))) => shared.baseline(id, endpoint, score).await,
-                Some(Ok((id, Err(error)))) => tracing::warn!(host_id = id, %error, "VPN host baseline unavailable"),
-                Some(Err(error)) => tracing::error!(%error, "VPN baseline task failed"),
-                None => break,
-            }
-        }
-    }
-    // JoinSet drop cancels unfinished probes, whose owners cancel their stacks.
-    WorkerExit::Ranked
-}
 
 async fn benchmark_hosts(
     candidates: &[HostCandidate],
@@ -237,7 +199,7 @@ async fn benchmark_hosts(
     password: Arc<str>,
     dns_override: Option<Ipv4Addr>,
     permits: Arc<Semaphore>,
-) -> Result<(Baselines, ProbeTasks)> {
+) -> Result<Baselines> {
     let started = Instant::now();
     let mut tasks = JoinSet::new();
     for (id, candidate) in candidates.iter().cloned().enumerate() {
@@ -257,23 +219,17 @@ async fn benchmark_hosts(
             (id, result)
         });
     }
-    let result = wait_for_first_healthy(tasks, candidates.len()).await;
-    tracing::info!(hosts = candidates.len(), elapsed = ?started.elapsed(), parallelism = INITIAL_PROBE_PARALLELISM, "initial VPN readiness assessment completed");
+    let result = collect_baselines(tasks, candidates.len()).await;
+    tracing::info!(hosts = candidates.len(), elapsed = ?started.elapsed(), parallelism = INITIAL_PROBE_PARALLELISM, "VPN baseline round completed");
     result
 }
 
-async fn wait_for_first_healthy(
-    mut tasks: ProbeTasks,
-    host_count: usize,
-) -> Result<(Baselines, ProbeTasks)> {
+async fn collect_baselines(mut tasks: ProbeTasks, host_count: usize) -> Result<Baselines> {
     let mut scores: Vec<Option<(SocketAddr, LatencyScore)>> =
         (0..host_count).map(|_| None).collect();
     while let Some(result) = tasks.join_next().await {
         match result {
-            Ok((id, Ok(score))) => {
-                scores[id] = Some(score);
-                break;
-            }
+            Ok((id, Ok(score))) => scores[id] = Some(score),
             Ok((id, Err(error))) => {
                 tracing::warn!(host_id = id, %error, "VPN host baseline unavailable");
             }
@@ -283,7 +239,7 @@ async fn wait_for_first_healthy(
     if scores.iter().all(Option::is_none) {
         bail!("no VPN host passed the startup latency probe");
     }
-    Ok((scores, tasks))
+    Ok(scores)
 }
 
 #[cfg(test)]
@@ -292,12 +248,12 @@ mod tests {
     use std::time::Duration;
 
     #[tokio::test]
-    async fn first_healthy_host_does_not_wait_for_pending_candidates() {
+    async fn startup_waits_for_all_assessments_and_keeps_later_faster_hosts() {
+        let (release, delayed) = tokio::sync::oneshot::channel();
         let mut tasks = JoinSet::new();
-        tasks.spawn(std::future::pending());
         tasks.spawn(async {
             (
-                1,
+                0,
                 Ok((
                     "127.0.0.1:1194".parse().unwrap(),
                     LatencyScore {
@@ -309,20 +265,45 @@ mod tests {
                 )),
             )
         });
-        let (baselines, remaining) =
-            tokio::time::timeout(Duration::from_secs(1), wait_for_first_healthy(tasks, 2))
+        tasks.spawn(async move { (1, delayed.await.unwrap()) });
+        tasks.spawn(async { (2, Err(anyhow!("unreachable"))) });
+        let assessment = collect_baselines(tasks, 3);
+        tokio::pin!(assessment);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), &mut assessment)
                 .await
-                .unwrap()
-                .unwrap();
-        assert!(baselines[0].is_none());
-        assert!(baselines[1].is_some());
-        assert_eq!(remaining.len(), 1);
+                .is_err(),
+            "startup completed before the delayed candidate was assessed"
+        );
+        release
+            .send(Ok((
+                "127.0.0.2:443".parse().unwrap(),
+                LatencyScore {
+                    median: Duration::from_millis(5),
+                    elapsed: Duration::ZERO,
+                    successful_samples: 3,
+                    measured_at: Instant::now(),
+                },
+            )))
+            .unwrap_or_else(|_| panic!("startup stopped before the final assessment"));
+        let baselines = tokio::time::timeout(Duration::from_secs(1), assessment)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            baselines[0].as_ref().unwrap().1.median,
+            Duration::from_millis(20)
+        );
+        let (endpoint, score) = baselines[1].as_ref().unwrap();
+        assert_eq!(*endpoint, "127.0.0.2:443".parse().unwrap());
+        assert_eq!(score.median, Duration::from_millis(5));
+        assert!(baselines[2].is_none());
     }
 
     #[tokio::test]
     async fn startup_fails_when_every_candidate_fails() {
         let mut tasks = JoinSet::new();
         tasks.spawn(async { (0, Err(anyhow!("unreachable"))) });
-        assert!(wait_for_first_healthy(tasks, 1).await.is_err());
+        assert!(collect_baselines(tasks, 1).await.is_err());
     }
 }

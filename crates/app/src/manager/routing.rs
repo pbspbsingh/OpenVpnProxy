@@ -186,7 +186,6 @@ enum RoutingUpdate {
     Probe(usize, u64, anyhow::Result<LatencyScore>, Duration),
     Parked(usize),
     Down(usize, bool),
-    Baseline(usize, SocketAddr, LatencyScore),
 }
 
 enum Release {
@@ -408,11 +407,6 @@ impl Shared {
         self.update(RoutingUpdate::Down(id, shutdown)).await;
     }
 
-    pub(super) async fn baseline(&self, id: usize, endpoint: SocketAddr, score: LatencyScore) {
-        self.update(RoutingUpdate::Baseline(id, endpoint, score))
-            .await;
-    }
-
     pub(super) async fn stop_accepting(&self) {
         let (reply, received) = oneshot::channel();
         if self.command(RoutingCommand::StopAccepting(reply)).await {
@@ -619,7 +613,6 @@ impl RoutingActor {
             | RoutingUpdate::Probe(id, ..)
             | RoutingUpdate::Parked(id)
             | RoutingUpdate::Down(id, _)
-            | RoutingUpdate::Baseline(id, ..)
             | RoutingUpdate::Ready { id, .. } => *id,
         };
         match update {
@@ -687,38 +680,6 @@ impl RoutingActor {
                 tracing::debug!(host_id = id, "VPN host parked");
             }
             RoutingUpdate::Down(id, shutdown) => self.down(id, shutdown),
-            RoutingUpdate::Baseline(id, endpoint, score) => {
-                let host = &mut self.state.hosts[id];
-                if host
-                    .score_measured_at
-                    .is_none_or(|previous| score.measured_at > previous)
-                    && host.stack.is_none()
-                {
-                    host.endpoint = endpoint;
-                    host.latency_score = Some(score.median);
-                    host.score_measured_at = Some(score.measured_at);
-                }
-                // Fill available slots without displacing hosts serving requests.
-                let selected = self.state.hosts.iter().filter(|host| host.selected).count();
-                if !self.state.hosts[id].selected && selected < self.max_active_vpn_hosts {
-                    let host = &mut self.state.hosts[id];
-                    host.selected = true;
-                    if let Some(epoch) = self.state.pool_epoch {
-                        host.enabled.send_replace(HostActivation::Active {
-                            epoch,
-                            preferred_endpoint: host.endpoint,
-                        });
-                    }
-                }
-                if !self.state.pool_tokens.is_empty()
-                    && let Some(failed) =
-                        self.state.hosts.iter().position(|host| {
-                            host.selected && host.unhealthy && host.stack.is_none()
-                        })
-                {
-                    self.replace_failed_host(failed);
-                }
-            }
         }
         self.state.observe_host(id);
         self.notify_ready();
@@ -1164,30 +1125,34 @@ mod tests {
     }
 
     #[test]
-    fn background_assessments_fill_pool_without_displacing_selected_hosts() {
+    fn pool_wake_selects_fastest_scored_hosts_and_keeps_others_dormant() {
         let (ready, _) = watch::channel(0);
         let (releases, _) = mpsc::unbounded_channel();
+        let preferred = "127.0.0.2:443".parse().unwrap();
         let mut actor = RoutingActor {
             state: RoutingState::new(vec![
                 Host::new("127.0.0.1:1194".parse().unwrap(), true, Some(score(20))),
-                Host::new("127.0.0.2:1194".parse().unwrap(), false, None),
-                Host::new("127.0.0.3:1194".parse().unwrap(), false, None),
+                Host::new(preferred, false, Some(score(10))),
+                Host::new("127.0.0.3:1194".parse().unwrap(), false, Some(score(5))),
+                Host::new("127.0.0.4:1194".parse().unwrap(), false, None),
             ]),
             ready,
             releases,
             max_active_vpn_hosts: 2,
         };
         actor.begin().unwrap();
-        let preferred = "127.0.0.2:443".parse().unwrap();
-        actor.update(RoutingUpdate::Baseline(1, preferred, score(10)));
-        actor.update(RoutingUpdate::Baseline(
-            2,
-            "127.0.0.3:1194".parse().unwrap(),
-            score(5),
-        ));
-        assert!(actor.state.hosts[0].selected);
+        assert!(!actor.state.hosts[0].selected);
         assert!(actor.state.hosts[1].selected);
-        assert!(!actor.state.hosts[2].selected);
+        assert!(actor.state.hosts[2].selected);
+        assert!(!actor.state.hosts[3].selected);
+        assert_eq!(
+            *actor.state.hosts[0].enabled.borrow(),
+            HostActivation::Dormant
+        );
+        assert_eq!(
+            *actor.state.hosts[3].enabled.borrow(),
+            HostActivation::Dormant
+        );
         assert!(
             matches!(*actor.state.hosts[1].enabled.borrow(), HostActivation::Active { preferred_endpoint, .. } if preferred_endpoint == preferred)
         );
@@ -1200,36 +1165,6 @@ mod tests {
         owner.shutdown().await;
         let (reply, _received) = oneshot::channel();
         assert!(!shared.command(RoutingCommand::Inspect(reply)).await);
-    }
-
-    #[test]
-    fn late_baseline_replaces_failed_selected_host() {
-        let (ready, _) = watch::channel(0);
-        let (releases, _) = mpsc::unbounded_channel();
-        let mut actor = RoutingActor {
-            state: RoutingState::new(vec![
-                Host::new("127.0.0.1:1194".parse().unwrap(), true, Some(score(20))),
-                Host::new("127.0.0.2:1194".parse().unwrap(), false, None),
-            ]),
-            ready,
-            releases,
-            max_active_vpn_hosts: 1,
-        };
-        actor.begin().unwrap();
-        actor.down(0, false);
-        assert!(actor.state.hosts[0].selected);
-        actor.update(RoutingUpdate::Baseline(
-            1,
-            "127.0.0.2:443".parse().unwrap(),
-            score(10),
-        ));
-        assert!(!actor.state.hosts[0].selected);
-        assert_eq!(
-            *actor.state.hosts[0].enabled.borrow(),
-            HostActivation::Dormant
-        );
-        assert!(actor.state.hosts[1].selected);
-        assert!(actor.state.hosts[1].enabled.borrow().epoch().is_some());
     }
 
     #[tokio::test]

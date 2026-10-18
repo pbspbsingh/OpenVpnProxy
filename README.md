@@ -41,7 +41,7 @@ The app composes `profile`, `client`, `netstack`, `socks5`, and `ui`. The VPN cl
 
 ### Connection manager and sticky routing
 
-The app resolves every profile `remote` to IPv4 endpoints, deduplicates them, and groups ports under each server IP. It assesses candidates with at most four probes running concurrently and begins accepting SOCKS connections after the first successful baseline. Remaining assessments continue in the background, filling available pool slots without displacing selected hosts. Each baseline tunnel closes after measurement. On each pool wake, the fastest scored `max_active_vpn_hosts` (default: 16) become selected; other scored hosts remain dormant as failover candidates. Each worker tries its preferred port first, establishes a VPN session and packet stack, obtains a fresh tunneled score, then becomes available for routing. A failed selected host yields its slot to a dormant candidate, preferring candidates that have not failed during the current wake. If none remains, the failed host retries with bounded exponential backoff.
+The app resolves every profile `remote` to IPv4 endpoints, deduplicates them, and groups ports under each server IP. It assesses all candidates with at most four probes running concurrently, then ranks successful candidates by latency before accepting SOCKS connections. Each baseline tunnel closes after measurement. On each pool wake, the fastest scored `max_active_vpn_hosts` (default: 16) become selected; other scored hosts remain dormant as failover candidates. Each worker tries its preferred port first, establishes a VPN session and packet stack, obtains a fresh tunneled score, then becomes available for routing. A failed selected host yields its slot to a dormant candidate, preferring candidates that have not failed during the current wake. If none remains, the failed host retries with bounded exponential backoff.
 
 The initial score is the median of three tunneled TCP connection times to `1.1.1.1:443`; at least two must succeed. Logs report tunnel setup time, time spent obtaining the score, and total time for each host. Connected hosts refresh the score every minute on staggered schedules, smoothing new samples with the previous score; probes do not count as client activity. A dormant replacement gets a fresh score before receiving traffic. Scores remain in memory only and are measured again on app restart.
 
@@ -92,10 +92,10 @@ sequenceDiagram
     Profile-->>App: Remotes, CA, keys, options
     App->>Listener: Bind socks5_address
     App->>Manager: Resolve all remotes; group endpoints by server IP
-    Manager->>Manager: Start candidate assessments, four at a time
-    Manager-->>App: First healthy host found; serving tunnels dormant
+    Manager->>Manager: Assess all candidates, four at a time
+    Manager->>Manager: Rank successful candidates; select fastest hosts
+    Manager-->>App: Assessments complete; serving tunnels dormant
     App->>Listener: Begin accepting SOCKS5 clients
-    Manager->>Manager: Continue assessments; fill selected pool slots
 ```
 
 Profile or host discovery errors prevent proxy serving; an enabled dashboard remains available to show the failure. A candidate that fails its baseline probe is ineligible; proxy startup fails if none pass. The manager does not benchmark throughput or refresh remote DNS records after startup yet.
@@ -176,7 +176,7 @@ OpenVPN may request a new data key, or the client may start renegotiation when i
 
 The design fails closed for **traffic handled by this proxy**:
 
-- The SOCKS listener begins accepting after the first successful baseline but before serving tunnels connect. A request waits for a selected host up to the profile handshake window plus 30 seconds for control setup (60 seconds with the default 30-second handshake window). A failed host clears its assignment; a scored standby may take its slot after a fresh probe. If no host becomes ready, the proxy returns a SOCKS5 network failure. A profile's `hand-window` setting overrides the default handshake window and also limits key renegotiation.
+- The SOCKS listener begins accepting after all startup baseline assessments complete and the fastest healthy hosts are selected, but before serving tunnels connect. A request waits for a selected host up to the profile handshake window plus 30 seconds for control setup (60 seconds with the default 30-second handshake window). A failed host clears its assignment; a scored standby may take its slot after a fresh probe. If no host becomes ready, the proxy returns a SOCKS5 network failure. A profile's `hand-window` setting overrides the default handshake window and also limits key renegotiation.
 - During a session, SOCKS requests can select only a ready host. A VPN or stack error marks that host unhealthy, clears its sticky assignments, shuts down its stack, and closes its client connections. Other hosts continue serving. Packet ingress or egress delivery failure ends the affected host session; full per-connection upload queues apply backpressure.
 - There is no direct-to-destination fallback in the SOCKS or stack crates. If every selected host is unavailable, new requests fail. The manager can activate a scored standby, retries failed hosts when no standby remains, and tries alternate ports; automatic DNS rediscovery and migration of existing TCP connections are not implemented.
 

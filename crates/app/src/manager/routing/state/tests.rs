@@ -9,6 +9,12 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::time;
 
 async fn test_stack() -> (ovpn_netstack::StackOwner, mpsc::Receiver<Vec<u8>>) {
+    test_stack_with_ipv6(None).await
+}
+
+async fn test_stack_with_ipv6(
+    ipv6: Option<ovpn_netstack::Ipv6Config>,
+) -> (ovpn_netstack::StackOwner, mpsc::Receiver<Vec<u8>>) {
     let (tx, rx) = mpsc::channel(1024);
     let owner = ovpn_netstack::StackOwner::start(
         ovpn_netstack::TunnelConfig::new(
@@ -16,7 +22,7 @@ async fn test_stack() -> (ovpn_netstack::StackOwner, mpsc::Receiver<Vec<u8>>) {
             "10.8.0.1".parse().unwrap(),
             vec![],
             1400,
-            None,
+            ipv6,
         )
         .unwrap(),
         tx,
@@ -33,6 +39,72 @@ fn score(milliseconds: u64) -> LatencyScore {
         successful_samples: 3,
         measured_at: Instant::now(),
     }
+}
+
+#[tokio::test]
+async fn host_selection_weights_load_and_rotates_equal_scores() {
+    let (owner, _output) = test_stack().await;
+    let mut hosts = vec![
+        Host::new("127.0.0.1:1194".parse().unwrap(), true, Some(score(10))),
+        Host::new("127.0.0.2:1194".parse().unwrap(), true, Some(score(5))),
+    ];
+    for host in &mut hosts {
+        host.phase = HostPhase::Ready;
+        host.stack = Some(owner.client());
+    }
+    let mut state = RoutingState::new(hosts, 2, Telemetry::default());
+    let destination = DestinationHost::Domain("example.com".into());
+    state.hosts[1].active = 16;
+    assert_eq!(choose_host(&mut state, &destination), Some(0));
+    state.hosts[1].active = 0;
+    assert_eq!(choose_host(&mut state, &destination), Some(1));
+
+    state.hosts[0].latency_score = Some(Duration::from_millis(5));
+    state.next_choice = 0;
+    for expected in [0, 1, 0, 1] {
+        assert_eq!(choose_host(&mut state, &destination), Some(expected));
+    }
+    state.hosts[0].selected = false;
+    assert_eq!(choose_host(&mut state, &destination), Some(1));
+    state.hosts[1].phase = HostPhase::Dormant;
+    assert_eq!(choose_host(&mut state, &destination), None);
+    owner.shutdown().await;
+}
+
+#[tokio::test]
+async fn host_selection_prefers_ipv6_for_domains_and_checks_literal_routes() {
+    let (v4, _v4_output) = test_stack().await;
+    let (v6, _v6_output) = test_stack_with_ipv6(Some(ovpn_netstack::Ipv6Config {
+        local: "fd00::2".parse().unwrap(),
+        prefix_len: 64,
+        routes: vec![ovpn_netstack::Ipv6Route {
+            network: "::".parse().unwrap(),
+            prefix_len: 0,
+            gateway: "fd00::1".parse().unwrap(),
+        }],
+    }))
+    .await;
+    let mut hosts = vec![
+        Host::new("127.0.0.1:1194".parse().unwrap(), true, Some(score(1))),
+        Host::new("127.0.0.2:1194".parse().unwrap(), true, Some(score(20))),
+    ];
+    for (host, stack) in hosts.iter_mut().zip([v4.client(), v6.client()]) {
+        host.phase = HostPhase::Ready;
+        host.stack = Some(stack);
+    }
+    let mut state = RoutingState::new(hosts, 2, Telemetry::default());
+    let domain = DestinationHost::Domain("example.com".into());
+    let ipv4 = DestinationHost::Ipv4("192.0.2.1".parse().unwrap());
+    let ipv6 = DestinationHost::Ipv6("2001:db8::1".parse().unwrap());
+    assert_eq!(choose_host(&mut state, &domain), Some(1));
+    assert_eq!(choose_host(&mut state, &ipv4), Some(0));
+    assert_eq!(choose_host(&mut state, &ipv6), Some(1));
+
+    state.hosts[1].selected = false;
+    assert_eq!(choose_host(&mut state, &domain), Some(0));
+    assert_eq!(choose_host(&mut state, &ipv6), None);
+    v4.shutdown().await;
+    v6.shutdown().await;
 }
 
 #[tokio::test]

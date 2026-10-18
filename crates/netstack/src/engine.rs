@@ -394,8 +394,10 @@ impl Engine {
         }
         self.device.output_blocked = false;
         self.iface.poll(now, &mut self.device, &mut self.sockets);
-        let mut pending = Vec::new();
-        for request in self.pending_dns.drain(..) {
+        // Work backwards so swap_remove only moves requests already checked.
+        // Pending requests reuse this vector's allocation; query order is immaterial.
+        for index in (0..self.pending_dns.len()).rev() {
+            let request = self.pending_dns.swap_remove(index);
             let socket = self.sockets.get_mut::<dns::Socket>(self.dns_socket);
             if request.reply.is_closed() {
                 socket.cancel_query(request.query);
@@ -424,15 +426,13 @@ impl Engine {
                         Ok(addresses)
                     });
                 }
-                Err(dns::GetQueryResultError::Pending) => pending.push(request),
+                Err(dns::GetQueryResultError::Pending) => self.pending_dns.push(request),
                 Err(_) => {
                     tracing::warn!(host = %request.host, "tunneled DNS query failed");
                     let _ = request.reply.send(Err(StackError::DnsFailed));
                 }
             }
         }
-        self.pending_dns = pending;
-
         let mut close = Vec::new();
         for (&id, connection) in &mut self.connections {
             let socket = self.sockets.get_mut::<tcp::Socket>(connection.socket);

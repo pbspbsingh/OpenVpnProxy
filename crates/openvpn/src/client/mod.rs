@@ -191,7 +191,7 @@ impl Session {
             wire_bytes = wire.len(),
             "sending encrypted OpenVPN data"
         );
-        let sent = self.link.socket().send(&wire).await?;
+        let sent = self.link.socket().send(wire).await?;
         require(sent == wire.len(), "short VPN UDP send")
     }
 
@@ -209,24 +209,29 @@ impl Session {
             self.last_ping = Instant::now();
         }
         let packet = match self.link.step().await? {
-            Some(wire) => match self.decrypt_packet(&wire) {
-                Ok(plain) => {
-                    self.last_data = Instant::now();
-                    tracing::trace!(
-                        key_id = wire[0] & KEY_ID_MASK,
-                        plain_bytes = plain.len(),
-                        "decrypted OpenVPN data"
-                    );
-                    if plain == PING { None } else { Some(plain) }
+            Some(wire) => {
+                let key_id = wire[0] & KEY_ID_MASK;
+                match self.decrypt_packet(wire) {
+                    Ok(plain) => {
+                        self.last_data = Instant::now();
+                        tracing::trace!(
+                            key_id,
+                            plain_bytes = plain.len(),
+                            "decrypted OpenVPN data"
+                        );
+                        if plain == PING { None } else { Some(plain) }
+                    }
+                    Err(
+                        error @ (Error::Replay
+                        | Error::DataAuthenticationFailed
+                        | Error::Protocol(_)),
+                    ) => {
+                        tracing::debug!(%error, "discarded invalid OpenVPN data packet");
+                        None
+                    }
+                    Err(error) => return Err(error),
                 }
-                Err(
-                    error @ (Error::Replay | Error::DataAuthenticationFailed | Error::Protocol(_)),
-                ) => {
-                    tracing::debug!(%error, "discarded invalid OpenVPN data packet");
-                    None
-                }
-                Err(error) => return Err(error),
-            },
+            }
             None => None,
         };
         self.progress_rekey().await?;
@@ -234,7 +239,7 @@ impl Session {
         Ok(packet)
     }
 
-    fn decrypt_packet(&mut self, wire: &[u8]) -> Result<Vec<u8>> {
+    fn decrypt_packet(&mut self, wire: Vec<u8>) -> Result<Vec<u8>> {
         let key_id = wire
             .first()
             .map(|op| op & KEY_ID_MASK)
@@ -360,7 +365,7 @@ impl Session {
                     .as_mut()
                     .ok_or(Error::Protocol("missing replacement data key"))?
                     .encrypt(&PING)?;
-                let sent = self.link.socket().send(&wire).await?;
+                let sent = self.link.socket().send(wire).await?;
                 require(sent == wire.len(), "short VPN UDP send")?;
                 self.rekey = Some(RekeyState::PeerKey {
                     started: state.started(),

@@ -565,39 +565,31 @@ fn host_eligible(host: &Host, destination: &DestinationHost) -> bool {
 }
 
 fn choose_host(state: &mut RoutingState, destination: &DestinationHost) -> Option<usize> {
-    let mut eligible: Vec<_> = state
-        .hosts
-        .iter()
-        .enumerate()
-        .filter_map(|(id, host)| host_eligible(host, destination).then_some(id))
-        .collect();
-    if matches!(destination, DestinationHost::Domain(_))
-        && eligible.iter().any(|&id| {
-            state.hosts[id]
-                .stack
-                .as_ref()
-                .is_some_and(Stack::supports_ipv6)
-        })
-    {
-        eligible.retain(|&id| {
-            state.hosts[id]
-                .stack
-                .as_ref()
-                .is_some_and(Stack::supports_ipv6)
+    let prefer_ipv6 = matches!(destination, DestinationHost::Domain(_))
+        && state.hosts.iter().any(|host| {
+            host_eligible(host, destination)
+                && host.stack.as_ref().is_some_and(Stack::supports_ipv6)
         });
-    }
     let host_count = state.hosts.len();
     let start = state.next_choice % host_count;
     state.next_choice = state.next_choice.wrapping_add(1);
-    eligible.into_iter().min_by_key(|&id| {
-        let host = &state.hosts[id];
-        let latency = host.latency_score.unwrap_or_default().as_nanos();
-        let load = host.active as u128;
-        (
-            latency.saturating_mul(LOAD_SCORE_SCALE.saturating_add(load)),
-            (id + host_count - start) % host_count,
-        )
-    })
+    state
+        .hosts
+        .iter()
+        .enumerate()
+        .filter(|(_, host)| {
+            host_eligible(host, destination)
+                && (!prefer_ipv6 || host.stack.as_ref().is_some_and(Stack::supports_ipv6))
+        })
+        .min_by_key(|&(id, host)| {
+            let latency = host.latency_score.unwrap_or_default().as_nanos();
+            let load = host.active as u128;
+            (
+                latency.saturating_mul(LOAD_SCORE_SCALE.saturating_add(load)),
+                (id + host_count - start) % host_count,
+            )
+        })
+        .map(|(id, _)| id)
 }
 
 fn destination_supported(stack: &Stack, destination: &DestinationHost) -> bool {

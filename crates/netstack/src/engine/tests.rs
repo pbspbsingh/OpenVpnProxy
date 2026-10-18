@@ -508,6 +508,55 @@ fn unacknowledged_data_times_out_while_idle_connections_survive() {
 }
 
 #[test]
+fn pending_dns_survives_other_queries_being_cancelled_or_timing_out() {
+    let mut config = tunnel_config();
+    config.dns = vec!["8.8.8.8".parse().unwrap()];
+    let (io, _outbound) = mpsc::channel(1024);
+    let mut engine = Engine::new(0, config, io).unwrap();
+    let mut replies = Vec::new();
+    for host in ["first.test", "cancelled.test", "timeout.test", "last.test"] {
+        let (reply, received) = oneshot::channel();
+        engine.handle(Command::Resolve(host.into(), IpVersion::V4, reply));
+        replies.push(received);
+    }
+    drop(replies.remove(1));
+    engine.pending_dns[2].deadline = Clock::now() - Duration::from_secs(1);
+
+    for _ in 0..3 {
+        engine.tick(Instant::ZERO).unwrap();
+        let mut pending: Vec<_> = engine
+            .pending_dns
+            .iter()
+            .map(|request| request.host.as_str())
+            .collect();
+        pending.sort_unstable();
+        assert_eq!(pending, ["first.test", "last.test"]);
+        for index in [0, 2] {
+            assert!(matches!(
+                replies[index].try_recv(),
+                Err(oneshot::error::TryRecvError::Empty)
+            ));
+        }
+    }
+    assert!(matches!(
+        replies[1].try_recv(),
+        Ok(Err(StackError::DnsTimeout))
+    ));
+
+    for request in &mut engine.pending_dns {
+        request.deadline = Clock::now() - Duration::from_secs(1);
+    }
+    engine.tick(Instant::ZERO).unwrap();
+    assert!(engine.pending_dns.is_empty());
+    for index in [0, 2] {
+        assert!(matches!(
+            replies[index].try_recv(),
+            Ok(Err(StackError::DnsTimeout))
+        ));
+    }
+}
+
+#[test]
 fn dns_response_retains_multiple_addresses() {
     use smoltcp::wire::UdpPacket;
     let local: Ipv4Addr = "10.8.0.2".parse().unwrap();

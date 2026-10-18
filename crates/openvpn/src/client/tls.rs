@@ -13,8 +13,8 @@ use rustls::{
 };
 use x509_parser::prelude::{FromDer, X509Certificate};
 
-use super::ClientConfig;
-use crate::error::{Error, Result};
+use super::{ClientConfig, TlsVersion};
+use crate::error::{Error, Result, require};
 
 pub(crate) fn new_tls_connection(config: &Arc<TlsClientConfig>) -> Result<ClientConnection> {
     let name = ServerName::try_from("openvpn.invalid")
@@ -32,6 +32,24 @@ pub(super) fn tls_client(profile: &ClientConfig<'_>) -> Result<Arc<TlsClientConf
     for cert in certs {
         roots.add(cert).map_err(Error::InvalidCa)?;
     }
+    configure_tls(profile, roots)
+}
+
+fn configure_tls(profile: &ClientConfig<'_>, roots: RootCertStore) -> Result<Arc<TlsClientConfig>> {
+    require(
+        profile.tls_version_min <= profile.tls_version_max,
+        "invalid TLS version range",
+    )?;
+    let versions: Vec<_> = [
+        (TlsVersion::V1_3, &rustls::version::TLS13),
+        (TlsVersion::V1_2, &rustls::version::TLS12),
+    ]
+    .into_iter()
+    .filter_map(|(version, supported)| {
+        (version >= profile.tls_version_min && version <= profile.tls_version_max)
+            .then_some(supported)
+    })
+    .collect();
     let provider: CryptoProvider = rustls::crypto::aws_lc_rs::default_provider();
     let verifier = OpenVpnVerifier {
         roots,
@@ -39,7 +57,7 @@ pub(super) fn tls_client(profile: &ClientConfig<'_>) -> Result<Arc<TlsClientConf
         require_server_certificate_purpose: profile.require_server_certificate_purpose,
     };
     let mut config = TlsClientConfig::builder_with_provider(Arc::new(provider))
-        .with_safe_default_protocol_versions()?
+        .with_protocol_versions(&versions)?
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(verifier))
         .with_no_client_auth();
@@ -125,4 +143,67 @@ fn verify_server_certificate_purpose(
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Decode the actual ClientHello, including TLS 1.2's absent versions extension.
+    fn offered_versions(config: &Arc<TlsClientConfig>) -> Vec<u16> {
+        let mut connection = new_tls_connection(config).unwrap();
+        let mut wire = Vec::new();
+        connection.write_tls(&mut wire).unwrap();
+        assert_eq!(wire[0], 22); // TLS handshake record
+        assert_eq!(wire[5], 1); // ClientHello
+        let legacy = u16::from_be_bytes([wire[9], wire[10]]);
+        let mut at = 5 + 4 + 2 + 32;
+        at += 1 + usize::from(wire[at]);
+        let cipher_bytes = usize::from(u16::from_be_bytes([wire[at], wire[at + 1]]));
+        at += 2 + cipher_bytes;
+        at += 1 + usize::from(wire[at]);
+        let extension_bytes = usize::from(u16::from_be_bytes([wire[at], wire[at + 1]]));
+        at += 2;
+        let end = at + extension_bytes;
+        while at < end {
+            let kind = u16::from_be_bytes([wire[at], wire[at + 1]]);
+            let size = usize::from(u16::from_be_bytes([wire[at + 2], wire[at + 3]]));
+            at += 4;
+            if kind == 43 {
+                return wire[at + 1..at + size]
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|version| u16::from_be_bytes([version[0], version[1]]))
+                    .collect();
+            }
+            at += size;
+        }
+        vec![legacy]
+    }
+
+    #[test]
+    fn tls_bounds_restrict_initial_and_replacement_client_hellos() {
+        for (minimum, maximum, expected) in [
+            (TlsVersion::V1_2, TlsVersion::V1_3, vec![0x0304, 0x0303]),
+            (TlsVersion::V1_3, TlsVersion::V1_3, vec![0x0304]),
+            (TlsVersion::V1_2, TlsVersion::V1_2, vec![0x0303]),
+        ] {
+            let profile = ClientConfig {
+                endpoint: "127.0.0.1:1194".parse().unwrap(),
+                ca_pem: "",
+                tls_crypt_key: &[0; 256],
+                require_server_certificate_purpose: true,
+                tls_version_min: minimum,
+                tls_version_max: maximum,
+                renegotiate_after: None,
+                handshake_window: std::time::Duration::from_secs(30),
+                transition_window: std::time::Duration::from_secs(3600),
+            };
+            let config = configure_tls(&profile, RootCertStore::empty()).unwrap();
+            assert_eq!(offered_versions(&config), expected);
+            // Rekeys construct a fresh connection from this same immutable config.
+            assert_eq!(offered_versions(&config), expected);
+        }
+    }
 }

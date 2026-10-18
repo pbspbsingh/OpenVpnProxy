@@ -122,6 +122,7 @@ impl TunnelConfig {
 #[derive(Debug)]
 pub(crate) enum StreamEvent {
     Connected,
+    ConnectFailed(StackError),
     Data(Vec<u8>),
     ReadClosed,
     Closed,

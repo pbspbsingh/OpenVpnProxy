@@ -21,6 +21,7 @@ psl.workspace = true
 
 # Async networking and orchestration
 tokio.workspace = true
+futures-util.workspace = true
 
 # Error context and structured logging
 anyhow.workspace = true

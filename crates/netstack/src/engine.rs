@@ -25,6 +25,9 @@ const EPHEMERAL_PORT_END: u16 = 60_000;
 const MAX_CONNECTIONS: usize = 256;
 const DNS_QUERY_TIMEOUT: Duration = Duration::from_secs(10);
 const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+// Linux's default tcp_retries2 reference budget, rather than a short app timeout.
+// https://docs.kernel.org/networking/ip-sysctl.html#tcp-retries2-integer
+const TCP_PROGRESS_TIMEOUT: smoltcp::time::Duration = smoltcp::time::Duration::from_millis(924_600);
 const TCP_READ_BUFFER_BYTES: usize = 4096;
 const STACK_STATUS_INTERVAL: Duration = Duration::from_secs(10);
 
@@ -172,7 +175,7 @@ struct PendingDns {
     host: String,
     version: IpVersion,
     query: dns::QueryHandle,
-    reply: oneshot::Sender<Result<IpAddr>>,
+    reply: oneshot::Sender<Result<Vec<IpAddr>>>,
     deadline: Clock,
 }
 
@@ -304,7 +307,8 @@ impl Engine {
                 }
                 if self.connections.len() >= MAX_CONNECTIONS {
                     tracing::warn!(id, %address, "userspace TCP connection limit reached");
-                    let _ = events.try_send(StreamEvent::Closed);
+                    let _ =
+                        events.try_send(StreamEvent::ConnectFailed(StackError::ConnectionLimit));
                     return;
                 }
                 tracing::debug!(id, %address, receive_buffer_bytes = TCP_RECEIVE_BUFFER_BYTES, send_buffer_bytes = TCP_SEND_BUFFER_BYTES, "opening userspace TCP connection");
@@ -365,6 +369,14 @@ impl Engine {
     fn tick(&mut self, now: Instant) -> Result<()> {
         let started = Clock::now();
         self.stats.polls += 1;
+        // smoltcp also checks its timeout on idle sockets. Enable it only while
+        // a handshake or outstanding data needs progress. The connect deadline
+        // remains independently enforced below.
+        for connection in self.connections.values() {
+            let socket = self.sockets.get_mut::<tcp::Socket>(connection.socket);
+            let needs_progress = !connection.established || socket.send_queue() > 0;
+            socket.set_timeout(needs_progress.then_some(TCP_PROGRESS_TIMEOUT));
+        }
         self.iface.poll(now, &mut self.device, &mut self.sockets);
         while let Some(packet) = self.device.outbound.pop_front() {
             self.stats.outbound_packets += 1;
@@ -389,16 +401,20 @@ impl Engine {
             }
             match socket.get_query_result(request.query) {
                 Ok(addresses) => {
-                    let address =
-                        addresses
-                            .iter()
-                            .find_map(|address| match (request.version, address) {
-                                (IpVersion::V4, IpAddress::Ipv4(value)) => Some(IpAddr::V4(*value)),
-                                (IpVersion::V6, IpAddress::Ipv6(value)) => Some(IpAddr::V6(*value)),
-                                _ => None,
-                            });
-                    tracing::debug!(host = %request.host, ?address, "tunneled DNS query completed");
-                    let _ = request.reply.send(address.ok_or(StackError::NoDnsAddress));
+                    let addresses: Vec<_> = addresses
+                        .iter()
+                        .filter_map(|address| match (request.version, address) {
+                            (IpVersion::V4, IpAddress::Ipv4(value)) => Some(IpAddr::V4(*value)),
+                            (IpVersion::V6, IpAddress::Ipv6(value)) => Some(IpAddr::V6(*value)),
+                            _ => None,
+                        })
+                        .collect();
+                    tracing::debug!(host = %request.host, ?addresses, "tunneled DNS query completed");
+                    let _ = request.reply.send(if addresses.is_empty() {
+                        Err(StackError::NoDnsAddress)
+                    } else {
+                        Ok(addresses)
+                    });
                 }
                 Err(dns::GetQueryResultError::Pending) => pending.push(request),
                 Err(_) => {

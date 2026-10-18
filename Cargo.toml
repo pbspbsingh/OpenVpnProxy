@@ -27,7 +27,7 @@ rustls-pemfile = "2.2.0"
 x509-parser = "0.18.1"
 
 # Userspace TCP, IP, and DNS
-smoltcp = { version = "0.14.0", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-dns", "iface-max-route-count-4", "dns-max-server-count-4"] }
+smoltcp = { version = "0.14.0", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-dns", "iface-max-route-count-4", "dns-max-server-count-4", "dns-max-result-count-16"] }
 
 # TOML application configuration
 serde = { version = "1.0", features = ["derive"] }
@@ -44,6 +44,7 @@ idna = "1.1.0"
 
 # Async I/O and task scheduling
 bytes = "1.12.1"
+futures-util = { version = "0.3.34", default-features = false, features = ["alloc"] }
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util", "signal", "fs"] }
 
 # Structured logging

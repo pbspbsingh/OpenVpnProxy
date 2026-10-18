@@ -11,7 +11,9 @@ use tokio::task::JoinSet;
 use tokio::time;
 
 use super::discovery::HostCandidate;
-use super::probe::{LatencyScore, PROBE_INTERVAL, measure, measure_with_session};
+use super::probe::{
+    LatencyScore, PROBE_INTERVAL, SessionHealth, check_health, measure_with_session,
+};
 use super::routing::{HostActivation, Shared};
 use super::telemetry::{HostPhase, HostTraffic};
 
@@ -267,6 +269,8 @@ async fn connect_host(
         ca_pem: &profile.ca_pem,
         tls_crypt_key: &profile.tls_crypt_key,
         require_server_certificate_purpose: profile.require_server_certificate_purpose,
+        tls_version_min: profile.tls_version_min,
+        tls_version_max: profile.tls_version_max,
         renegotiate_after: profile.renegotiate_after,
         handshake_window: profile.handshake_window,
         transition_window: profile.transition_window,
@@ -351,6 +355,7 @@ impl HostSession {
         let mut traffic_tick = time::interval(Duration::from_secs(1));
         traffic_tick.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
         let mut probes = JoinSet::new();
+        let mut health = SessionHealth::default();
         let mut sent_packets = 0_u64;
         let mut received_packets = 0_u64;
         let mut sent_bytes = 0_u64;
@@ -376,13 +381,14 @@ impl HostSession {
                             let shared = Arc::clone(shared);
                             probes.spawn(async move {
                                 let started = Instant::now();
-                                let result = measure(&stack).await;
-                                shared.record_probe(id, stack.id(), result, started.elapsed()).await;
+                                let report = check_health(&stack).await;
+                                shared.record_probe(id, stack.id(), report.score, started.elapsed()).await;
+                                report.reachability
                             });
                         }
                     }
                     Some(result) = probes.join_next(), if !probes.is_empty() => {
-                        if let Err(error) = result { tracing::warn!(host_id = id, %error, "VPN probe task failed"); }
+                        health.record(result.context("VPN probe task failed")?)?;
                     }
                     packet = outbound.recv() => {
                         let packet = packet.context("VPN packet output channel closed")?;

@@ -148,8 +148,9 @@ impl Stack {
         StackPhase::from_raw(self.phase.load(Ordering::Acquire))
     }
 
-    /// Resolves through this session's DNS servers, including mailbox wait in the deadline.
-    pub async fn resolve(&self, host: &str, version: IpVersion) -> Result<IpAddr> {
+    /// Returns this family's DNS answers through the session, including mailbox
+    /// wait in the deadline. At most 16 addresses are retained per query.
+    pub async fn resolve(&self, host: &str, version: IpVersion) -> Result<Vec<IpAddr>> {
         if !self.is_ready() {
             return Err(StackError::VpnDown);
         }
@@ -175,6 +176,7 @@ impl Stack {
             let (id, mut events) = self.open(address).await?;
             match events.recv().await {
                 Some(StreamEvent::Connected) => Ok(TunnelStream::new(id, events)),
+                Some(StreamEvent::ConnectFailed(error)) => Err(error),
                 _ => Err(StackError::Disconnected),
             }
         })
@@ -220,7 +222,7 @@ impl Stack {
 
 pub(crate) enum Command {
     Packet(Vec<u8>),
-    Resolve(String, IpVersion, oneshot::Sender<Result<IpAddr>>),
+    Resolve(String, IpVersion, oneshot::Sender<Result<Vec<IpAddr>>>),
     Connect(ConnectRequest),
     #[cfg(test)]
     Close(u64),

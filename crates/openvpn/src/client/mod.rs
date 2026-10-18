@@ -5,6 +5,7 @@ mod tls;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::{Duration, Instant};
 
+use ovpn_profile::TlsVersion;
 use tokio::net::UdpSocket;
 
 use self::key_method::{client_km2, read_server_km2, take_server_km2};
@@ -27,6 +28,8 @@ pub struct ClientConfig<'a> {
     pub ca_pem: &'a str,
     pub tls_crypt_key: &'a [u8; crate::protocol::STATIC_KEY_BYTES],
     pub require_server_certificate_purpose: bool,
+    pub tls_version_min: TlsVersion,
+    pub tls_version_max: TlsVersion,
     pub renegotiate_after: Option<Duration>,
     pub handshake_window: Duration,
     pub transition_window: Duration,

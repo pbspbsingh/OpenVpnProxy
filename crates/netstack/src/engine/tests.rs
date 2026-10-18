@@ -21,6 +21,42 @@ fn test_payload(length: usize) -> Vec<u8> {
         .collect()
 }
 
+fn peer_packet(port: u16, sequence: i32, ack: i32, control: TcpControl, payload: &[u8]) -> Vec<u8> {
+    let src = Ipv4Addr::new(1, 1, 1, 1);
+    let dst = Ipv4Addr::new(10, 8, 0, 2);
+    let tcp = TcpRepr {
+        src_port: 443,
+        dst_port: port,
+        control,
+        seq_number: TcpSeqNumber(sequence),
+        ack_number: Some(TcpSeqNumber(ack)),
+        window_len: u16::MAX,
+        window_scale: None,
+        max_seg_size: (control == TcpControl::Syn).then_some(MSS as u16),
+        sack_permitted: false,
+        sack_ranges: [None; 3],
+        timestamp: None,
+        payload,
+    };
+    let ip = Ipv4Repr {
+        src_addr: src,
+        dst_addr: dst,
+        next_header: IpProtocol::Tcp,
+        payload_len: tcp.buffer_len(),
+        hop_limit: 64,
+    };
+    let caps = ChecksumCapabilities::default();
+    let mut packet = vec![0; ip.buffer_len() + tcp.buffer_len()];
+    ip.emit(&mut Ipv4Packet::new_unchecked(&mut packet[..]), &caps);
+    tcp.emit(
+        &mut TcpPacket::new_unchecked(&mut packet[ip.buffer_len()..]),
+        &IpAddress::Ipv4(src),
+        &IpAddress::Ipv4(dst),
+        &caps,
+    );
+    packet
+}
+
 struct Peer {
     stack: Stack,
     outbound: mpsc::Receiver<Vec<u8>>,
@@ -44,39 +80,7 @@ impl Peer {
     }
 
     fn control_packet(&self, ack: i32, control: TcpControl, payload: &[u8]) -> Vec<u8> {
-        let src = Ipv4Addr::new(1, 1, 1, 1);
-        let dst = Ipv4Addr::new(10, 8, 0, 2);
-        let tcp = TcpRepr {
-            src_port: 443,
-            dst_port: self.port,
-            control,
-            seq_number: TcpSeqNumber(self.next_seq),
-            ack_number: Some(TcpSeqNumber(ack)),
-            window_len: u16::MAX,
-            window_scale: None,
-            max_seg_size: (control == TcpControl::Syn).then_some(MSS as u16),
-            sack_permitted: false,
-            sack_ranges: [None; 3],
-            timestamp: None,
-            payload,
-        };
-        let ip = Ipv4Repr {
-            src_addr: src,
-            dst_addr: dst,
-            next_header: IpProtocol::Tcp,
-            payload_len: tcp.buffer_len(),
-            hop_limit: 64,
-        };
-        let caps = ChecksumCapabilities::default();
-        let mut packet = vec![0; ip.buffer_len() + tcp.buffer_len()];
-        ip.emit(&mut Ipv4Packet::new_unchecked(&mut packet[..]), &caps);
-        tcp.emit(
-            &mut TcpPacket::new_unchecked(&mut packet[ip.buffer_len()..]),
-            &IpAddress::Ipv4(src),
-            &IpAddress::Ipv4(dst),
-            &caps,
-        );
-        packet
+        peer_packet(self.port, self.next_seq, ack, control, payload)
     }
 
     fn send(&mut self, ack: i32, payload: &[u8]) {
@@ -207,6 +211,142 @@ fn ready_work_yields_without_a_timer() {
     assert_eq!(wait.as_mut().poll(&mut context), Poll::Pending);
     // No runtime or clock advancement is needed to resume ready work.
     assert_eq!(wait.as_mut().poll(&mut context), Poll::Ready(()));
+}
+
+#[test]
+fn unacknowledged_data_times_out_while_idle_connections_survive() {
+    for has_unacknowledged_data in [false, true] {
+        let config = TunnelConfig::new(
+            "10.8.0.2".parse().unwrap(),
+            "10.8.0.1".parse().unwrap(),
+            vec![],
+            1400,
+            None,
+        )
+        .unwrap();
+        let (io, mut outbound) = mpsc::channel(1024);
+        let mut engine = Engine::new(0, config, io).unwrap();
+        let (events, _received) = mpsc::channel(32);
+        let (writer, writes) = mpsc::channel(32);
+        let (write_finished, _finished) = oneshot::channel();
+        engine.handle(Command::Connect(ConnectRequest {
+            id: 1,
+            address: "1.1.1.1:443".parse().unwrap(),
+            events,
+            wake_needed: Arc::new(AtomicBool::new(false)),
+            writes,
+            write_finished,
+        }));
+        engine.tick(Instant::ZERO).unwrap();
+        let syn = outbound.try_recv().unwrap();
+        let ip = Ipv4Packet::new_checked(&syn[..]).unwrap();
+        let tcp = TcpPacket::new_checked(ip.payload()).unwrap();
+        engine.handle(Command::Packet(peer_packet(
+            tcp.src_port(),
+            1000,
+            tcp.seq_number().0.wrapping_add(1),
+            TcpControl::Syn,
+            &[],
+        )));
+        engine.tick(Instant::from_millis(1)).unwrap();
+        assert!(engine.connections[&1].established);
+        if has_unacknowledged_data {
+            writer
+                .try_send(Bytes::from_static(b"never acknowledged"))
+                .unwrap();
+        }
+        engine.tick(Instant::from_millis(2)).unwrap();
+        engine.tick(Instant::from_millis(3)).unwrap();
+        // A temporary two-minute interruption is not enough to lose the stream.
+        engine.tick(Instant::from_millis(120_010)).unwrap();
+        assert!(engine.connections.contains_key(&1));
+        // Advance the protocol clock rather than sleeping for the timeout.
+        engine
+            .tick(Instant::from_millis(
+                TCP_PROGRESS_TIMEOUT.total_millis() as i64 + 10,
+            ))
+            .unwrap();
+        assert_eq!(
+            engine.connections.contains_key(&1),
+            !has_unacknowledged_data
+        );
+        if !has_unacknowledged_data {
+            engine
+                .tick(Instant::from_millis(24 * 60 * 60 * 1000))
+                .unwrap();
+            assert!(engine.connections.contains_key(&1));
+            // Uploading after a long idle period starts a fresh wait for ACKs.
+            writer
+                .try_send(Bytes::from_static(b"after a day idle"))
+                .unwrap();
+            engine
+                .tick(Instant::from_millis(24 * 60 * 60 * 1000 + 1))
+                .unwrap();
+            engine
+                .tick(Instant::from_millis(24 * 60 * 60 * 1000 + 2))
+                .unwrap();
+            assert!(engine.connections.contains_key(&1));
+        }
+    }
+}
+
+#[test]
+fn dns_response_retains_multiple_addresses() {
+    use smoltcp::wire::UdpPacket;
+    let local: Ipv4Addr = "10.8.0.2".parse().unwrap();
+    let server: Ipv4Addr = "10.8.0.53".parse().unwrap();
+    let config = TunnelConfig::new(
+        local,
+        "10.8.0.1".parse().unwrap(),
+        vec![server.into()],
+        1400,
+        None,
+    )
+    .unwrap();
+    let (io, mut outbound) = mpsc::channel(1024);
+    let mut engine = Engine::new(0, config, io).unwrap();
+    let (reply, mut result) = oneshot::channel();
+    engine.handle(Command::Resolve("example.com".into(), IpVersion::V4, reply));
+    engine.tick(Instant::ZERO).unwrap();
+    let query = outbound.try_recv().unwrap();
+    let ip = Ipv4Packet::new_checked(&query[..]).unwrap();
+    let udp = UdpPacket::new_checked(ip.payload()).unwrap();
+    let mut response = udp.payload().to_vec();
+    response[2..4].copy_from_slice(&0x8180_u16.to_be_bytes()); // Standard successful response.
+    response[6..8].copy_from_slice(&2_u16.to_be_bytes());
+    for address in [[192, 0, 2, 1], [192, 0, 2, 2]] {
+        // Name points at the question; type A, class IN, TTL 60, four address bytes.
+        response.extend_from_slice(&[0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4]);
+        response.extend_from_slice(&address);
+    }
+    let repr = Ipv4Repr {
+        src_addr: server,
+        dst_addr: local,
+        next_header: IpProtocol::Udp,
+        payload_len: 8 + response.len(),
+        hop_limit: 64,
+    };
+    let mut packet = vec![0; repr.buffer_len() + repr.payload_len];
+    repr.emit(
+        &mut Ipv4Packet::new_unchecked(&mut packet[..]),
+        &ChecksumCapabilities::default(),
+    );
+    let mut answer = UdpPacket::new_unchecked(&mut packet[repr.buffer_len()..]);
+    answer.set_src_port(53);
+    answer.set_dst_port(udp.src_port());
+    answer.set_len((8 + response.len()) as u16);
+    answer.payload_mut().copy_from_slice(&response);
+    answer.fill_checksum(&server.into(), &local.into());
+    engine.handle(Command::Packet(packet));
+    engine.tick(Instant::from_millis(1)).unwrap();
+    let addresses = result.try_recv().unwrap().unwrap();
+    assert_eq!(
+        addresses,
+        vec![
+            "192.0.2.1".parse::<IpAddr>().unwrap(),
+            "192.0.2.2".parse().unwrap()
+        ]
+    );
 }
 
 #[test]

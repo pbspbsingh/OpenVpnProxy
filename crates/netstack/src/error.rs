@@ -31,6 +31,8 @@ pub enum StackError {
     Disconnected,
     #[error("tunnel TCP connection timed out")]
     ConnectTimeout,
+    #[error("userspace TCP connection limit reached")]
+    ConnectionLimit,
     #[error("tunnel command queue is full")]
     CommandQueueFull,
     #[error("VPN packet delivery failed")]

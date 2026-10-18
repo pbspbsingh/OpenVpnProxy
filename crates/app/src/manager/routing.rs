@@ -1114,6 +1114,55 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn session_failure_clears_assignments_and_wakes_a_ranked_standby() {
+        let (ready, _) = watch::channel(0);
+        let (releases, _) = mpsc::unbounded_channel();
+        let endpoint = "127.0.0.1:1194".parse().unwrap();
+        let mut actor = RoutingActor {
+            state: RoutingState::new(vec![
+                Host::new(endpoint, true, Some(score(10))),
+                Host::new("127.0.0.2:1194".parse().unwrap(), false, Some(score(20))),
+            ]),
+            ready,
+            releases,
+            max_active_vpn_hosts: 1,
+        };
+        let token = actor.begin().unwrap();
+        let epoch = actor.state.pool_epoch.unwrap();
+        let owner = test_stack().await;
+        actor.update(RoutingUpdate::Ready {
+            id: 0,
+            epoch,
+            endpoint,
+            stack: owner.client(),
+            elapsed: Duration::ZERO,
+            score: score(10),
+        });
+        let destination = DestinationHost::Domain("example.com".into());
+        let key = sticky_key("127.0.0.1".parse().unwrap(), &destination).unwrap();
+        let _route = actor
+            .select(token, &key, &destination)
+            .ok()
+            .flatten()
+            .unwrap();
+
+        // Health failures use the same transition as every other session error.
+        actor.update(RoutingUpdate::Down(0, false));
+
+        assert!(actor.state.hosts[0].stack.is_none());
+        assert!(actor.state.sticky.is_empty());
+        assert!(!actor.state.hosts[0].selected);
+        assert_eq!(
+            *actor.state.hosts[0].enabled.borrow(),
+            HostActivation::Dormant
+        );
+        assert!(actor.state.hosts[1].selected);
+        assert_eq!(actor.state.hosts[1].enabled.borrow().epoch(), Some(epoch));
+        assert!(matches!(actor.select(token, &key, &destination), Ok(None)));
+        owner.shutdown().await;
+    }
+
     #[test]
     fn background_assessments_fill_pool_without_displacing_selected_hosts() {
         let (ready, _) = watch::channel(0);

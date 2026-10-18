@@ -7,6 +7,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
+use futures_util::{StreamExt, stream::FuturesUnordered};
 use ovpn_netstack::{IpVersion, Stack, StackError, TunnelStream};
 use ovpn_socks5::{ConnectError, Connector, DestinationHost};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -15,6 +16,7 @@ use tokio::time;
 use crate::manager::{HostLease, RouterHandle};
 
 const ADDRESS_FAMILY_DELAY: Duration = Duration::from_millis(250);
+const DOMAIN_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Keeps the routing reservation alive until forwarding and both half-closes finish.
 pub(crate) struct LeasedStream {
@@ -66,15 +68,54 @@ async fn connect_domain(
     port: u16,
 ) -> ovpn_netstack::Result<TunnelStream> {
     let connect = |version| async move {
-        let address = stack.resolve(host, version).await?;
-        stack.connect(SocketAddr::new(address, port)).await
+        let addresses = stack.resolve(host, version).await?;
+        connect_addresses(addresses, port, |address| stack.connect(address)).await
     };
-    if !stack.supports_ipv6() {
-        return connect(IpVersion::V4).await;
+    time::timeout(DOMAIN_CONNECT_TIMEOUT, async {
+        if !stack.supports_ipv6() {
+            return connect(IpVersion::V4).await;
+        }
+        // Losing lookups and connection attempts release their queries/sockets.
+        connect_with_fallback(connect(IpVersion::V4), connect(IpVersion::V6)).await
+    })
+    .await
+    .map_err(|_| StackError::ConnectTimeout)?
+}
+
+async fn connect_addresses<T, F, Fut>(
+    addresses: Vec<IpAddr>,
+    port: u16,
+    connect: F,
+) -> Result<T, StackError>
+where
+    F: Fn(SocketAddr) -> Fut,
+    Fut: Future<Output = Result<T, StackError>>,
+{
+    let mut addresses = addresses.into_iter().peekable();
+    // These futures belong to the requesting task. Dropping the race releases
+    // every losing socket immediately, without spawning or cancelling tasks.
+    let mut attempts = FuturesUnordered::new();
+    let mut next_attempt = time::Instant::now();
+    let mut last_error = StackError::NoDnsAddress;
+    loop {
+        if (attempts.is_empty() || time::Instant::now() >= next_attempt)
+            && let Some(address) = addresses.next()
+        {
+            attempts.push(connect(SocketAddr::new(address, port)));
+            next_attempt = time::Instant::now() + ADDRESS_FAMILY_DELAY;
+        }
+        if attempts.is_empty() {
+            return Err(last_error);
+        }
+        tokio::select! {
+            result = attempts.next() => match result {
+                Some(Ok(stream)) => return Ok(stream),
+                Some(Err(error)) => last_error = error,
+                None => return Err(last_error),
+            },
+            _ = time::sleep_until(next_attempt), if addresses.peek().is_some() => {}
+        }
     }
-    // Keep each lookup alive through its connection attempt. Losing attempts are
-    // cancelled by dropping their futures, releasing DNS queries and sockets.
-    connect_with_fallback(connect(IpVersion::V4), connect(IpVersion::V6)).await
 }
 
 async fn connect_with_fallback<T>(
@@ -124,6 +165,67 @@ impl AsyncWrite for LeasedStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    #[tokio::test]
+    async fn later_dns_answer_wins_when_the_first_address_never_connects() {
+        let addresses = vec!["192.0.2.1".parse().unwrap(), "192.0.2.2".parse().unwrap()];
+        let dropped = Arc::new(AtomicBool::new(false));
+        struct PendingAttempt(Arc<AtomicBool>);
+        impl Drop for PendingAttempt {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Relaxed);
+            }
+        }
+        let result = time::timeout(
+            Duration::from_secs(2),
+            connect_addresses(addresses, 443, |address| {
+                let dropped = Arc::clone(&dropped);
+                async move {
+                    if address.ip() == "192.0.2.1".parse::<IpAddr>().unwrap() {
+                        let _guard = PendingAttempt(dropped);
+                        std::future::pending().await
+                    } else {
+                        Ok(address)
+                    }
+                }
+            }),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(result, "192.0.2.2:443".parse().unwrap());
+        assert!(dropped.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn refused_dns_answer_tries_next_immediately_and_all_failures_return() {
+        let addresses = vec!["192.0.2.1".parse().unwrap(), "192.0.2.2".parse().unwrap()];
+        let result = time::timeout(
+            Duration::from_millis(100),
+            connect_addresses(addresses, 443, |address| async move {
+                if address.ip() == "192.0.2.1".parse::<IpAddr>().unwrap() {
+                    Err(StackError::Disconnected)
+                } else {
+                    Ok(address)
+                }
+            }),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(result, "192.0.2.2:443".parse().unwrap());
+        assert!(matches!(
+            connect_addresses(vec![result.ip()], 443, |_| async {
+                Err::<(), _>(StackError::Disconnected)
+            })
+            .await,
+            Err(StackError::Disconnected)
+        ));
+    }
 
     #[tokio::test]
     async fn failed_primary_uses_fallback_without_waiting_for_stagger() {

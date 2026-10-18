@@ -11,3 +11,4 @@ pub use client::{
     ClientConfig, Ipv6Route, Ipv6TunnelSettings, Session, SessionConfig, TunnelSettings,
 };
 pub use error::Error;
+pub use ovpn_profile::TlsVersion;

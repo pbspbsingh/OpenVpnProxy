@@ -5,6 +5,9 @@ edition.workspace = true
 publish.workspace = true
 
 [dependencies]
+# Shared, validated profile policy types (no runtime dependencies).
+ovpn-profile.workspace = true
+
 # OpenVPN packet cryptography and randomness
 aes.workspace = true
 aes-gcm.workspace = true

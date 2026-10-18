@@ -37,7 +37,7 @@ Only applications configured to use this SOCKS5 proxy follow this path. The proj
 | `ovpn-ui` | Embedded dashboard with shutdown control, WebSocket feeds, bounded log buffer, and in-memory one-minute chart history. | Transports serialized dashboard frames and log events; no VPN or SOCKS dependency. |
 | `openvpn-proxy-app` | TOML config, host discovery, connection manager, sticky routing, tunnel supervision, SOCKS and dashboard listeners, and shutdown. | Executable and composition root. |
 
-The dependency direction is `app → profile/client/netstack/socks5/ui`. The app owns one OpenVPN session and one packet stack **per active VPN host**, connects their plain IP packet streams, and supplies routing/DNS/connection policy to SOCKS through its connector. Reusable crates expose typed errors with `thiserror`; the app adds context with `anyhow` and logs through `tracing`.
+The app composes `profile`, `client`, `netstack`, `socks5`, and `ui`. The VPN client also uses the profile crate's pure policy types, so parsing and TLS negotiation share one definition of supported TLS versions. The app owns one OpenVPN session and one packet stack **per active VPN host**, connects their plain IP packet streams, and supplies routing/DNS/connection policy to SOCKS through its connector. Reusable crates expose typed errors with `thiserror`; the app adds context with `anyhow` and logs through `tracing`.
 
 ### Connection manager and sticky routing
 
@@ -45,9 +45,13 @@ The app resolves every profile `remote` to IPv4 endpoints, deduplicates them, an
 
 The initial score is the median of three tunneled TCP connection times to `1.1.1.1:443`; at least two must succeed. Logs report tunnel setup time, time spent obtaining the score, and total time for each host. Connected hosts refresh the score every minute on staggered schedules, smoothing new samples with the previous score; probes do not count as client activity. A dormant replacement gets a fresh score before receiving traffic. Scores remain in memory only and are measured again on app restart.
 
+If a live latency assessment fails, the host checks tunneled TCP connectivity to `8.8.8.8:443` and `9.9.9.9:443`. Either successful connection preserves the host. Three failed health assessments end the host session through its normal failure path, clearing assignments and activating a scored standby or retrying the host. A successful assessment resets the session's failure count. A full local TCP socket table makes a check inconclusive rather than counting as a network failure. The host session owns health tracking; routing receives its usual ready/down transitions.
+
 For a SOCKS hostname, the application connector acquires a route **before DNS**. The manager uses the Public Suffix List to group a registrable domain and its subdomains: `abc.com` and `xyz.abc.com` share an assignment for the same client source IP. Direct IP requests use `(source IP, destination IP)` as the sticky key. A new group chooses among ready selected hosts using latency and current connection count. IPv6 requests require a matching IPv6 route on the selected tunnel. Existing assignments remain fixed until their host fails or they have no TCP connections for 30 minutes. On failure, the manager removes that host's assignments and shuts down its stack, closing existing proxied TCP connections. When the entire pool has no client routes for 30 minutes, all VPN sessions close and sticky state clears. The next request reopens the selected pool.
 
 The sticky table is bounded. If it fills, new groups fail closed rather than silently losing their assignment. DNS for a hostname runs through its assigned host's packet stack, so DNS and TCP use the same VPN. On IPv6-capable tunnels, IPv4 resolution/connection starts first and an IPv6 attempt starts after 250 ms, or immediately if IPv4 fails. The first successful attempt wins; cancellation releases the losing query or socket.
+
+DNS retains up to 16 answers per address family. Connection attempts within a family also start 250 ms apart, advancing immediately when no attempt remains pending. This allows a later address to succeed while an earlier address is unreachable. DNS and all address attempts share a 30-second deadline; successful connection or cancellation releases the remaining attempts.
 
 ### Inside the OpenVPN client
 
@@ -58,11 +62,15 @@ The sticky table is bounded. If it fills, new groups fail closed rather than sil
 
 The control channel establishes trust and derives data keys. The data channel carries the actual IP packets. They share one UDP socket, but use different packet types and cryptographic state.
 
+Profiles support `tls-version-min` and `tls-version-max`, with TLS 1.2 through 1.3 enabled by default. The bounds apply to initial connections and rekeys. Minimums below 1.2 retain the implementation's TLS 1.2 floor; maximums below 1.2 and conflicting bounds fail validation. `tls-version-min` also supports `or-highest`. Unsupported security directives and unknown options fail profile loading instead of disappearing silently. Native OS setup/script and scheduling options are explicitly ignored because this client owns its userspace networking and never runs profile scripts.
+
 ### Inside the packet stack
 
 `Stack` is a cloneable async handle. Its commands go to one `smoltcp` engine task; callers receive connection events through channels. The engine polls a virtual IP device, runs DNS and TCP state machines, and emits IPv4 or IPv6 packets to the app according to the VPN server's routes. The device is an in-memory packet queue, not a TUN interface. The engine wakes for commands, consumed connection events, and the next TCP or application deadline; it does not need a dedicated OS thread for `smoltcp`.
 
 `smoltcp` supplies the TCP behavior a SOCKS client expects: connection setup, sequencing, acknowledgments, retransmission, and teardown. The SOCKS handler works with byte streams and connection events; it does not construct TCP or IP headers. Each connection's `StreamWriter` has a bounded upload queue. When that queue fills, SOCKS pauses client reads while continuing to receive responses and monitor tunnel failure. Ready buffered work yields cooperatively without waiting on the timer wheel.
+
+TCP handshakes retain their existing connection deadline. Established connections with outstanding data use a fixed 924.6-second failure limit (about 15 minutes), based on the Linux default `tcp_retries2` reference budget. Healthy idle connections remain open, and writing after an idle period starts a fresh wait for acknowledgements. There is no timeout configuration setting.
 
 ## Startup sequence
 

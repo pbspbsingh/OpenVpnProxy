@@ -133,7 +133,9 @@ impl AsyncRead for TunnelStream {
                 Some(StreamEvent::Data(data)) => self.buffered = Bytes::from(data),
                 Some(StreamEvent::ReadClosed) => self.read_closed = true,
                 Some(StreamEvent::Connected) => continue,
-                Some(StreamEvent::Closed) | None => return Poll::Ready(Err(disconnected())),
+                Some(StreamEvent::ConnectFailed(_)) | Some(StreamEvent::Closed) | None => {
+                    return Poll::Ready(Err(disconnected()));
+                }
             }
         }
     }

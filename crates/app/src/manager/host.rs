@@ -11,11 +11,12 @@ use tokio::task::JoinSet;
 use tokio::time;
 
 use super::discovery::HostCandidate;
+use super::domain::{HostActivation, HostPhase};
 use super::probe::{
     LatencyScore, PROBE_INTERVAL, SessionHealth, check_health, measure_with_session,
 };
-use super::routing::{HostActivation, Shared};
-use super::telemetry::{HostPhase, HostTraffic};
+use super::routing::Shared;
+use super::telemetry::HostTraffic;
 
 const TUNNEL_PACKET_QUEUE_CAPACITY: usize = 1024;
 pub(super) const CONTROL_SETUP_ALLOWANCE: Duration = Duration::from_secs(30);

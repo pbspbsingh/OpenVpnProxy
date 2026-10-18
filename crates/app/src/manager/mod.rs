@@ -1,4 +1,5 @@
 mod discovery;
+pub(crate) mod domain;
 mod host;
 mod probe;
 mod routing;

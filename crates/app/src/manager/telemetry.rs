@@ -1,32 +1,10 @@
 //! Domain observations. Producers never wait for dashboard work or depend on UI types.
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
 
-pub(crate) const STICKY_IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
-pub(crate) const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum HostPhase {
-    Dormant,
-    Connecting,
-    Ready,
-    Backoff,
-    Stopped,
-}
-
-#[derive(Clone, Hash, Eq, PartialEq, Debug)]
-pub(crate) struct StickyKey {
-    pub source: IpAddr,
-    pub destination: StickyDestination,
-}
-
-#[derive(Clone, Hash, Eq, PartialEq, Debug)]
-pub(crate) enum StickyDestination {
-    Ip(IpAddr),
-    Domain(String),
-}
+use super::domain::{HostPhase, StickyKey};
 
 #[derive(Clone)]
 pub(crate) struct HostObservation {

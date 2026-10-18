@@ -7,10 +7,10 @@ use ovpn_ui::{
     PoolSnapshot,
 };
 
-use crate::manager::telemetry::{
-    HostObservation, HostPhase, Observation, POOL_IDLE_TIMEOUT, PoolObservation,
-    STICKY_IDLE_TIMEOUT, StickyDestination, StickyKey,
+use crate::manager::domain::{
+    HostPhase, POOL_IDLE_TIMEOUT, STICKY_IDLE_TIMEOUT, StickyDestination, StickyKey,
 };
+use crate::manager::telemetry::{HostObservation, Observation, PoolObservation};
 
 pub(super) enum Lifecycle {
     Starting(&'static str),

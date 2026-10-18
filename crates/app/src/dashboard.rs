@@ -241,7 +241,8 @@ impl DashboardHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::manager::telemetry::{HostObservation, HostPhase, StickyDestination, StickyKey};
+    use crate::manager::domain::{HostPhase, StickyDestination, StickyKey};
+    use crate::manager::telemetry::HostObservation;
 
     fn initialize(telemetry: &Telemetry) {
         telemetry.emit(|| Observation::Initialized {

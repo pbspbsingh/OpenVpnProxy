@@ -13,6 +13,7 @@ use crate::manager::domain::{
 use crate::manager::telemetry::{HostObservation, Observation, PoolObservation};
 
 pub(super) enum Lifecycle {
+    Unconfigured,
     Starting(&'static str),
     Running,
     Failed(String),
@@ -34,6 +35,7 @@ struct Assignment {
 
 pub(super) struct Projection {
     pub lifecycle: Lifecycle,
+    pub configuration: ovpn_ui::ConfigurationStatus,
     hosts: Vec<HostView>,
     pool: PoolObservation,
     max_active_hosts: usize,
@@ -45,6 +47,7 @@ impl Projection {
     pub fn new() -> Self {
         Self {
             lifecycle: Lifecycle::Starting("Starting proxy"),
+            configuration: ovpn_ui::ConfigurationStatus::default(),
             hosts: Vec::new(),
             pool: PoolObservation::default(),
             max_active_hosts: 0,
@@ -128,7 +131,6 @@ impl Projection {
                     groups.clear();
                 }
             }
-            #[cfg(test)]
             Observation::Barrier(reply) => {
                 let _ = reply.send(());
             }
@@ -193,6 +195,10 @@ impl Projection {
             PoolPhase::Ready
         };
         let (phase, message) = match &self.lifecycle {
+            Lifecycle::Unconfigured => (
+                PoolPhase::Unconfigured,
+                Some("No configuration active; add or activate one in Configuration".into()),
+            ),
             Lifecycle::Starting(stage) => (PoolPhase::Starting, Some((*stage).to_owned())),
             Lifecycle::Running => (phase, None),
             Lifecycle::Failed(error) => (PoolPhase::Failed, Some(error.clone())),
@@ -204,6 +210,7 @@ impl Projection {
                 .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
                 .unwrap_or_default(),
             message,
+            configuration: self.configuration.clone(),
             pool: PoolSnapshot {
                 phase,
                 candidate_hosts: self.hosts.len(),

@@ -35,7 +35,7 @@ Only applications configured to use this SOCKS5 proxy follow this path. The proj
 | `ovpn-netstack` | Virtual IP interface, DNS queries, TCP connections, and IP packet production/consumption using `smoltcp`. | An exclusive `StackOwner` for the host; cloneable `Stack` connection handles and standard async `TunnelStream`s for clients. |
 | `ovpn-socks5` | SOCKS5 negotiation and bidirectional stream forwarding, including TCP half-close. | An application-supplied `Connector` returns an async stream. No VPN or packet-stack dependency. |
 | `ovpn-ui` | Embedded dashboard with shutdown control, WebSocket feeds, bounded log buffer, and in-memory one-minute chart history. | Transports serialized dashboard frames and log events; no VPN or SOCKS dependency. |
-| `openvpn-proxy-app` | TOML config, host discovery, connection manager, sticky routing, tunnel supervision, SOCKS and dashboard listeners, and shutdown. | Executable and composition root. |
+| `openvpn-proxy-app` | TOML config, saved configurations, activation, host discovery, connection manager, sticky routing, tunnel supervision, SOCKS and dashboard listeners, and shutdown. | Executable and composition root. |
 
 The app composes `profile`, `client`, `netstack`, `socks5`, and `ui`. The VPN client also uses the profile crate's pure policy types, so parsing and TLS negotiation share one definition of supported TLS versions. The app owns one OpenVPN session and one packet stack **per active VPN host**, connects their plain IP packet streams, and supplies routing/DNS/connection policy to SOCKS through its connector. Reusable crates expose typed errors with `thiserror`; the app adds context with `anyhow` and logs through `tracing`.
 
@@ -76,7 +76,7 @@ TCP handshakes retain their existing connection deadline. Established connection
 
 ## Startup sequence
 
-When configured, the dashboard binds first and remains available during profile loading and host probing. The SOCKS listener binds after profile validation, but accepts clients only after host discovery and baseline probing. Baseline tunnels close after measurement; serving tunnels start when requests arrive.
+When configured, the dashboard binds first and remains available during profile loading, host probing, and configuration changes. The optional `[openvpn_config]` section supplies the read-only Default entry. Startup restores the last successfully active configuration using its latest saved settings. On the first launch, it uses Default if present; otherwise the dashboard waits for activation from Configuration. Headless operation requires either a saved startup selection or that section. The SOCKS listener binds after profile validation, but accepts clients only after host discovery and baseline probing. Baseline tunnels close after measurement; serving tunnels start when requests arrive.
 
 ```mermaid
 sequenceDiagram
@@ -191,29 +191,98 @@ The OpenVPN protocol code is Rust. `rustls` uses the `aws-lc-rs` crypto provider
 ```sh
 cargo build --release -p openvpn-proxy-app
 cp config.toml.example config.toml
-# Set profile_path, username, password, and socks5_address in config.toml.
+# Open the dashboard to add a VPN, or define [openvpn_config] in config.toml.
 cargo run --release -p openvpn-proxy-app
 ```
 
-Pass a path as the sole argument to use a config file other than `config.toml`. Relative `profile_path` values resolve from that file's directory. `max_active_vpn_hosts` defaults to 16. Set `webui_address` to enable the dashboard; omitting it starts no web server. When enabled, the dashboard binds before profile loading, SOCKS binding, and VPN probing. A failed dashboard bind stops startup; a later proxy startup or listener failure appears in the dashboard, which stays available until shutdown. `dns_override` is optional; it replaces the server-pushed resolver for SOCKS destination lookups and still sends those queries through the assigned VPN. Without a usable DNS server, hostname requests fail; direct IP address requests can still work.
+Pass a path as the sole argument to use a config file other than `config.toml`. Application settings (`socks5_address`, `webui_address`, and `dashboard_log_capacity`) stay at the top level. The optional `[openvpn_config]` section holds `profile_path`, `username`, `password`, `dns_override`, and `max_active_vpn_hosts`. Relative `profile_path` values resolve from the application TOML file's directory. Each VPN's `max_active_vpn_hosts` defaults to 16. Set `webui_address` to enable the dashboard; omitting it starts no web server. When enabled, the dashboard binds before profile loading, SOCKS binding, and VPN probing. A failed dashboard bind stops startup; a later proxy startup or listener failure appears in the dashboard, which stays available until shutdown. `dns_override` is optional; it replaces the server-pushed resolver for SOCKS destination lookups and still sends those queries through the assigned VPN. Without a usable DNS server, hostname requests fail; direct IP address requests can still work.
 
 ```sh
 curl --socks5-hostname 127.0.0.1:1080 https://example.com
 RUST_LOG=debug cargo run --release -p openvpn-proxy-app
 ```
 
-With `webui_address = "127.0.0.1:8080"`, open `http://127.0.0.1:8080` for the dashboard. Overview, Hosts, and Routing status update through a WebSocket every five seconds. System and per-host TX/RX and latency charts show the latest 60 one-minute buckets; traffic charts show average bytes per second and latency charts show milliseconds, including on hover. The UI uses Alpine.js components and native JavaScript modules; Alpine and Chart.js load from pinned CDN URLs, so the browser needs CDN access. The Rust binary embeds the entire application assets directory; no Node or frontend build step is required. See [dashboard development](crates/ui/README.md) for the component structure and browser checks. The Hosts tab shows the selected host's assigned groups in a panel with its own scrollbar; entries load in pages and show source IP, destination group, and active or idle state. The dashboard actor maintains a local view from routing and host observations. Group pages read that view; WebSocket status reflects the most recent five-second sample. Dashboard and log WebSockets retry after 5, 10, and 30 seconds, then show Disconnected until the page is reloaded. The Profile tab shows loaded remotes, authentication policy, certificate checks, IPv6 policy, and timing settings.
+With `webui_address = "127.0.0.1:8080"`, open `http://127.0.0.1:8080` for the dashboard. Overview, Hosts, and Routing status update through a WebSocket every five seconds. System and per-host TX/RX and latency charts show the latest 60 one-minute buckets; traffic charts show average bytes per second and latency charts show milliseconds, including on hover. The UI uses Alpine.js components and native JavaScript modules; Alpine and Chart.js load from pinned CDN URLs, so the browser needs CDN access. The Rust binary embeds the entire application assets directory; no Node or frontend build step is required. See [dashboard development](crates/ui/README.md) for the component structure and browser checks. The Hosts tab shows the selected host's assigned groups in a panel with its own scrollbar; entries load in pages and show source IP, destination group, and active or idle state. The dashboard actor maintains a local view from routing and host observations. Group pages read that view; WebSocket status reflects the most recent five-second sample. Dashboard and log WebSockets retry after 5, 10, and 30 seconds, then show Disconnected until the page is reloaded. The Profile tab shows loaded remotes, authentication policy, certificate checks, IPv6 policy, and timing settings for the current activation.
 
 The Logs tab shows recent tracing events and receives new events immediately through its own WebSocket, which is open only while that tab is selected. `dashboard_log_capacity` sets the number of retained entries (default 1000, maximum 20000); each message is capped at 4096 bytes. History loads in batches, and the tab initially renders the latest 2000 matching rows; use Show older to view more. The Minimum level filter includes the selected severity and all more severe events: INFO includes WARN and ERROR. Under heavy logging, a full input queue drops log events and the tab reports the drop count rather than blocking traffic.
 
 The header’s Shut down button asks for confirmation, then requests graceful shutdown of the proxy and its VPN tunnels. It also works during startup or when startup has failed. Anyone with dashboard access can use this control.
 
-The current chart minute is partial; history, counters, and buffered logs reset when the app restarts. The dashboard includes a Shut down button and has no authentication; it binds only to loopback when configured with a loopback address. Logs can contain destination names and other operational details, so restrict dashboard access accordingly.
+The current chart minute is partial; history, counters, and buffered logs reset when the app restarts. The dashboard includes configuration management, activation/restart, and a Shut down button, and has no authentication; it binds only to loopback when configured with a loopback address. Logs can contain destination names and other operational details, so restrict dashboard access accordingly.
 
 `RUST_LOG=info` shows discovered hosts, connection attempts, ready/down transitions, idle closures, and new domain assignments. `RUST_LOG=debug` adds route requests, retries, and per-host activity. `RUST_LOG=trace` adds packet flow details. `socks5_address = "0.0.0.0:1080"` accepts clients from other machines. The proxy has **no SOCKS authentication**, so choose the bind address and network exposure accordingly. `config.toml` contains credentials; it and `*.ovpn` are ignored by Git.
 
 For a browser speed test, run the release build with `RUST_LOG=debug`. `VPN route acquired` and `VPN destination connected` include `stack_id`, route acquisition time, and total connection setup time. `SOCKS5 connection finished` reports total elapsed time and transferred bytes in each direction. Hosts and packet stacks report 10-second traffic windows. `packet stack activity` includes command, timer, and consumer wakeups, timer lateness, time spent per pass, full 4 KiB reads, event queue stalls, and the largest queued TCP write. Share these summaries and the matching `VPN host traffic` lines when investigating a slow request; debug logs also contain destination names.
 
+## Saved configurations and activation
+
+The Configuration tab manages multiple named VPN entries, with one active at a time.
+Application listener settings remain fixed for the process lifetime. A default VPN is optional:
+
+```toml
+socks5_address = "127.0.0.1:1080"
+webui_address = "127.0.0.1:8080"
+
+# Omit this section to start the dashboard without an active VPN.
+[openvpn_config]
+profile_path = "client.ovpn"
+username = "your-user"
+password = "your-password"
+max_active_vpn_hosts = 16
+# dns_override = "1.1.1.1"
+```
+
+Existing installations must move their top-level VPN fields into `[openvpn_config]`.
+The Default entry is read-only through the API and dashboard; changing its application
+TOML settings requires restarting the executable. The referenced default `.ovpn` is
+read again when Default is activated.
+
+Custom entries contain a name, username/password, uploaded `.ovpn`, optional DNS override,
+and host limit. They are stored as `configs/<id>.toml` **under the current working directory**,
+regardless of the application TOML file's location. Each record contains metadata plus
+an `[openvpn_config]` section with the credentials and inline profile text. No database
+or runtime asset directory is required. The directory is ignored by Git. On Unix, newly
+created storage directories use mode `0700` and records use `0600`. Records contain
+credentials in plaintext; files are flushed and atomically replaced when saved.
+
+Saving validates the supported profile syntax and required credentials without opening
+a VPN session. It does not change a running proxy. Editing can retain the existing password
+and profile, replace either, or explicitly clear the password when the profile permits it.
+API responses contain only metadata, never passwords or profile contents. Revisions reject
+stale edits and activation requests. Up to 64 custom entries are supported; uploaded
+profiles are limited to 256 KiB.
+
+Activate (or Restart for the active saved revision) validates and captures the selected
+revision, closes and joins existing SOCKS clients and VPN/routing workers, resets dashboard
+status/counters/chart history, then runs host discovery and baseline assessment again.
+The HTTP server and logs stay available. A failed activation leaves the proxy unavailable
+and the dashboard usable for another activation; it does not silently select another VPN.
+Existing TCP connections cannot survive activation. Saving changes leaves the running
+settings unchanged; they take effect on explicit activation or the next app restart.
+
+Saved entries survive executable restarts. Each successful activation atomically stores
+only its configuration ID in `configs/active.toml`; no old settings or profile copies are
+preserved. Startup loads that entry's latest saved settings, including in headless mode.
+A failed switch does not replace the last successful selection. With no startup selection,
+it uses Default if configured; otherwise the dashboard waits for a selection.
+
+Custom entries can be deleted with confirmation. Default is read-only, and a running or
+starting configuration must be switched away from before deletion. Deleting an entry also
+clears its startup selection when applicable. IDs are never intentionally recycled, so a
+stale browser cannot modify a newly created entry after deletion.
+
+If the selected configuration or referenced OpenVPN profile file is missing, the app emits
+an ERROR log and displays a prominent red alert across dashboard tabs. It keeps the
+dashboard available for restoring the file or choosing another configuration; it does not
+silently switch VPNs. A successful selection clears the warning.
+
+The app's
+configuration service owns persistence and prepared activation requests; the lifecycle loop
+alone owns the running proxy. HTTP depends on a separate `ConfigurationControl` interface,
+while `DashboardSource` remains read-only. Old observation producers are joined and drained
+before the dashboard resets, and each activation has a generation to invalidate cached
+profile, host, and rate data in the browser.
+
 ## Current scope
 
-Supported profiles use UDP/IPv4 to reach the VPN server, an inline CA, `tls-crypt` v1, and AES-256-GCM. Username/password is supported when required. The SOCKS5 listener stays on the configured IPv4 address and supports unauthenticated TCP CONNECT to IPv4, IPv6, and hostnames. IPv6 destinations work only when the chosen VPN server pushes an IPv6 tunnel address and route and neither the profile nor server blocks IPv6; otherwise the request fails closed. Hostnames use tunneled A and AAAA queries on IPv6-capable hosts and can fall back to IPv4. UDP ASSOCIATE, throughput-based host selection, and dashboard configuration editing are not implemented. macOS behavior remains unverified.
+Supported profiles use UDP/IPv4 to reach the VPN server, an inline CA, `tls-crypt` v1, and AES-256-GCM. Username/password is supported when required. The SOCKS5 listener stays on the configured IPv4 address and supports unauthenticated TCP CONNECT to IPv4, IPv6, and hostnames. IPv6 destinations work only when the chosen VPN server pushes an IPv6 tunnel address and route and neither the profile nor server blocks IPv6; otherwise the request fails closed. Hostnames use tunneled A and AAAA queries on IPv6-capable hosts and can fall back to IPv4. UDP ASSOCIATE and throughput-based host selection are not implemented. macOS behavior remains unverified.

@@ -1,5 +1,6 @@
 mod app;
 mod config;
+mod configurations;
 mod connector;
 mod dashboard;
 mod logging;

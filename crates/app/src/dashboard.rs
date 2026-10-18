@@ -33,6 +33,8 @@ pub(crate) struct DashboardHandle {
 }
 
 enum Request {
+    Reset(oneshot::Sender<()>),
+    Configuration(ovpn_ui::ConfigurationStatus),
     Lifecycle(Lifecycle),
     Profile(ProfileSummary),
     Groups {
@@ -107,6 +109,28 @@ impl Drop for Dashboard {
 }
 
 impl DashboardHandle {
+    /// Call only after joining all old producers, before starting the next manager.
+    pub(crate) async fn reset(&self) -> Result<(), ovpn_ui::GroupError> {
+        let (reply, received) = oneshot::channel();
+        self.telemetry.emit(|| Observation::Barrier(reply));
+        received
+            .await
+            .map_err(|_| ovpn_ui::GroupError::Unavailable)?;
+        let (reply, received) = oneshot::channel();
+        self.requests
+            .send(Request::Reset(reply))
+            .map_err(|_| ovpn_ui::GroupError::Unavailable)?;
+        received.await.map_err(|_| ovpn_ui::GroupError::Unavailable)
+    }
+
+    pub(crate) fn configuration_changed(&self, status: ovpn_ui::ConfigurationStatus) {
+        let _ = self.requests.send(Request::Configuration(status));
+    }
+
+    pub(crate) fn unconfigured(&self) {
+        self.lifecycle(Lifecycle::Unconfigured);
+    }
+
     pub(crate) fn telemetry(&self) -> Telemetry {
         self.telemetry.clone()
     }
@@ -142,6 +166,17 @@ impl DashboardActor {
                 _ = &mut stop => break,
                 Some(event) = observations.recv() => self.projection.observe(event),
                 Some(request) = requests.recv() => match request {
+                    Request::Reset(reply) => {
+                        self.projection = Projection::new();
+                        self.history = DashboardHistory::new();
+                        self.profile.send_replace(ProfileSummary::default());
+                        self.publish();
+                        let _ = reply.send(());
+                    }
+                    Request::Configuration(status) => {
+                        self.projection.configuration = status;
+                        self.publish();
+                    }
                     Request::Lifecycle(state) => { self.projection.lifecycle = state; self.publish(); }
                     Request::Profile(profile) => { self.profile.send_replace(profile); }
                     Request::Groups { host_id, offset, limit, reply } => {
@@ -306,6 +341,39 @@ mod tests {
             Err(GroupError::Unavailable)
         ));
         assert!(!handle.telemetry().is_enabled());
+    }
+
+    #[tokio::test]
+    async fn activation_reset_drains_old_observations_and_clears_profile_history_and_routes() {
+        let dashboard = Dashboard::start().unwrap();
+        let handle = dashboard.handle();
+        let telemetry = handle.telemetry();
+        initialize(&telemetry);
+        telemetry.emit(|| Observation::Traffic {
+            id: 0,
+            tx_bytes: 100,
+            rx_bytes: 200,
+        });
+        handle.profile_loaded(ProfileSummary {
+            credentials_required: true,
+            ..ProfileSummary::default()
+        });
+        // Reset must consume queued old events before clearing their host indices.
+        handle.reset().await.unwrap();
+        let snapshot = handle.snapshot().await;
+        assert!(snapshot.hosts.is_empty());
+        assert_eq!(snapshot.pool.rx_bytes, 0);
+        assert!(!handle.profile().credentials_required);
+        assert!(!handle.subscribe().borrow().contains("127.0.0.1:1194"));
+        initialize(&telemetry);
+        telemetry.emit(|| Observation::Traffic {
+            id: 0,
+            tx_bytes: 1,
+            rx_bytes: 2,
+        });
+        handle.flush_observations().await;
+        assert_eq!(handle.snapshot().await.pool.rx_bytes, 2);
+        dashboard.shutdown().await;
     }
 
     #[tokio::test]

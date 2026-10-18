@@ -52,7 +52,6 @@ pub(crate) enum Observation {
         tx_bytes: u64,
         rx_bytes: u64,
     },
-    #[cfg(test)]
     Barrier(tokio::sync::oneshot::Sender<()>),
 }
 

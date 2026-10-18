@@ -24,6 +24,7 @@ impl Fixture {
             version: 1,
             sampled_at_ms: now.as_millis() as u64,
             message: None,
+            configuration: ovpn_ui::ConfigurationStatus::default(),
             pool: PoolSnapshot {
                 phase: PoolPhase::Ready,
                 candidate_hosts: 2,
@@ -165,6 +166,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         receiver,
         logs,
         shutdown_request,
+        None,
     )
     .await;
     sampler.abort();

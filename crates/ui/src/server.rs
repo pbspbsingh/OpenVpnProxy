@@ -1,3 +1,5 @@
+mod configuration;
+
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -6,7 +8,7 @@ use std::time::Duration;
 use axum::Json;
 use axum::Router;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Path, Query, State};
+use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE, HOST, ORIGIN};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::map_response;
@@ -19,9 +21,13 @@ use tokio::net::TcpListener;
 use tokio::sync::{Semaphore, broadcast, watch};
 use tokio::time;
 
+use self::configuration::{
+    activate_configuration, create_configuration, delete_configuration, list_configurations,
+    update_configuration,
+};
 use crate::assets;
 use crate::logs::{LogEntry, LogHub};
-use crate::{GroupPage, ProfileSummary};
+use crate::{ConfigurationControl, GroupPage, ProfileSummary};
 
 const MAX_WEBSOCKET_CLIENTS: usize = 32;
 const MAX_LOG_CLIENTS: usize = 8;
@@ -60,6 +66,8 @@ pub enum UiError {
 
 #[derive(Clone)]
 struct UiState {
+    configurations: Option<Arc<dyn ConfigurationControl>>,
+    configuration_queries: Arc<Semaphore>,
     source: Arc<dyn DashboardSource>,
     updates: watch::Receiver<String>,
     connections: Arc<Semaphore>,
@@ -83,10 +91,13 @@ pub async fn serve<S: DashboardSource>(
     shutdown: watch::Receiver<bool>,
     logs: LogHub,
     shutdown_request: watch::Sender<bool>,
+    configurations: Option<Arc<dyn ConfigurationControl>>,
 ) -> Result<(), UiError> {
     let source: Arc<dyn DashboardSource> = Arc::new(source);
     let updates = source.subscribe();
     let state = UiState {
+        configurations,
+        configuration_queries: Arc::new(Semaphore::new(4)),
         source,
         updates,
         connections: Arc::new(Semaphore::new(MAX_WEBSOCKET_CLIENTS)),
@@ -103,9 +114,22 @@ pub async fn serve<S: DashboardSource>(
         .route("/api/hosts/{host_id}/groups", get(groups))
         .route("/api/profile", get(profile))
         .route("/api/shutdown", post(request_shutdown))
+        .route(
+            "/api/configurations",
+            get(list_configurations).post(create_configuration),
+        )
+        .route(
+            "/api/configurations/{id}",
+            axum::routing::put(update_configuration).delete(delete_configuration),
+        )
+        .route(
+            "/api/configurations/{id}/activate",
+            post(activate_configuration),
+        )
         .route("/ws", any(websocket))
         .route("/ws/logs", any(log_websocket))
         .layer(map_response(no_cache))
+        .layer(DefaultBodyLimit::max(2 * 1024 * 1024))
         .with_state(state);
     tracing::info!(address = %listener.local_addr()?, "dashboard listening");
 

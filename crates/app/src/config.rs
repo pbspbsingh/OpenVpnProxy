@@ -9,15 +9,23 @@ use serde::Deserialize;
 const DEFAULT_DASHBOARD_LOG_CAPACITY: usize = 1000;
 const MAX_DASHBOARD_LOG_CAPACITY: usize = 20_000;
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct AppConfig {
-    pub profile_path: PathBuf,
-    pub username: String,
-    pub password: String,
     pub socks5_address: SocketAddr,
     pub webui_address: Option<SocketAddr>,
     pub dashboard_log_capacity: Option<NonZeroUsize>,
+    pub openvpn_config: Option<OpenVpnConfig>,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct OpenVpnConfig {
+    pub profile_path: PathBuf,
+    #[serde(default)]
+    pub username: String,
+    #[serde(default)]
+    pub password: String,
     pub dns_override: Option<Ipv4Addr>,
     pub max_active_vpn_hosts: Option<NonZeroUsize>,
 }
@@ -55,13 +63,40 @@ pub(crate) async fn load_config(path: &Path) -> Result<AppConfig> {
     if config.dashboard_log_capacity().get() > MAX_DASHBOARD_LOG_CAPACITY {
         bail!("dashboard_log_capacity must be at most {MAX_DASHBOARD_LOG_CAPACITY}");
     }
-    if config.profile_path.is_relative() {
-        let parent = path
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty());
-        if let Some(parent) = parent {
-            config.profile_path = parent.join(&config.profile_path);
+    if let Some(vpn) = &mut config.openvpn_config {
+        if vpn
+            .max_active_vpn_hosts
+            .is_some_and(|limit| limit.get() > 64)
+        {
+            bail!("max_active_vpn_hosts must be at most 64");
+        }
+        if vpn.profile_path.is_relative() {
+            let parent = path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty());
+            if let Some(parent) = parent {
+                vpn.profile_path = parent.join(&vpn.profile_path);
+            }
         }
     }
     Ok(config)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn application_settings_and_optional_openvpn_section_are_separate() {
+        let config: AppConfig =
+            toml::from_str("socks5_address = '127.0.0.1:1080'\nwebui_address = '127.0.0.1:8080'")
+                .unwrap();
+        assert!(config.openvpn_config.is_none());
+        let config: AppConfig = toml::from_str("socks5_address = '127.0.0.1:1080'\n[openvpn_config]\nprofile_path = 'client.ovpn'\nusername = 'user'\npassword = 'secret'").unwrap();
+        assert_eq!(config.openvpn_config.unwrap().username, "user");
+        assert!(
+            toml::from_str::<AppConfig>("socks5_address = '127.0.0.1:1080'\nusername = 'user'")
+                .is_err()
+        );
+    }
 }

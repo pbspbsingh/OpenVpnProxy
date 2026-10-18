@@ -69,15 +69,27 @@
     <button :aria-selected="$store.dashboard.tab === 'profile'" :class="{ active: $store.dashboard.tab === 'profile' }" :tabindex="$store.dashboard.tab === 'profile' ? 0 : -1" @click="selectTab('profile')" aria-controls="profile" aria-selected="false" class="tab" data-tab="profile" id="tab-profile" role="tab" type="button">
      Profile
     </button>
+    <button :aria-selected="$store.dashboard.tab === 'configuration'" :class="{ active: $store.dashboard.tab === 'configuration' }" :tabindex="$store.dashboard.tab === 'configuration' ? 0 : -1" @click="selectTab('configuration')" aria-controls="configuration" aria-selected="false" class="tab" data-tab="configuration" id="tab-configuration" role="tab" type="button">
+     Configuration
+    </button>
     <button :aria-selected="$store.dashboard.tab === 'logs'" :class="{ active: $store.dashboard.tab === 'logs' }" :tabindex="$store.dashboard.tab === 'logs' ? 0 : -1" @click="selectTab('logs')" aria-controls="logs" aria-selected="false" class="tab" data-tab="logs" id="tab-logs" role="tab" type="button">
      Logs
     </button>
    </nav>
-   <main>
+   <main :class="{ 'has-critical-warning': $store.dashboard.snapshot?.configuration?.file_missing }">
+    <div class="critical-warning" id="configuration-missing-warning" x-show="$store.dashboard.snapshot?.configuration?.file_missing" x-cloak role="alert">
+     <svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M12 3 2 21h20L12 3Z" stroke-linejoin="round"/><path d="M12 9v5m0 3v1" stroke-linecap="round"/></svg>
+     <div>
+      <strong>VPN configuration file missing</strong>
+      <p x-text="$store.dashboard.snapshot?.configuration?.message"></p>
+      <button class="config-button" @click="selectTab('configuration')" type="button">Choose another configuration</button>
+     </div>
+    </div>
     {{overview}}
     {{hosts}}
     {{routing}}
     {{profile}}
+    {{configuration}}
     {{logs}}
    </main>
    <footer>

@@ -4,4 +4,6 @@
 *.pem
 .env
 config.toml
+/configs/
+__pycache__/
 *.log

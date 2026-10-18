@@ -1,13 +1,13 @@
 use std::net::SocketAddr;
 
 use anyhow::{Context, Result, anyhow, bail};
-use ovpn_profile::Profile;
 use ovpn_ui::LogHub;
 use tokio::net::TcpListener;
-use tokio::sync::watch;
-use tokio::task::{JoinError, JoinHandle, JoinSet};
+use tokio::sync::{mpsc, watch};
+use tokio::task::{JoinError, JoinSet};
 
 use crate::config::AppConfig;
+use crate::configurations::{Activation, Configurations, PreparedConfiguration};
 use crate::dashboard::{Dashboard, DashboardHandle, summarize_profile};
 use crate::manager::{ConnectionManager, RouterHandle};
 
@@ -22,178 +22,255 @@ pub(crate) async fn run(config: AppConfig, logs: Option<LogHub>) -> Result<()> {
 }
 
 async fn run_with_dashboard(config: AppConfig, address: SocketAddr, logs: LogHub) -> Result<()> {
-    let webui_listener = TcpListener::bind(address)
+    let listener = TcpListener::bind(address)
         .await
         .with_context(|| format!("cannot bind dashboard on {address}"))?;
     let dashboard = Dashboard::start()?;
-    let result = serve_with_dashboard(config, webui_listener, dashboard.handle(), logs).await;
+    let storage = std::env::current_dir()
+        .context("cannot locate configuration storage")?
+        .join("configs");
+    let (configurations, requests) = Configurations::new(config.openvpn_config.clone(), storage);
+    let result = serve_with_dashboard(
+        config,
+        listener,
+        dashboard.handle(),
+        logs,
+        configurations,
+        requests,
+    )
+    .await;
     dashboard.shutdown().await;
     result
 }
 
+enum StartRequest {
+    Startup,
+    Prepared(Box<PreparedConfiguration>),
+}
+
+impl StartRequest {
+    async fn prepare(
+        self,
+        configurations: &Configurations,
+    ) -> Result<Option<PreparedConfiguration>> {
+        match self {
+            Self::Startup => Ok(configurations.prepare_startup().await?),
+            Self::Prepared(prepared) => Ok(Some(*prepared)),
+        }
+    }
+}
+
+/// The HTTP server outlives each proxy generation. Only this loop owns activation.
 async fn serve_with_dashboard(
     config: AppConfig,
-    webui_listener: TcpListener,
+    listener: TcpListener,
     source: DashboardHandle,
     logs: LogHub,
+    configurations: Configurations,
+    mut requests: mpsc::Receiver<Activation>,
 ) -> Result<()> {
     let (shutdown, _) = watch::channel(false);
     let (shutdown_request, mut requested) = watch::channel(false);
+    // Reject activation until startup selection has been resolved.
+    configurations.starting();
     let mut ui_task = tokio::spawn(ovpn_ui::serve(
-        webui_listener,
+        listener,
         source.clone(),
         shutdown.subscribe(),
         logs,
         shutdown_request,
+        Some(std::sync::Arc::new(configurations.clone())),
     ));
-
-    let startup = tokio::select! {
-        result = initialize(config, Some(&source)) => result,
-        result = &mut ui_task => return dashboard_ended(result),
-        signal = wait_for_stop(&mut requested) => {
-            shutdown.send_replace(true);
-            ui_task.await.context("dashboard task failed")??;
-            signal?;
-            return Ok(());
-        }
-    };
-
-    let (socks_listener, mut manager) = match startup {
-        Ok(started) => started,
-        Err(error) => {
-            return show_failure(error, &source, &shutdown, &mut requested, &mut ui_task).await;
-        }
-    };
-    source.running();
-    let mut socks = SocksServer::new(socks_listener, manager.router());
+    let mut next = Some(StartRequest::Startup);
+    let mut selection_updates = configurations.subscribe();
+    let mut proxy: Option<Proxy> = None;
+    let mut failure = None;
     let mut ui_finished = false;
-    let proxy_result = tokio::select! {
-        result = socks.run() => result,
-        result = manager.wait_for_failure() => result,
-        result = &mut ui_task => {
-            ui_finished = true;
-            dashboard_ended(result)
-        }
-        signal = wait_for_stop(&mut requested) => {
-            signal?;
-            tracing::info!("shutdown requested");
-            Ok(())
-        }
-    };
-    if let Err(error) = &proxy_result
-        && !ui_finished
-    {
-        source.failed(format!("{error:#}"));
-    }
-    socks.shutdown().await;
-    manager.shutdown().await;
+    source.configuration_changed(configurations.status());
 
-    match proxy_result {
-        Err(error) if !ui_finished => {
-            show_failure(error, &source, &shutdown, &mut requested, &mut ui_task).await
-        }
-        result => {
-            shutdown.send_replace(true);
-            if !ui_finished {
-                ui_task.await.context("dashboard task failed")??;
+    let result = 'serving: loop {
+        if let Some(start) = next.take() {
+            // Every previous producer has been joined before resetting observation state.
+            if let Err(error) = source.reset().await {
+                break Err(error.into());
             }
-            result
+            configurations.starting();
+            source.configuration_changed(configurations.status());
+            source.starting("Loading OpenVPN configuration");
+            let started = tokio::select! {
+                result = async {
+                    let prepared = start.prepare(&configurations).await?;
+                    source.configuration_changed(configurations.status());
+                    let Some(prepared) = prepared else { return Ok(None); };
+                    let started = Proxy::start(&config, prepared, Some(&source), configurations.status().generation).await?;
+                    if let Err(error) = configurations.ready().await {
+                        started.shutdown().await;
+                        return Err(error.into());
+                    }
+                    Ok(Some(started))
+                } => result,
+                signal = wait_for_stop(&mut requested) => break 'serving signal.map_err(Into::into),
+                result = &mut ui_task => {
+                    ui_finished = true;
+                    break 'serving dashboard_ended(result);
+                }
+            };
+            match started {
+                Ok(Some(started)) => {
+                    proxy = Some(started);
+                    failure = None;
+                    source.running();
+                }
+                Ok(None) => {
+                    failure = None;
+                    source.unconfigured();
+                }
+                Err(error) => {
+                    tracing::error!(%error, "proxy unavailable; dashboard remains active");
+                    configurations.failed(&error);
+                    source.failed(format!("{error:#}"));
+                    failure = Some(error);
+                }
+            }
+            source.configuration_changed(configurations.status());
         }
-    }
-}
 
-async fn run_without_dashboard(config: AppConfig) -> Result<()> {
-    tracing::info!("dashboard disabled; webui_address not configured");
-    let (socks_listener, mut manager) = tokio::select! {
-        result = initialize(config, None) => result?,
-        signal = tokio::signal::ctrl_c() => { signal?; return Ok(()); }
-    };
-    let mut socks = SocksServer::new(socks_listener, manager.router());
-    let result = tokio::select! {
-        result = socks.run() => result,
-        result = manager.wait_for_failure() => result,
-        signal = tokio::signal::ctrl_c() => {
-            signal?;
-            tracing::info!("shutdown requested");
-            Ok(())
+        tokio::select! {
+            signal = wait_for_stop(&mut requested) => {
+                if let Err(error) = signal { break Err(error.into()); }
+                break failure.map_or(Ok(()), Err);
+            }
+            result = &mut ui_task => {
+                ui_finished = true;
+                break dashboard_ended(result);
+            }
+            changed = selection_updates.changed() => {
+                if changed.is_ok() {
+                    let status = selection_updates.borrow_and_update().clone();
+                    if status.phase == ovpn_ui::ConfigurationPhase::Unconfigured && proxy.is_none() {
+                        failure = None;
+                        if let Err(error) = source.reset().await { break Err(error.into()); }
+                        source.unconfigured();
+                    }
+                    source.configuration_changed(status);
+                }
+            }
+            Some(activation) = requests.recv() => {
+                if let Some(running) = proxy.take() { running.shutdown().await; }
+                next = Some(StartRequest::Prepared(Box::new(activation.prepared)));
+            }
+            result = async { proxy.as_mut().expect("guarded running proxy").wait_for_failure().await }, if proxy.is_some() => {
+                let error = result.err().unwrap_or_else(|| anyhow!("proxy stopped unexpectedly"));
+                let generation = proxy.as_ref().expect("running proxy").generation;
+                if let Some(running) = proxy.take() { running.shutdown().await; }
+                tracing::error!(%error, "proxy unavailable; dashboard remains active");
+                // A concurrently accepted activation already describes the next
+                // generation; an old failure must not make it editable/deletable.
+                if configurations.failed_for(generation, &error) {
+                    source.failed(format!("{error:#}"));
+                    source.configuration_changed(configurations.status());
+                }
+                failure = Some(error);
+            }
         }
     };
-    socks.shutdown().await;
-    manager.shutdown().await;
+    if let Some(running) = proxy {
+        running.shutdown().await;
+    }
+    shutdown.send_replace(true);
+    if !ui_finished {
+        ui_task.await.context("dashboard task failed")??;
+    }
     result
 }
 
-async fn initialize(
-    config: AppConfig,
-    dashboard: Option<&DashboardHandle>,
-) -> Result<(TcpListener, ConnectionManager)> {
-    if let Some(dashboard) = dashboard {
-        dashboard.starting("Loading OpenVPN profile");
-    }
-    let content = tokio::fs::read_to_string(&config.profile_path)
-        .await
-        .with_context(|| format!("cannot read profile {}", config.profile_path.display()))?;
-    let profile = Profile::parse(&content).context("invalid OpenVPN profile")?;
-    if let Some(dashboard) = dashboard {
-        dashboard.profile_loaded(summarize_profile(&profile));
-    }
-    tracing::debug!(
-        remotes = profile.remotes.len(),
-        credentials_required = profile.needs_credentials,
-        "OpenVPN profile loaded"
-    );
-    if profile.needs_credentials && (config.username.is_empty() || config.password.is_empty()) {
-        bail!("username and password are required by this profile");
-    }
-
-    if let Some(dashboard) = dashboard {
-        dashboard.starting("Binding SOCKS5 listener");
-    }
-    let socks_listener = TcpListener::bind(config.socks5_address)
-        .await
-        .with_context(|| format!("cannot bind SOCKS5 listener on {}", config.socks5_address))?;
-
-    if let Some(dashboard) = dashboard {
-        dashboard.starting("Probing OpenVPN hosts");
-    }
-    let manager = ConnectionManager::start(
-        profile,
-        config.username,
-        config.password,
-        config.dns_override,
-        config.max_active_vpn_hosts,
-        dashboard
-            .map(DashboardHandle::telemetry)
-            .unwrap_or_default(),
-    )
-    .await?;
-    Ok((socks_listener, manager))
+async fn run_without_dashboard(config: AppConfig) -> Result<()> {
+    let storage = std::env::current_dir()?.join("configs");
+    let (configurations, _requests) = Configurations::new(config.openvpn_config.clone(), storage);
+    let mut proxy = tokio::select! {
+        result = async {
+            let prepared = configurations.prepare_startup().await.map_err(|error| {
+                tracing::error!(%error, "cannot restore startup VPN configuration");
+                error
+            })?.context(
+                "no active VPN configuration; configure [openvpn_config] or enable webui_address to select one",
+            )?;
+            let proxy = Proxy::start(&config, prepared, None, configurations.status().generation).await?;
+            if let Err(error) = configurations.ready().await {
+                proxy.shutdown().await;
+                return Err(error.into());
+            }
+            Ok::<_, anyhow::Error>(proxy)
+        } => result?,
+        signal = tokio::signal::ctrl_c() => { signal?; return Ok(()); }
+    };
+    let result = tokio::select! {
+        result = proxy.wait_for_failure() => result,
+        signal = tokio::signal::ctrl_c() => signal.map_err(Into::into),
+    };
+    proxy.shutdown().await;
+    result
 }
 
-async fn show_failure(
-    error: anyhow::Error,
-    source: &DashboardHandle,
-    shutdown: &watch::Sender<bool>,
-    requested: &mut watch::Receiver<bool>,
-    ui_task: &mut JoinHandle<std::result::Result<(), ovpn_ui::UiError>>,
-) -> Result<()> {
-    tracing::error!(%error, "proxy unavailable; dashboard remains active");
-    source.failed(format!("{error:#}"));
-    let signal = tokio::select! {
-        signal = wait_for_stop(requested) => signal,
-        result = &mut *ui_task => return dashboard_ended(result),
-    };
-    shutdown.send_replace(true);
-    ui_task.await.context("dashboard task failed")??;
-    signal?;
-    Err(error)
+/// One running configuration owns its listener, clients, and complete VPN pool.
+struct Proxy {
+    generation: u64,
+    socks: SocksServer,
+    manager: ConnectionManager,
+}
+
+impl Proxy {
+    async fn start(
+        config: &AppConfig,
+        prepared: PreparedConfiguration,
+        dashboard: Option<&DashboardHandle>,
+        generation: u64,
+    ) -> Result<Self> {
+        if let Some(dashboard) = dashboard {
+            dashboard.profile_loaded(summarize_profile(&prepared.profile));
+            dashboard.starting("Binding SOCKS5 listener");
+        }
+        let listener = TcpListener::bind(config.socks5_address)
+            .await
+            .with_context(|| format!("cannot bind SOCKS5 listener on {}", config.socks5_address))?;
+        if let Some(dashboard) = dashboard {
+            dashboard.starting("Probing OpenVPN hosts");
+        }
+        let manager = ConnectionManager::start(
+            prepared.profile,
+            prepared.username,
+            prepared.password,
+            prepared.dns_override,
+            prepared.max_active_vpn_hosts,
+            dashboard
+                .map(DashboardHandle::telemetry)
+                .unwrap_or_default(),
+        )
+        .await?;
+        Ok(Self {
+            generation,
+            socks: SocksServer::new(listener, manager.router()),
+            manager,
+        })
+    }
+
+    async fn wait_for_failure(&mut self) -> Result<()> {
+        tokio::select! {
+            result = self.socks.run() => result,
+            result = self.manager.wait_for_failure() => result,
+        }
+    }
+
+    async fn shutdown(self) {
+        self.socks.shutdown().await;
+        self.manager.shutdown().await;
+    }
 }
 
 async fn wait_for_stop(requested: &mut watch::Receiver<bool>) -> std::io::Result<()> {
     tokio::select! {
         signal = tokio::signal::ctrl_c() => signal,
         received = async { requested.wait_for(|requested| *requested).await.is_ok() } => {
-            // If the UI task exits, let its JoinHandle report the failure instead.
             if received { Ok(()) } else { std::future::pending().await }
         }
     }
@@ -203,7 +280,7 @@ fn dashboard_ended(
     result: std::result::Result<std::result::Result<(), ovpn_ui::UiError>, JoinError>,
 ) -> Result<()> {
     match result.context("dashboard task failed")? {
-        Ok(()) => Err(anyhow!("dashboard stopped unexpectedly")),
+        Ok(()) => bail!("dashboard stopped unexpectedly"),
         Err(error) => Err(error.into()),
     }
 }

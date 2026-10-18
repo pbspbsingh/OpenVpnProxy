@@ -46,7 +46,14 @@ mod tests {
     fn shell_contains_all_views() {
         let html = index();
         assert!(!html.contains("{{"), "unresolved view fragment");
-        for name in ["overview", "hosts", "routing", "profile", "logs"] {
+        for name in [
+            "overview",
+            "hosts",
+            "routing",
+            "profile",
+            "configuration",
+            "logs",
+        ] {
             assert!(html.contains(&format!("id=\"{name}\"")));
         }
         let script = std::str::from_utf8(get("app.js").unwrap().1).unwrap();

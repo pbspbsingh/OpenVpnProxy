@@ -1,16 +1,17 @@
 # Copy this file to config.toml and fill in your own values.
-# Relative profile paths are resolved from the directory containing config.toml.
-profile_path = "client.ovpn"
-username = ""
-password = ""
 # Listen on all IPv4 interfaces so other machines can use the proxy.
 socks5_address = "0.0.0.0:1080"
-# Uncomment to enable the dashboard, including its shutdown control. Bind another address for remote access.
-# webui_address = "127.0.0.1:8080"
+# Dashboard includes configuration management, activation, and shutdown.
+webui_address = "127.0.0.1:8080"
 # Recent dashboard log events kept in memory (default 1000, maximum 20000).
 # dashboard_log_capacity = 1000
-# The default is 16. Set this lower if your provider restricts concurrent sessions.
-max_active_vpn_hosts = 16
-
-# Set this only when the VPN server does not provide a usable DNS server.
+# Optional default VPN, read-only in the dashboard. Without it, add and activate
+# a custom entry in Configuration. Restart restores the last active entry using its
+# latest saved settings. Headless operation requires that selection or this default.
+# Relative profile paths resolve from the directory containing this application TOML file.
+# [openvpn_config]
+# profile_path = "client.ovpn"
+# username = ""
+# password = ""
+# max_active_vpn_hosts = 16
 # dns_override = "1.1.1.1"

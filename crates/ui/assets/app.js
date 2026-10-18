@@ -6,11 +6,12 @@ import { overview } from "./components/overview.js";
 import { hosts } from "./components/hosts.js";
 import { routing } from "./components/routing.js";
 import { profile } from "./components/profile.js";
+import { configuration } from "./components/configuration.js";
 import { logs } from "./components/logs.js";
 import { trafficChart } from "./components/chart.js";
 
 Alpine.store("dashboard", dashboardStore());
-for (const [name, component] of Object.entries({ shell, overview, hosts, routing, profile, logs, trafficChart })) {
+for (const [name, component] of Object.entries({ shell, overview, hosts, routing, profile, configuration, logs, trafficChart })) {
   Alpine.data(name, component);
 }
 Alpine.start();

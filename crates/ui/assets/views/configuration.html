@@ -1,0 +1,61 @@
+<section :hidden="$store.dashboard.tab !== 'configuration'" aria-labelledby="tab-configuration" class="tab-panel" hidden id="configuration" role="tabpanel" x-data="configuration">
+ <div class="section-heading">
+  <div><div class="eyebrow">SAVED VPN CONNECTIONS</div><h2>Configuration</h2></div>
+  <div class="range-pill" id="configuration-state" aria-live="polite" x-text="stateLabel">No configuration active</div>
+ </div>
+ <div class="configuration-layout">
+  <article class="panel configuration-list">
+   <div class="panel-heading"><h3>Configurations</h3><button class="config-button" id="configuration-new" @click="edit()" :disabled="busy || $store.dashboard.stopping" type="button">Add configuration</button></div>
+   <p class="muted" x-show="loaded && entries.length === 0">No saved configurations. Add one to start the proxy.</p>
+   <div id="configuration-entries">
+    <template x-for="entry in entries" :key="entry.id">
+     <div class="configuration-entry" :class="{ selected: editingId === entry.id }" :data-configuration-id="entry.id">
+      <div class="config-entry-heading">
+       <strong x-text="entry.name"></strong>
+       <span class="config-active-icon" x-show="entry.id === status?.id && status.phase === 'ready' && !$store.dashboard.stopping" x-cloak role="img" aria-label="Currently active configuration" title="Currently active configuration">
+        <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="m8 12 3 3 5-6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+       </span>
+       <span class="muted" x-show="entry.read_only">Read-only</span>
+      </div>
+      <div class="muted" x-text="entry.profile_name"></div>
+      <div class="config-entry-state" x-text="label(entry)"></div>
+      <div class="config-actions">
+       <button class="config-button" :data-edit-config="entry.id" @click="edit(entry)" :disabled="busy || $store.dashboard.stopping" x-text="entry.read_only ? 'View' : 'Edit'" type="button"></button>
+       <button class="config-button primary" :data-activate-config="entry.id" @click="activate(entry)" :disabled="busy || starting || $store.dashboard.stopping" x-text="entry.id === status?.id && entry.revision === status.revision && status.phase === 'ready' ? 'Restart' : 'Activate'" type="button">Activate</button>
+       <button class="config-button danger" :data-delete-config="entry.id" @click="deleteEntry(entry)" x-show="!entry.read_only" :disabled="busy || inUse(entry) || $store.dashboard.stopping" :title="inUse(entry) ? 'Switch away from this configuration before deleting it' : 'Delete saved configuration'" type="button">Delete</button>
+      </div>
+     </div>
+    </template>
+   </div>
+  </article>
+  <article class="panel configuration-editor">
+   <h3 x-text="readOnly ? 'Default configuration' : editingId ? 'Edit configuration' : 'Add configuration'"></h3>
+   <p class="muted config-explanation" x-show="readOnly">Loaded from [openvpn_config] in the application TOML file. Edit that file and restart the application to change these settings.</p>
+   <form id="configuration-form" @submit.prevent="save()" autocomplete="off">
+    <fieldset :disabled="readOnly || busy || $store.dashboard.stopping">
+     <label for="configuration-name">Name</label>
+     <input id="configuration-name" x-model="draft.name" maxlength="80" required placeholder="e.g. Ireland VPN">
+     <label for="configuration-username">Username</label>
+     <input id="configuration-username" x-model="draft.username" maxlength="4096" autocomplete="off">
+     <label for="configuration-password">Password</label>
+     <input id="configuration-password" x-model="draft.password" type="password" maxlength="4096" autocomplete="new-password" :disabled="draft.clearPassword" :placeholder="passwordSet ? 'Configured — leave blank to keep' : 'Password'">
+     <label class="config-checkbox" x-show="passwordSet && !readOnly"><input id="configuration-clear-password" type="checkbox" x-model="draft.clearPassword"> Clear saved password</label>
+     <label for="configuration-file">OpenVPN file</label>
+     <input id="configuration-file" x-ref="file" type="file" accept=".ovpn,text/plain" @change="chooseFile($event)" :required="!editingId">
+     <p class="muted" id="configuration-file-status" x-text="reading ? 'Reading file…' : uploadName ? `Selected: ${uploadName}` : profileName ? `Stored: ${profileName} — choose a file to replace it` : 'Choose an .ovpn file (maximum 256 KiB)'"></p>
+     <label for="configuration-dns">DNS override <span class="muted">(optional IPv4 address)</span></label>
+     <input id="configuration-dns" x-model="draft.dns" placeholder="Use the VPN server’s DNS">
+     <label for="configuration-limit">Maximum active VPN hosts <span class="muted">(optional)</span></label>
+     <input id="configuration-limit" x-model="draft.limit" type="number" min="1" max="64" placeholder="16">
+     <button class="config-button primary" id="configuration-save" type="submit" x-show="!readOnly" :disabled="busy || reading" x-text="busy ? 'Working…' : 'Save configuration'">Save configuration</button>
+    </fieldset>
+   </form>
+   <p class="muted config-explanation">Saving does not change the running proxy. Activation closes existing connections. Passwords are never returned to this form.</p>
+  </article>
+ </div>
+ <div class="configuration-feedback" aria-live="polite">
+  <p class="config-error" id="configuration-error" x-show="error" x-text="error"></p>
+  <p class="config-notice" id="configuration-notice" x-show="notice" x-text="notice"></p>
+  <p class="config-error" id="configuration-activation-error" x-show="status?.phase === 'failed'" x-text="status?.message"></p>
+ </div>
+</section>

@@ -131,11 +131,11 @@ def check_failed_app_shutdown(binary):
         url = f"http://127.0.0.1:{port}"
         config = Path(directory) / "config.toml"
         config.write_text(
-            'profile_path = "missing-profile.ovpn"\nusername = ""\npassword = ""\n'
             f'socks5_address = "127.0.0.1:0"\nwebui_address = "127.0.0.1:{port}"\n'
+            '[openvpn_config]\nprofile_path = "missing-profile.ovpn"\nusername = ""\npassword = ""\n'
         )
         with tempfile.TemporaryFile() as output:
-            process = subprocess.Popen([str(binary.resolve()), str(config)], stdout=output, stderr=output, env={**os.environ, "RUST_LOG": "info"})
+            process = subprocess.Popen([str(binary.resolve()), str(config)], cwd=directory, stdout=output, stderr=output, env={**os.environ, "RUST_LOG": "info"})
             try:
                 deadline = time.monotonic() + 10
                 while True:

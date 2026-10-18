@@ -6,6 +6,7 @@ pub struct DashboardSnapshot {
     pub version: u8,
     pub sampled_at_ms: u64,
     pub message: Option<String>,
+    pub configuration: crate::ConfigurationStatus,
     pub pool: PoolSnapshot,
     pub hosts: Vec<HostSnapshot>,
 }
@@ -79,6 +80,7 @@ pub struct ProfileRemote {
 #[derive(Clone, Copy, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PoolPhase {
+    Unconfigured,
     Starting,
     Dormant,
     Waking,

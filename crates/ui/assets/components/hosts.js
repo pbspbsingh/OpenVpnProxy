@@ -1,7 +1,7 @@
 import { formatters } from "../lib/format.js";
 
 export function hosts() {
-  let request = null, timer = null;
+  let request = null, timer = null, generation = null;
   return {
     ...formatters,
     groups: [], total: 0,
@@ -24,6 +24,10 @@ export function hosts() {
       ];
     },
     init() {
+      this.$watch("$store.dashboard.frame", () => {
+        const next = this.$store.dashboard.snapshot?.configuration?.generation;
+        if (next !== generation) { generation = next; this.syncSelection(); }
+      });
       this.$watch("selectedId", () => this.syncSelection());
       this.$watch("active", () => {
         if (this.active && this.groups.length === 0) this.loadGroups();

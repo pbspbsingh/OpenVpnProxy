@@ -1,6 +1,6 @@
 export function shell() {
   return {
-    tabs: ["overview", "hosts", "routing", "profile", "logs"],
+    tabs: ["overview", "hosts", "routing", "profile", "configuration", "logs"],
     shuttingDown: false,
     shutdownAccepted: false,
     shutdownError: "",

@@ -17,7 +17,7 @@ export function bucketRate(bytes, observedMs) {
 /** Missing hosts, counter resets and stale intervals never produce artificial spikes. */
 export function ratesBetween(snapshot, previous) {
   const seconds = previous ? (snapshot.sampled_at_ms - previous.sampled_at_ms) / 1000 : 0;
-  const valid = seconds > 0 && seconds <= 20;
+  const valid = seconds > 0 && seconds <= 20 && snapshot.configuration?.generation === previous?.configuration?.generation;
   const rate = (current, older) => valid && older != null && current >= older ? (current - older) / seconds : 0;
   const counters = (current, older) => ({ rx: rate(current.rx_bytes, older?.rx_bytes), tx: rate(current.tx_bytes, older?.tx_bytes) });
   const priorHosts = new Map((previous?.hosts ?? []).map(host => [host.id, host]));

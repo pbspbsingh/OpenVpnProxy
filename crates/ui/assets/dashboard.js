@@ -20,6 +20,7 @@ export function dashboardStore() {
         onStatus: (kind, label) => { this.feedKind = kind; this.feedLabel = label; },
         onMessage: frame => {
           if (frame?.snapshot?.version !== 1 || !Array.isArray(frame.history)) return false;
+          if (frame.snapshot.configuration?.generation !== this.snapshot?.configuration?.generation) this.selectedHostId = null;
           this.rates = ratesBetween(frame.snapshot, this.snapshot);
           this.frame = frame;
           if (!this.hosts.some(host => host.id === this.selectedHostId)) {

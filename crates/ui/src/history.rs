@@ -168,6 +168,7 @@ mod tests {
             version: 1,
             sampled_at_ms: at_ms,
             message: None,
+            configuration: crate::ConfigurationStatus::default(),
             pool: PoolSnapshot {
                 phase: PoolPhase::Ready,
                 candidate_hosts: 1,

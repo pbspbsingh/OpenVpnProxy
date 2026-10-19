@@ -119,6 +119,7 @@ impl RekeyState {
 
 impl Session {
     /// Connects to the configured VPN endpoint and negotiates tunnel settings.
+    #[tracing::instrument(name = "openvpn_connect", skip_all, fields(endpoint = %profile.endpoint))]
     pub async fn connect(
         profile: &ClientConfig<'_>,
         username: &str,
@@ -135,15 +136,19 @@ impl Session {
             tls_config,
         )
         .await?;
+        tracing::debug!(timeout = ?profile.handshake_window, "OpenVPN TLS handshake starting");
         link.handshake(profile.handshake_window).await?;
+        tracing::debug!("OpenVPN TLS handshake completed");
         tracing::debug!("exchanging OpenVPN key method 2 messages");
         let mut km2 = client_km2(username, password)?;
         let send_result = link.write_app(&km2).await;
         km2.fill(0);
         send_result?;
         read_server_km2(&mut link).await?;
+        tracing::debug!("OpenVPN key method exchange completed; requesting tunnel settings");
         link.write_app(b"PUSH_REQUEST\0").await?;
         let push = read_push(&mut link).await?;
+        tracing::debug!("OpenVPN tunnel settings received");
         let (tunnel, peer_id, ping_interval, restart_interval) = parse_push(&push)?;
         let pushed_auth = pushed_auth_token(&push)?;
         tracing::debug!(peer_id, local = %tunnel.local, gateway = %tunnel.gateway, mtu = tunnel.mtu, dns_servers = tunnel.dns.len(), ipv6_routes = tunnel.ipv6.as_ref().map_or(0, |ipv6| ipv6.routes.len()), ?ping_interval, ?restart_interval, "OpenVPN server settings accepted");

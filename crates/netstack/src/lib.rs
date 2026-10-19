@@ -5,6 +5,7 @@ mod engine;
 mod error;
 mod stack;
 mod stream;
+mod tcp_diagnostics;
 mod types;
 
 pub use error::{Result, StackError};

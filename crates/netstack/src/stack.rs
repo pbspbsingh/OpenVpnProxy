@@ -154,6 +154,7 @@ impl Stack {
 
     /// Resolves through authenticated DNS over TLS on this session. The deadline
     /// includes pool wait, connection and TLS. At most 16 answers are retained.
+    #[tracing::instrument(name = "tunnel_dns", skip_all, fields(stack_id = self.id, %host, ?version))]
     pub async fn resolve(&self, host: &str, version: IpVersion) -> Result<Vec<IpAddr>> {
         if !self.is_ready() {
             return Err(StackError::VpnDown);
@@ -163,7 +164,10 @@ impl Stack {
         }
         self.dns
             .resolve(host, version, |address| async move {
-                self.connect(address).await.map_err(std::io::Error::other)
+                let stream = self.connect(address).await.map_err(std::io::Error::other)?;
+                tracing::info!(stack_id = self.id, stream_id = stream.id(), %address,
+                    "DNS tunnel TCP stream connected");
+                Ok(stream)
             })
             .await
             .map(|mut addresses| {

@@ -6,6 +6,7 @@ use tracing::Event;
 use tracing::field::{Field, Visit};
 use tracing_subscriber::Layer;
 use tracing_subscriber::layer::Context;
+use tracing_subscriber::registry::LookupSpan;
 
 const MAX_LOG_MESSAGE_BYTES: usize = 4096;
 
@@ -19,10 +20,39 @@ impl DashboardLogLayer {
     }
 }
 
-impl<S: tracing::Subscriber> Layer<S> for DashboardLogLayer {
-    fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
+struct SpanFields(String);
+
+impl<S> Layer<S> for DashboardLogLayer
+where
+    S: tracing::Subscriber + for<'a> LookupSpan<'a>,
+{
+    fn on_new_span(
+        &self,
+        attrs: &tracing::span::Attributes<'_>,
+        id: &tracing::Id,
+        ctx: Context<'_, S>,
+    ) {
         let mut visitor = MessageVisitor::default();
-        event.record(&mut visitor);
+        attrs.record(&mut visitor);
+        if let Some(span) = ctx.span(id) {
+            span.extensions_mut().insert(SpanFields(visitor.finish()));
+        }
+    }
+
+    fn on_record(&self, id: &tracing::Id, values: &tracing::span::Record<'_>, ctx: Context<'_, S>) {
+        if let Some(span) = ctx.span(id) {
+            let mut fields = span.extensions_mut();
+            if let Some(fields) = fields.get_mut::<SpanFields>() {
+                let mut visitor = MessageVisitor::default();
+                let _ = visitor.write_str(&fields.0);
+                values.record(&mut visitor);
+                fields.0 = visitor.finish();
+            }
+        }
+    }
+
+    fn on_event(&self, event: &Event<'_>, ctx: Context<'_, S>) {
+        let message = event_message(event, ctx);
         let timestamp_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
@@ -32,9 +62,27 @@ impl<S: tracing::Subscriber> Layer<S> for DashboardLogLayer {
             timestamp_ms,
             level: metadata.level().to_string(),
             target: metadata.target().to_owned(),
-            message: visitor.finish(),
+            message,
         });
     }
+}
+
+fn event_message<S>(event: &Event<'_>, ctx: Context<'_, S>) -> String
+where
+    S: tracing::Subscriber + for<'a> LookupSpan<'a>,
+{
+    let mut visitor = MessageVisitor::default();
+    if let Some(scope) = ctx.event_scope(event) {
+        for span in scope.from_root() {
+            let _ = write!(visitor, "{}{{", span.name());
+            if let Some(fields) = span.extensions().get::<SpanFields>() {
+                let _ = visitor.write_str(&fields.0);
+            }
+            let _ = visitor.write_str("} ");
+        }
+    }
+    event.record(&mut visitor);
+    visitor.finish()
 }
 
 #[derive(Default)]
@@ -88,5 +136,66 @@ impl MessageVisitor {
             self.message.push('…');
         }
         self.message
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::num::NonZeroUsize;
+    use std::sync::{Arc, Mutex};
+    use tracing_subscriber::prelude::*;
+
+    struct Capture(Arc<Mutex<Vec<String>>>);
+    impl<S> Layer<S> for Capture
+    where
+        S: tracing::Subscriber + for<'a> LookupSpan<'a>,
+    {
+        fn on_event(&self, event: &Event<'_>, ctx: Context<'_, S>) {
+            self.0.lock().unwrap().push(event_message(event, ctx));
+        }
+    }
+
+    #[tokio::test]
+    async fn dashboard_events_keep_nested_request_ids_and_updated_span_fields() {
+        let (_hub, input) = ovpn_ui::LogHub::start(NonZeroUsize::new(16).unwrap());
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry()
+            .with(DashboardLogLayer::new(input))
+            .with(Capture(captured.clone()));
+        tracing::subscriber::with_default(subscriber, || {
+            let connection = tracing::info_span!("socks_connection", connection_id = 42);
+            let _connection = connection.enter();
+            let dns = tracing::info_span!("dns_query", query_id = 7, stage = tracing::field::Empty);
+            let _dns = dns.enter();
+            dns.record("stage", "tls_handshake");
+            tracing::warn!(error = "certificate rejected", "DNS query failed");
+        });
+        let captured = captured.lock().unwrap();
+        assert_eq!(captured.len(), 1);
+        for expected in [
+            "socks_connection",
+            "connection_id=42",
+            "dns_query",
+            "query_id=7",
+            "stage=tls_handshake",
+            "certificate rejected",
+            "DNS query failed",
+        ] {
+            assert!(
+                captured[0].contains(expected),
+                "missing {expected}: {}",
+                captured[0]
+            );
+        }
+    }
+
+    #[test]
+    fn oversized_unicode_log_messages_are_bounded_without_invalid_utf8() {
+        let mut visitor = MessageVisitor::default();
+        let _ = visitor.write_str(&"é".repeat(MAX_LOG_MESSAGE_BYTES));
+        let message = visitor.finish();
+        assert!(message.len() <= MAX_LOG_MESSAGE_BYTES + '…'.len_utf8());
+        assert!(message.ends_with('…'));
     }
 }

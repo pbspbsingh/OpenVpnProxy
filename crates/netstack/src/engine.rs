@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::time::{Duration, Instant as Clock};
@@ -15,6 +15,7 @@ use tokio::time;
 use crate::device::PacketDevice;
 use crate::error::{Result, StackError};
 use crate::stack::{Command, ConnectRequest};
+use crate::tcp_diagnostics::control_packet;
 use crate::types::{Ipv6Route, StackPhase, StreamEvent, TunnelConfig, matches_route};
 
 const TCP_RECEIVE_BUFFER_BYTES: usize = 256 * 1024;
@@ -127,7 +128,7 @@ impl Worker {
             let now =
                 Instant::from_millis(started.elapsed().as_millis().min(i64::MAX as u128) as i64);
             if let Err(error) = engine.tick(now) {
-                tracing::error!(%error, "packet stack stopped");
+                tracing::error!(stack_id = id, %error, "packet stack stopped");
                 phase.store(StackPhase::Failed as u8, Ordering::Release);
                 break;
             }
@@ -160,14 +161,32 @@ struct StackStats {
 }
 
 /// A received FIN starts draining; EOF is published only after buffered data.
-#[derive(Clone, Copy, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ReadState {
     Open,
     Draining,
     Closed,
 }
 
+#[derive(Debug)]
+enum CloseReason {
+    ClientDropped,
+    ClosedUnacknowledged,
+    TcpInactive,
+    ConnectTimeout,
+    WriteError,
+    ReadError,
+}
+
 struct Connection {
+    address: SocketAddr,
+    local_port: u16,
+    created_at: Clock,
+    queued_upload_bytes: u64,
+    delivered_download_bytes: u64,
+    last_application_activity: Clock,
+    remote_fin_seen: bool,
+    remote_reset_seen: bool,
     socket: SocketHandle,
     events: mpsc::Sender<StreamEvent>,
     wake_needed: Arc<AtomicBool>,
@@ -195,7 +214,7 @@ struct Engine {
 
 impl Engine {
     fn new(id: u64, config: TunnelConfig, io: mpsc::Sender<Vec<u8>>) -> Result<Self> {
-        let mut device = PacketDevice::new(config.mtu, io.clone());
+        let mut device = PacketDevice::new(id, config.mtu, io.clone());
         let mut iface =
             Interface::new(Config::new(HardwareAddress::Ip), &mut device, Instant::ZERO);
         let mut inserted = false;
@@ -257,8 +276,48 @@ impl Engine {
                 self.stats.inbound_packets += 1;
                 self.stats.inbound_bytes += packet.len() as u64;
                 tracing::trace!(bytes = packet.len(), "packet delivered to userspace stack");
+                if let Some(control) = control_packet(&packet) {
+                    if let Some((&id, connection)) =
+                        self.connections.iter_mut().find(|(_, connection)| {
+                            connection.local_port == control.destination.port()
+                                && connection.address == control.source
+                        })
+                    {
+                        connection.remote_fin_seen |= control.fin;
+                        connection.remote_reset_seen |= control.rst;
+                        let socket = self.sockets.get::<tcp::Socket>(connection.socket);
+                        let span = tracing::info_span!("tcp_control", stack_id = self.id, stream_id = id,
+                            direction = "inbound", source = %control.source, destination = %control.destination,
+                            sequence = control.sequence, acknowledgment = ?control.acknowledgment,
+                            fin = control.fin, rst = control.rst, window = control.window,
+                            hop_limit = control.hop_limit, payload_bytes = control.payload_bytes,
+                            state_before = ?socket.state(), read_state = ?connection.read_state,
+                            local_write_closed = connection.write_closed, remote_fin_seen = connection.remote_fin_seen,
+                            elapsed = ?connection.created_at.elapsed(), application_idle = ?connection.last_application_activity.elapsed(),
+                            queued_upload_bytes = connection.queued_upload_bytes, delivered_download_bytes = connection.delivered_download_bytes,
+                            unacknowledged_bytes = socket.send_queue(), buffered_download_bytes = socket.recv_queue(),
+                            pending_upload_bytes = connection.write_queue.len(), queued_upload_chunks = connection.writes.len());
+                        let _entered = span.enter();
+                        if control.rst {
+                            tracing::warn!("TCP reset received from tunnel");
+                        } else {
+                            tracing::info!("TCP FIN received from tunnel");
+                        }
+                    } else {
+                        tracing::debug!(stack_id = self.id, source = %control.source, destination = %control.destination,
+                            sequence = control.sequence, acknowledgment = ?control.acknowledgment,
+                            fin = control.fin, rst = control.rst, hop_limit = control.hop_limit,
+                            "TCP control packet received without a matching stream");
+                    }
+                }
                 if !self.device.receive_packet(packet) {
                     self.stats.inbound_dropped += 1;
+                    if self.stats.inbound_dropped == 1 {
+                        tracing::warn!(
+                            stack_id = self.id,
+                            "Tunnel packet receive queue full; packets are being dropped"
+                        );
+                    }
                 }
             }
             #[cfg(test)]
@@ -303,9 +362,18 @@ impl Engine {
                 );
                 match result {
                     Ok(()) => {
+                        self.device.stream_ids.insert((port, address), id);
                         self.connections.insert(
                             id,
                             Connection {
+                                address,
+                                local_port: port,
+                                created_at: Clock::now(),
+                                queued_upload_bytes: 0,
+                                delivered_download_bytes: 0,
+                                last_application_activity: Clock::now(),
+                                remote_fin_seen: false,
+                                remote_reset_seen: false,
                                 socket: handle,
                                 events,
                                 wake_needed,
@@ -327,14 +395,42 @@ impl Engine {
                 }
             }
             #[cfg(test)]
-            Command::Close(id) => self.close(id),
+            Command::Close(id) => self.close(id, CloseReason::ClientDropped),
         }
     }
 
-    fn close(&mut self, id: u64) {
+    fn close(&mut self, id: u64, reason: CloseReason) {
         if let Some(connection) = self.connections.remove(&id) {
-            tracing::debug!(id, "closing userspace TCP connection");
+            let socket = self.sockets.get::<tcp::Socket>(connection.socket);
+            let span = tracing::info_span!("tcp_stream_close", stack_id = self.id, stream_id = id, address = %connection.address,
+                    local_port = connection.local_port, ?reason, state = ?socket.state(),
+                    established = connection.established, elapsed = ?connection.created_at.elapsed(),
+                    application_idle = ?connection.last_application_activity.elapsed(),
+                    read_state = ?connection.read_state, local_write_closed = connection.write_closed,
+                    remote_fin_seen = connection.remote_fin_seen, remote_reset_seen = connection.remote_reset_seen,
+                    queued_upload_bytes = connection.queued_upload_bytes,
+                    delivered_download_bytes = connection.delivered_download_bytes,
+                    unacknowledged_bytes = socket.send_queue(), buffered_download_bytes = socket.recv_queue(),
+                    pending_upload_bytes = connection.write_queue.len(), queued_upload_chunks = connection.writes.len());
+            let _entered = span.enter();
+            if matches!(reason, CloseReason::ClientDropped) {
+                tracing::debug!("TCP stream released by client");
+            } else if matches!(reason, CloseReason::TcpInactive)
+                && !connection.remote_reset_seen
+                && (socket.state() == tcp::State::TimeWait
+                    || (connection.read_state == ReadState::Closed
+                        && connection.write_closed
+                        && socket.send_queue() == 0
+                        && socket.recv_queue() == 0))
+            {
+                tracing::debug!("TCP stream closed normally");
+            } else {
+                tracing::warn!("TCP stream closed before completion");
+            }
             let _ = connection.events.try_send(StreamEvent::Closed);
+            self.device
+                .stream_ids
+                .remove(&(connection.local_port, connection.address));
             self.sockets.remove(connection.socket);
         }
     }
@@ -359,7 +455,7 @@ impl Engine {
         for (&id, connection) in &mut self.connections {
             let socket = self.sockets.get_mut::<tcp::Socket>(connection.socket);
             if connection.events.is_closed() {
-                close.push(id);
+                close.push((id, CloseReason::ClientDropped));
                 continue;
             }
             if !connection.established
@@ -372,7 +468,7 @@ impl Engine {
                 tracing::debug!(id, "userspace TCP connection established");
                 if connection.events.try_send(StreamEvent::Connected).is_err() {
                     tracing::debug!(id, "TCP client disappeared before connection completed");
-                    close.push(id);
+                    close.push((id, CloseReason::ClientDropped));
                     continue;
                 }
             }
@@ -395,7 +491,7 @@ impl Engine {
                     unacknowledged_bytes = socket.send_queue(),
                     "TCP closed before upload was acknowledged"
                 );
-                close.push(id);
+                close.push((id, CloseReason::ClosedUnacknowledged));
                 continue;
             }
             if connection.write_closed
@@ -405,18 +501,21 @@ impl Engine {
                 && let Some(finished) = connection.write_finished.take()
             {
                 let _ = finished.send(());
+                tracing::info!(stack_id = self.id, stream_id = id, address = %connection.address,
+                    state = ?socket.state(), unacknowledged_bytes = socket.send_queue(),
+                    "TCP local write shutdown acknowledged");
             }
             if !socket.is_active()
                 && (connection.read_state != ReadState::Draining
                     || (socket.state() == tcp::State::Closed && !connection.write_closed))
             {
                 tracing::debug!(id, state = ?socket.state(), "userspace TCP socket became inactive");
-                close.push(id);
+                close.push((id, CloseReason::TcpInactive));
                 continue;
             }
             if !connection.established && Clock::now() >= connection.deadline {
                 tracing::warn!(id, "userspace TCP connection timed out");
-                close.push(id);
+                close.push((id, CloseReason::ConnectTimeout));
                 continue;
             }
             if connection.established {
@@ -434,6 +533,10 @@ impl Engine {
                     match socket.send_slice(&connection.write_queue) {
                         Ok(written) => {
                             self.stats.tcp_write_bytes += written as u64;
+                            connection.queued_upload_bytes += written as u64;
+                            if written > 0 {
+                                connection.last_application_activity = Clock::now();
+                            }
                             tracing::trace!(id, bytes = written, "userspace TCP data queued");
                             connection.write_queue.advance(written);
                             if connection.write_queue.is_empty() {
@@ -442,7 +545,7 @@ impl Engine {
                         }
                         Err(error) => {
                             tracing::warn!(id, ?error, "userspace TCP send failed");
-                            close.push(id);
+                            close.push((id, CloseReason::WriteError));
                             continue;
                         }
                     }
@@ -454,6 +557,11 @@ impl Engine {
                     && connection.writes.is_empty()
                     && connection.write_queue.is_empty()
                 {
+                    tracing::info!(stack_id = self.id, stream_id = id, address = %connection.address,
+                        state_before = ?socket.state(), remote_fin_seen = connection.remote_fin_seen,
+                        queued_upload_bytes = connection.queued_upload_bytes, delivered_download_bytes = connection.delivered_download_bytes,
+                        unacknowledged_bytes = socket.send_queue(), elapsed = ?connection.created_at.elapsed(),
+                        "TCP local write shutdown requested; queuing FIN after buffered upload");
                     socket.close();
                     connection.write_closed = true;
                 }
@@ -461,6 +569,9 @@ impl Engine {
                     if connection.events.capacity() > 0 {
                         let _ = connection.events.try_send(StreamEvent::ReadClosed);
                         connection.read_state = ReadState::Closed;
+                        tracing::info!(stack_id = self.id, stream_id = id, address = %connection.address,
+                            delivered_download_bytes = connection.delivered_download_bytes,
+                            "TCP peer EOF delivered to reader");
                     } else {
                         connection.wake_needed.store(true, Ordering::Release);
                     }
@@ -477,6 +588,10 @@ impl Engine {
                         Ok(buffer) => {
                             let read = buffer.len();
                             self.stats.tcp_read_bytes += read as u64;
+                            connection.delivered_download_bytes += read as u64;
+                            if read > 0 {
+                                connection.last_application_activity = Clock::now();
+                            }
                             if read == TCP_READ_BUFFER_BYTES {
                                 self.stats.full_tcp_reads += 1;
                             }
@@ -488,19 +603,19 @@ impl Engine {
                                     .is_err()
                             {
                                 tracing::debug!(id, "TCP client disappeared during receive");
-                                close.push(id);
+                                close.push((id, CloseReason::ClientDropped));
                             }
                         }
                         Err(error) => {
                             tracing::warn!(id, ?error, "userspace TCP receive failed");
-                            close.push(id);
+                            close.push((id, CloseReason::ReadError));
                         }
                     }
                 }
             }
         }
-        for id in close {
-            self.close(id);
+        for (id, reason) in close {
+            self.close(id, reason);
         }
         self.stats.max_tick_time = self.stats.max_tick_time.max(started.elapsed());
         Ok(())
@@ -580,7 +695,7 @@ impl Engine {
 
     fn shutdown(mut self) {
         self.log_status();
-        tracing::info!(
+        tracing::debug!(
             connections = self.connections.len(),
             "userspace packet stack shutting down"
         );

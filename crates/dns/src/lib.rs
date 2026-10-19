@@ -5,7 +5,7 @@ use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU16, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_proto::rr::{DNSClass, Name, RData, RecordType};
@@ -15,6 +15,7 @@ use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{Mutex, Semaphore};
 use tokio_rustls::{TlsConnector, client::TlsStream};
+use tracing::Instrument;
 
 pub const DEFAULT_SERVER: Ipv4Addr = Ipv4Addr::new(1, 1, 1, 1);
 const QUERY_TIMEOUT: Duration = Duration::from_secs(12);
@@ -130,7 +131,35 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Client<S> {
         F: Fn(SocketAddr) -> Fut,
         Fut: Future<Output = io::Result<S>>,
     {
-        tokio::time::timeout(QUERY_TIMEOUT, async {
+        let query_id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let span = tracing::info_span!("dns_query", query_id, host, ?version,
+            resolver = %self.config.endpoint(), tls_name = ?self.config.server_name);
+        self.resolve_query(host, version, connect, query_id)
+            .instrument(span)
+            .await
+    }
+
+    async fn resolve_query<F, Fut>(
+        &self,
+        host: &str,
+        version: IpVersion,
+        connect: F,
+        query_id: u16,
+    ) -> Result<Vec<IpAddr>, Error>
+    where
+        F: Fn(SocketAddr) -> Fut,
+        Fut: Future<Output = io::Result<S>>,
+    {
+        let mut progress = QueryProgress {
+            stage: "encode",
+            started: Instant::now(),
+            finished: false,
+        };
+        tracing::info!(
+            timeout_ms = QUERY_TIMEOUT.as_millis() as u64,
+            "DNS over TLS query started"
+        );
+        let result = tokio::time::timeout(QUERY_TIMEOUT, async {
             let record_type = match version {
                 IpVersion::V4 => RecordType::A,
                 IpVersion::V6 => RecordType::AAAA,
@@ -138,44 +167,93 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Client<S> {
             let mut name = Name::from_utf8(host).map_err(protocol)?;
             name.set_fqdn(true);
             let mut request = Message::new(
-                self.next_id.fetch_add(1, Ordering::Relaxed),
+                query_id,
                 MessageType::Query,
                 OpCode::Query,
             );
             request.metadata.recursion_desired = true;
             request.queries.push(Query::query(name, record_type));
             let pool = &self.connections[usize::from(version == IpVersion::V6)];
+            progress.stage = "pool_wait";
+            let queued = Instant::now();
             let _permit = pool.permits.acquire().await.expect("DNS pool stays open");
+            tracing::info!(pool_wait_ms = queued.elapsed().as_millis() as u64,
+                available_connections = pool.permits.available_permits(), "DNS connection pool acquired");
             // Taking the stream out ensures cancellation drops partially read/written
             // messages instead of returning a desynchronized connection to the pool.
             let mut stream = pool.idle.lock().await.pop();
             let reused = stream.is_some();
+            tracing::info!(reused, "DNS TLS connection selected");
             for attempt in 0..2 {
                 let mut stream = match stream.take() {
                     Some(stream) => stream,
                     None => {
+                        progress.stage = "tcp_connect";
+                        let connected = Instant::now();
+                        tracing::info!("DoT TCP connection starting");
                         let tcp = connect(self.config.endpoint()).await?;
-                        self.tls
+                        tracing::info!(elapsed_ms = connected.elapsed().as_millis() as u64, "DoT TCP connected");
+                        progress.stage = "tls_handshake";
+                        let handshake = Instant::now();
+                        tracing::info!("DoT TLS handshake starting");
+                        let tls = self.tls
                             .connect(self.config.server_name.clone(), tcp)
-                            .await?
+                            .await?;
+                        tracing::info!(elapsed_ms = handshake.elapsed().as_millis() as u64,
+                            protocol = ?tls.get_ref().1.protocol_version(), "DoT TLS certificate verified");
+                        tls
                     }
                 };
-                match exchange(&mut stream, &request).await {
+                match exchange(&mut stream, &request, &mut progress).await {
                     Ok(response) => {
+                        progress.stage = "validate_response";
+                        tracing::info!(response_code = %response.metadata.response_code,
+                            answer_records = response.answers.len(), "DNS response received");
                         let result = addresses(&request, &response);
                         if result.is_ok() || matches!(result, Err(Error::NoAddress)) {
                             pool.idle.lock().await.push(stream);
                         }
                         return result;
                     }
-                    Err(Error::Io(_)) if reused && attempt == 0 => {}
+                    Err(Error::Io(error)) if reused && attempt == 0 => {
+                        tracing::warn!(%error, stage = progress.stage, "Stale DoT connection discarded; reconnecting once");
+                    }
                     Err(error) => return Err(error),
                 }
             }
             unreachable!("a fresh connection is never retried")
         })
         .await
-        .map_err(|_| Error::Timeout)?
+        .map_err(|_| Error::Timeout).and_then(|result| result);
+        progress.finished = true;
+        match &result {
+            Ok(addresses) => tracing::info!(
+                ?addresses,
+                elapsed_ms = progress.started.elapsed().as_millis() as u64,
+                "DNS query completed"
+            ),
+            Err(error) => tracing::warn!(%error, error_chain = ?error, stage = progress.stage,
+                elapsed_ms = progress.started.elapsed().as_millis() as u64, "DNS query failed"),
+        }
+        result
+    }
+}
+
+struct QueryProgress {
+    stage: &'static str,
+    started: Instant,
+    finished: bool,
+}
+
+impl Drop for QueryProgress {
+    fn drop(&mut self) {
+        if !self.finished {
+            tracing::info!(
+                stage = self.stage,
+                elapsed_ms = self.started.elapsed().as_millis() as u64,
+                "DNS query cancelled"
+            );
+        }
     }
 }
 
@@ -186,20 +264,25 @@ fn protocol(error: impl std::fmt::Display) -> Error {
 async fn exchange<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
     request: &Message,
+    progress: &mut QueryProgress,
 ) -> Result<Message, Error> {
     let message = request.to_vec().map_err(protocol)?;
     let length = u16::try_from(message.len()).map_err(protocol)?;
     let mut frame = Vec::with_capacity(message.len() + 2);
     frame.extend_from_slice(&length.to_be_bytes());
     frame.extend_from_slice(&message);
+    progress.stage = "write_query";
     stream.write_all(&frame).await?;
     stream.flush().await?;
+    progress.stage = "read_response_length";
     let length = stream.read_u16().await? as usize;
     if length < 12 {
         return Err(protocol("short DNS response"));
     }
     let mut response = vec![0; length];
+    progress.stage = "read_response_body";
     stream.read_exact(&mut response).await?;
+    progress.stage = "decode_response";
     Message::from_vec(&response).map_err(protocol)
 }
 

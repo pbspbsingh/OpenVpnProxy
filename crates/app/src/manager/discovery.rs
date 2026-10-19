@@ -28,6 +28,11 @@ pub(super) async fn resolve_candidates(
         bail!("profile contains too many VPN remotes");
     }
     let resolver = Arc::new(Client::<TcpStream>::new(dns));
+    tracing::info!(
+        remotes = profile.remotes.len(),
+        timeout_ms = REMOTE_DNS_TIMEOUT.as_millis() as u64,
+        "VPN host discovery started"
+    );
     let mut lookups = JoinSet::new();
     let distinct_remotes: BTreeSet<_> = profile.remotes.iter().cloned().collect();
     tracing::debug!(
@@ -38,9 +43,11 @@ pub(super) async fn resolve_candidates(
     for (host, port) in distinct_remotes {
         let resolver = Arc::clone(&resolver);
         lookups.spawn(async move {
+            tracing::debug!(%host, port, "VPN remote lookup started");
             let result = time::timeout(REMOTE_DNS_TIMEOUT, async {
                 // Literal endpoints require no DNS request.
                 if let Ok(address) = host.parse::<std::net::IpAddr>() {
+                    tracing::debug!(%host, port, "VPN remote is a literal IP; DNS skipped");
                     return Ok(if address.is_ipv4() {
                         vec![SocketAddr::new(address, port)]
                     } else {

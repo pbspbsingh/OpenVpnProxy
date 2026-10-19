@@ -7,6 +7,7 @@ mod logging;
 mod manager;
 
 use std::env;
+use std::io::IsTerminal;
 
 use anyhow::{Context, Result};
 use ovpn_ui::LogHub;
@@ -21,7 +22,8 @@ async fn main() -> Result<()> {
         }
         Err(_) => (tracing_subscriber::EnvFilter::new("info"), None),
     };
-    let config = config::load_config(&config::config_path()?).await?;
+    let config_path = config::config_path()?;
+    let config = config::load_config(&config_path).await?;
     let (logs, log_layer) = if config.webui_address.is_some() {
         let (hub, input) = LogHub::start(config.dashboard_log_capacity());
         (Some(hub), Some(logging::DashboardLogLayer::new(input)))
@@ -30,11 +32,20 @@ async fn main() -> Result<()> {
     };
     tracing_subscriber::registry()
         .with(filter)
-        .with(tracing_subscriber::fmt::layer())
+        .with(tracing_subscriber::fmt::layer().with_ansi(std::io::stdout().is_terminal()))
         .with(log_layer)
         .init();
     if let Some(error) = filter_error {
         return Err(error).context("invalid RUST_LOG filter");
     }
-    app::run(config, logs).await
+    tracing::info!(pid = std::process::id(), config = %config_path.display(),
+        socks5_address = %config.socks5_address, webui_address = ?config.webui_address, "Application starting");
+    let result = app::run(config, logs).await;
+    match &result {
+        Ok(()) => tracing::info!(pid = std::process::id(), "Application stopped"),
+        Err(error) => {
+            tracing::error!(pid = std::process::id(), error = %error, error_chain = ?error, "Application failed")
+        }
+    }
+    result
 }

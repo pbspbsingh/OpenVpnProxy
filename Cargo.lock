@@ -1043,7 +1043,7 @@ checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
 
 [[package]]
 name = "openvpn-proxy-app"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "futures-util",
@@ -1064,7 +1064,7 @@ dependencies = [
 
 [[package]]
 name = "ovpn-client"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -1084,7 +1084,7 @@ dependencies = [
 
 [[package]]
 name = "ovpn-dns"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "hickory-proto",
  "rcgen",
@@ -1092,12 +1092,13 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-rustls",
+ "tracing",
  "webpki-roots",
 ]
 
 [[package]]
 name = "ovpn-netstack"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "bytes",
  "ovpn-dns",
@@ -1109,24 +1110,25 @@ dependencies = [
 
 [[package]]
 name = "ovpn-profile"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "thiserror",
 ]
 
 [[package]]
 name = "ovpn-socks5"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "idna",
  "thiserror",
  "tokio",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
 name = "ovpn-ui"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "axum",
  "include_dir",

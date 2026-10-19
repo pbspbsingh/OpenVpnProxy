@@ -11,6 +11,7 @@ tokio-rustls.workspace = true
 webpki-roots.workspace = true
 tokio.workspace = true
 thiserror.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
 rcgen = { version = "0.14.8", default-features = false, features = ["aws_lc_rs"] }

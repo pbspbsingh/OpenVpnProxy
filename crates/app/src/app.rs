@@ -127,7 +127,7 @@ async fn serve_with_dashboard(
                     source.unconfigured();
                 }
                 Err(error) => {
-                    tracing::error!(%error, "proxy unavailable; dashboard remains active");
+                    tracing::error!(%error, error_chain = ?error, "proxy unavailable; dashboard remains active");
                     configurations.failed(&error);
                     source.failed(format!("{error:#}"));
                     failure = Some(error);
@@ -164,7 +164,7 @@ async fn serve_with_dashboard(
                 let error = result.err().unwrap_or_else(|| anyhow!("proxy stopped unexpectedly"));
                 let generation = proxy.as_ref().expect("running proxy").generation;
                 if let Some(running) = proxy.take() { running.shutdown().await; }
-                tracing::error!(%error, "proxy unavailable; dashboard remains active");
+                tracing::error!(%error, error_chain = ?error, "proxy unavailable; dashboard remains active");
                 // A concurrently accepted activation already describes the next
                 // generation; an old failure must not make it editable/deletable.
                 if configurations.failed_for(generation, &error) {
@@ -191,7 +191,7 @@ async fn run_without_dashboard(config: AppConfig) -> Result<()> {
     let mut proxy = tokio::select! {
         result = async {
             let prepared = configurations.prepare_startup().await.map_err(|error| {
-                tracing::error!(%error, "cannot restore startup VPN configuration");
+                tracing::error!(%error, error_chain = ?error, "cannot restore startup VPN configuration");
                 error
             })?.context(
                 "no active VPN configuration; configure [openvpn_config] or enable webui_address to select one",
@@ -316,13 +316,17 @@ impl SocksServer {
                     });
                 }
                 Some(result) = self.clients.join_next(), if !self.clients.is_empty() => {
-                    if let Err(error) = result { tracing::error!(%error, "SOCKS5 client task failed"); }
+                    if let Err(error) = result { tracing::error!(%error, error_chain = ?error, "SOCKS5 client task failed"); }
                 }
             }
         }
     }
 
     async fn shutdown(mut self) {
+        tracing::info!(
+            active_clients = self.clients.len(),
+            "SOCKS5 listener stopping; cancelling client requests"
+        );
         self.clients.abort_all();
         while self.clients.join_next().await.is_some() {}
     }

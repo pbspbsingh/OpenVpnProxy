@@ -15,6 +15,60 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 const MSS: usize = 1360;
 const TEST_TIMEOUT: Duration = Duration::from_secs(2);
 
+#[test]
+fn reset_diagnostics_parse_control_headers_without_accepting_truncated_or_fragmented_packets() {
+    for packet in [&[][..], &[0x40][..], &[0x60][..], &[0; 19][..]] {
+        assert!(control_packet(packet).is_none());
+    }
+    let ordinary = peer_packet(40001, 100, 200, TcpControl::None, b"payload is not logged");
+    assert!(control_packet(&ordinary).is_none());
+    let mut packet = peer_packet(40001, 100, 200, TcpControl::Rst, &[]);
+    let reset = control_packet(&packet).unwrap();
+    assert_eq!(reset.source, "1.1.1.1:443".parse().unwrap());
+    assert_eq!(reset.destination, "10.8.0.2:40001".parse().unwrap());
+    assert_eq!(reset.sequence, 100);
+    assert_eq!(reset.acknowledgment, Some(200));
+    Ipv4Packet::new_unchecked(&mut packet[..]).set_frag_offset(8);
+    assert!(control_packet(&packet).is_none());
+    Ipv4Packet::new_unchecked(&mut packet[..]).set_frag_offset(0);
+    Ipv4Packet::new_unchecked(&mut packet[..]).set_more_frags(true);
+    assert!(control_packet(&packet).is_none());
+}
+
+#[test]
+fn fin_diagnostics_preserve_headers_and_payload_length_without_payload() {
+    let packet = peer_packet(40003, 123, 456, TcpControl::Fin, b"private data");
+    let control = control_packet(&packet).unwrap();
+    assert!(control.fin);
+    assert!(!control.rst);
+    assert_eq!(control.sequence, 123);
+    assert_eq!(control.acknowledgment, Some(456));
+    assert_eq!(control.payload_bytes, 12);
+    assert_eq!(control.hop_limit, 64);
+}
+
+#[test]
+fn reset_diagnostics_recognize_ipv6_peers() {
+    use smoltcp::wire::{Ipv6Packet, Ipv6Repr};
+    let ipv4 = peer_packet(40002, 123, 456, TcpControl::Rst, &[]);
+    let tcp = Ipv4Packet::new_checked(&ipv4[..]).unwrap();
+    let repr = Ipv6Repr {
+        src_addr: "2001:db8::1".parse().unwrap(),
+        dst_addr: "2001:db8::2".parse().unwrap(),
+        next_header: IpProtocol::Tcp,
+        payload_len: tcp.payload().len(),
+        hop_limit: 64,
+    };
+    let mut packet = vec![0; repr.buffer_len() + repr.payload_len];
+    repr.emit(&mut Ipv6Packet::new_unchecked(&mut packet[..]));
+    packet[repr.buffer_len()..].copy_from_slice(tcp.payload());
+    TcpPacket::new_unchecked(&mut packet[repr.buffer_len()..])
+        .fill_checksum(&repr.src_addr.into(), &repr.dst_addr.into());
+    let reset = control_packet(&packet).unwrap();
+    assert_eq!(reset.source, "[2001:db8::1]:443".parse().unwrap());
+    assert_eq!(reset.destination, "[2001:db8::2]:40002".parse().unwrap());
+}
+
 #[tokio::test]
 async fn dns_uses_tunneled_tcp_to_default_resolver_and_cancels_cleanly() {
     let (io, mut outbound) = mpsc::channel(16);

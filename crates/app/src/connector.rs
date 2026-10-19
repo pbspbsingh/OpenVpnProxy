@@ -34,27 +34,33 @@ impl Connector for RouterHandle {
         port: u16,
     ) -> Result<LeasedStream, ConnectError> {
         let started = Instant::now();
+        tracing::info!(%source, ?destination, port, "VPN route requested");
         let lease = self
             .select(source, destination.clone())
             .await
-            .ok_or(ConnectError::NetworkUnavailable)?;
+            .ok_or_else(|| {
+                tracing::warn!(elapsed = ?started.elapsed(), "VPN route unavailable");
+                ConnectError::NetworkUnavailable
+            })?;
         let stack = lease.stack();
         let route_elapsed = started.elapsed();
-        tracing::debug!(%source, ?destination, port, stack_id = stack.id(), ?route_elapsed, "VPN route acquired");
+        tracing::info!(%source, ?destination, port, stack_id = stack.id(), ?route_elapsed, "VPN route acquired");
         let result = match destination {
             DestinationHost::Ipv4(address) => {
+                tracing::info!(%address, port, "Destination TCP connection starting");
                 stack.connect(SocketAddr::new(address.into(), port)).await
             }
             DestinationHost::Ipv6(address) => {
+                tracing::info!(%address, port, "Destination TCP connection starting");
                 stack.connect(SocketAddr::new(address.into(), port)).await
             }
             DestinationHost::Domain(host) => connect_domain(stack, &host, port).await,
         };
         let stream = result.map_err(|error| {
-            tracing::debug!(%error, stack_id = stack.id(), "VPN destination connection failed");
+            tracing::warn!(%error, error_chain = ?error, stack_id = stack.id(), elapsed = ?started.elapsed(), "VPN destination connection failed");
             ConnectError::HostUnreachable
         })?;
-        tracing::debug!(id = stream.id(), stack_id = stack.id(), ?route_elapsed, elapsed = ?started.elapsed(), "VPN destination connected");
+        tracing::info!(stream_id = stream.id(), stack_id = stack.id(), ?route_elapsed, elapsed = ?started.elapsed(), "VPN destination connected");
         Ok(LeasedStream {
             stream,
             _lease: lease,
@@ -101,7 +107,18 @@ where
         if (attempts.is_empty() || time::Instant::now() >= next_attempt)
             && let Some(address) = addresses.next()
         {
-            attempts.push(connect(SocketAddr::new(address, port)));
+            let address = SocketAddr::new(address, port);
+            let attempt = connect(address);
+            attempts.push(async move {
+                let started = Instant::now();
+                tracing::info!(%address, "Destination TCP connection starting");
+                let result = attempt.await;
+                match &result {
+                    Ok(_) => tracing::info!(%address, elapsed = ?started.elapsed(), "Destination TCP connected"),
+                    Err(error) => tracing::warn!(%address, %error, elapsed = ?started.elapsed(), "Destination TCP attempt failed"),
+                }
+                result
+            });
             next_attempt = time::Instant::now() + ADDRESS_FAMILY_DELAY;
         }
         if attempts.is_empty() {

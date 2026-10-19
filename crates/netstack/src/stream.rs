@@ -212,7 +212,7 @@ impl AsyncWrite for TunnelStream {
 }
 
 fn disconnected() -> io::Error {
-    io::Error::new(io::ErrorKind::BrokenPipe, "VPN connection closed")
+    io::Error::new(io::ErrorKind::BrokenPipe, "tunneled TCP stream closed")
 }
 
 #[cfg(test)]

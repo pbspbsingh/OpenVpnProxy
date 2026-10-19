@@ -361,7 +361,8 @@ impl RoutingState {
                 host.latency_score = Some(score.median);
                 host.score_measured_at = Some(score.measured_at);
                 host.unhealthy = false;
-                tracing::info!(host_id = id, %endpoint, stack_id = stack.id(), ipv6 = stack.supports_ipv6(), generation = host.generation, ?elapsed, latency_score = ?score.median, "VPN host ready after fresh latency probe");
+                tracing::info!(host_id = id, %endpoint, stack_id = stack.id(), ipv6 = stack.supports_ipv6(), generation = host.generation, "VPN host ready");
+                tracing::debug!(host_id = id, stack_id = stack.id(), ?elapsed, latency_score = ?score.median, "VPN host readiness probe completed");
             }
             RoutingUpdate::Probe(id, stack_id, result, elapsed) => {
                 let host = &mut self.hosts[id];
@@ -383,7 +384,7 @@ impl RoutingState {
                         });
                         host.latency_score = Some(smoothed);
                         host.score_measured_at = Some(score.measured_at);
-                        tracing::info!(host_id = id, stack_id, endpoint = %host.endpoint, sample_median = ?score.median, latency_score = ?smoothed, score_elapsed = ?score.elapsed, successful_samples = score.successful_samples, "VPN latency score measured");
+                        tracing::debug!(host_id = id, stack_id, endpoint = %host.endpoint, sample_median = ?score.median, latency_score = ?smoothed, score_elapsed = ?score.elapsed, successful_samples = score.successful_samples, "VPN latency score measured");
                     }
                     Err(error) => {
                         tracing::warn!(host_id = id, stack_id, endpoint = %host.endpoint, score_elapsed = ?elapsed, %error, "VPN latency score unavailable")
@@ -505,7 +506,8 @@ impl RoutingState {
                 },
             );
             self.groups_by_host[id].insert(key.clone());
-            tracing::info!(source = %key.source, destination = ?key.destination, host_id = id, endpoint = %self.hosts[id].endpoint, latency_score = ?self.hosts[id].latency_score, score_age = ?self.hosts[id].score_measured_at.map(|at| at.elapsed()), active = next_active, "assigned destination group to VPN host");
+            tracing::info!(source = %key.source, destination = ?key.destination, host_id = id, endpoint = %self.hosts[id].endpoint, active = next_active, "assigned destination group to VPN host");
+            tracing::debug!(host_id = id, latency_score = ?self.hosts[id].latency_score, score_age = ?self.hosts[id].score_measured_at.map(|at| at.elapsed()), "VPN route selection score");
             generation
         };
         self.hosts[id].active = next_active;

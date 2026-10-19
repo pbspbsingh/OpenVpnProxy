@@ -9,12 +9,13 @@ use ovpn_dns::ResolverConfig;
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use ovpn_profile::Profile;
 use tokio::sync::{Semaphore, watch};
 use tokio::task::JoinSet;
+use tokio::time::{self, Instant as Deadline};
 
 use self::discovery::{HostCandidate, MAX_ENDPOINTS, resolve_candidates};
 use self::host::{CONTROL_SETUP_ALLOWANCE, HostWorker, benchmark_host};
@@ -25,6 +26,7 @@ use self::telemetry::{HostTraffic, Telemetry};
 const MAX_ACTIVE_VPN_HOSTS: usize = MAX_ENDPOINTS;
 const DEFAULT_MAX_ACTIVE_VPN_HOSTS: usize = 16;
 const INITIAL_PROBE_PARALLELISM: usize = 4;
+const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub(crate) use self::routing::HostLease;
 pub(crate) use self::routing::RouterHandle;
@@ -45,7 +47,15 @@ impl ConnectionManager {
         max_active_vpn_hosts: Option<NonZeroUsize>,
         telemetry: Telemetry,
     ) -> Result<Self> {
-        let mut candidates = resolve_candidates(&profile, dns.clone()).await?;
+        let started = Instant::now();
+        let deadline = Deadline::now() + STARTUP_TIMEOUT;
+        tracing::info!(
+            timeout_secs = STARTUP_TIMEOUT.as_secs(),
+            "VPN host pool startup started"
+        );
+        let mut candidates = time::timeout_at(deadline, resolve_candidates(&profile, dns.clone()))
+            .await
+            .context("VPN host discovery exceeded the 30-second startup deadline")??;
         let max_active_vpn_hosts = max_active_vpn_hosts
             .map(NonZeroUsize::get)
             .unwrap_or(DEFAULT_MAX_ACTIVE_VPN_HOSTS);
@@ -55,14 +65,13 @@ impl ConnectionManager {
         let profile = Arc::new(profile);
         let username: Arc<str> = username.into();
         let password: Arc<str> = password.into();
-        let probe_permits = Arc::new(Semaphore::new(INITIAL_PROBE_PARALLELISM));
         let baselines = benchmark_hosts(
             &candidates,
             Arc::clone(&profile),
             Arc::clone(&username),
             Arc::clone(&password),
             dns.clone(),
-            probe_permits,
+            deadline,
         )
         .await?;
         let mut ranked: Vec<_> = baselines
@@ -77,7 +86,7 @@ impl ConnectionManager {
             .map(|&(id, _)| id)
             .collect();
         for (rank, &(id, latency)) in ranked.iter().enumerate() {
-            tracing::info!(
+            tracing::debug!(
                 host_id = id,
                 rank = rank + 1,
                 ?latency,
@@ -150,7 +159,8 @@ impl ConnectionManager {
             selected = selected.len(),
             max_active = max_active_vpn_hosts,
             initial_probe_parallelism = INITIAL_PROBE_PARALLELISM,
-            "VPN host pool initialized after all startup assessments; selected hosts connect on demand"
+            elapsed = ?started.elapsed(),
+            "VPN host pool initialized; selected hosts connect on demand"
         );
         Ok(Self {
             shared,
@@ -183,7 +193,7 @@ impl ConnectionManager {
         self.stop.send_replace(true);
         while let Some(result) = self.workers.join_next().await {
             if let Err(error) = result {
-                tracing::error!(%error, "VPN host task stopped unexpectedly");
+                tracing::error!(%error, error_chain = ?error, "VPN host task stopped unexpectedly");
             }
         }
         self.routing.shutdown().await;
@@ -200,9 +210,10 @@ async fn benchmark_hosts(
     username: Arc<str>,
     password: Arc<str>,
     dns: ResolverConfig,
-    permits: Arc<Semaphore>,
+    deadline: Deadline,
 ) -> Result<Baselines> {
     let started = Instant::now();
+    let permits = Arc::new(Semaphore::new(INITIAL_PROBE_PARALLELISM));
     let mut tasks = JoinSet::new();
     for (id, candidate) in candidates.iter().cloned().enumerate() {
         let profile = Arc::clone(&profile);
@@ -221,24 +232,53 @@ async fn benchmark_hosts(
             (id, result)
         });
     }
-    let result = collect_baselines(tasks, candidates.len()).await;
+    let result = collect_baselines(tasks, candidates.len(), deadline).await;
     tracing::info!(hosts = candidates.len(), elapsed = ?started.elapsed(), parallelism = INITIAL_PROBE_PARALLELISM, "VPN baseline round completed");
     result
 }
 
-async fn collect_baselines(mut tasks: ProbeTasks, host_count: usize) -> Result<Baselines> {
+async fn collect_baselines(
+    mut tasks: ProbeTasks,
+    host_count: usize,
+    deadline: Deadline,
+) -> Result<Baselines> {
     let mut scores: Vec<Option<(SocketAddr, LatencyScore)>> =
         (0..host_count).map(|_| None).collect();
-    while let Some(result) = tasks.join_next().await {
+    let mut deadline_reached = false;
+    while !tasks.is_empty() {
+        // Completed assessments are retained, including those already ready at the deadline.
+        let result = match time::timeout_at(deadline, tasks.join_next()).await {
+            Ok(Some(result)) => result,
+            Ok(None) => break,
+            Err(_) => {
+                deadline_reached = true;
+                tracing::warn!(
+                    timeout_secs = STARTUP_TIMEOUT.as_secs(),
+                    healthy = scores.iter().filter(|score| score.is_some()).count(),
+                    cancelled = tasks.len(),
+                    "VPN startup deadline reached; cancelling unfinished assessments"
+                );
+                // Abort and join both active probes and tasks waiting for a probe slot.
+                tasks.shutdown().await;
+                break;
+            }
+        };
         match result {
             Ok((id, Ok(score))) => scores[id] = Some(score),
             Ok((id, Err(error))) => {
-                tracing::warn!(host_id = id, %error, "VPN host baseline unavailable");
+                tracing::warn!(host_id = id, %error, error_chain = ?error, "VPN host baseline unavailable");
             }
-            Err(error) => tracing::error!(%error, "VPN host baseline task failed"),
+            Err(error) => {
+                tracing::error!(%error, error_chain = ?error, "VPN host baseline task failed")
+            }
         }
     }
     if scores.iter().all(Option::is_none) {
+        if deadline_reached {
+            bail!(
+                "no VPN host passed the startup latency probe within the 30-second startup deadline"
+            );
+        }
         bail!("no VPN host passed the startup latency probe");
     }
     Ok(scores)
@@ -247,7 +287,6 @@ async fn collect_baselines(mut tasks: ProbeTasks, host_count: usize) -> Result<B
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
 
     #[tokio::test]
     async fn startup_waits_for_all_assessments_and_keeps_later_faster_hosts() {
@@ -269,7 +308,7 @@ mod tests {
         });
         tasks.spawn(async move { (1, delayed.await.unwrap()) });
         tasks.spawn(async { (2, Err(anyhow!("unreachable"))) });
-        let assessment = collect_baselines(tasks, 3);
+        let assessment = collect_baselines(tasks, 3, Deadline::now() + STARTUP_TIMEOUT);
         tokio::pin!(assessment);
         assert!(
             tokio::time::timeout(Duration::from_millis(25), &mut assessment)
@@ -306,6 +345,92 @@ mod tests {
     async fn startup_fails_when_every_candidate_fails() {
         let mut tasks = JoinSet::new();
         tasks.spawn(async { (0, Err(anyhow!("unreachable"))) });
-        assert!(collect_baselines(tasks, 1).await.is_err());
+        assert!(
+            collect_baselines(tasks, 1, Deadline::now() + STARTUP_TIMEOUT)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn startup_deadline_retains_successes_and_cancels_active_and_queued_probes() {
+        let started = Deadline::now();
+        let deadline = started + STARTUP_TIMEOUT;
+        // Discovery consumes part of the same budget, rather than resetting it.
+        time::advance(Duration::from_secs(8)).await;
+        let permits = Arc::new(Semaphore::new(1));
+        let (active_cancelled, active) = tokio::sync::oneshot::channel::<()>();
+        let (queued_cancelled, queued) = tokio::sync::oneshot::channel::<()>();
+        let (acquired, ready) = tokio::sync::oneshot::channel();
+        let mut tasks = JoinSet::new();
+        tasks.spawn(async {
+            time::sleep(Duration::from_secs(10)).await;
+            (
+                0,
+                Ok((
+                    "127.0.0.1:1194".parse().unwrap(),
+                    LatencyScore {
+                        median: Duration::from_millis(20),
+                        elapsed: Duration::ZERO,
+                        successful_samples: 3,
+                        measured_at: Instant::now(),
+                    },
+                )),
+            )
+        });
+        let active_permits = Arc::clone(&permits);
+        tasks.spawn(async move {
+            let _permit = active_permits.acquire_owned().await.unwrap();
+            acquired.send(()).unwrap();
+            let _ = active.await;
+            (1, Err(anyhow!("active probe unexpectedly released")))
+        });
+        ready.await.unwrap();
+        let queued_permits = Arc::clone(&permits);
+        tasks.spawn(async move {
+            let _permit = queued_permits.acquire_owned().await.unwrap();
+            let _ = queued.await;
+            (2, Err(anyhow!("queued probe unexpectedly released")))
+        });
+
+        let baselines = collect_baselines(tasks, 3, deadline).await.unwrap();
+        assert_eq!(Deadline::now() - started, STARTUP_TIMEOUT);
+        assert!(baselines[0].is_some());
+        assert!(baselines[1].is_none());
+        assert!(baselines[2].is_none());
+        assert!(active_cancelled.is_closed());
+        assert!(queued_cancelled.is_closed());
+        assert_eq!(permits.available_permits(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn startup_fails_at_deadline_when_no_probe_passes() {
+        let started = Deadline::now();
+        let (cancelled, blocked) = tokio::sync::oneshot::channel::<()>();
+        let mut tasks = JoinSet::new();
+        tasks.spawn(async move {
+            let _ = blocked.await;
+            (0, Err(anyhow!("probe unexpectedly released")))
+        });
+        let error = collect_baselines(tasks, 1, started + STARTUP_TIMEOUT)
+            .await
+            .err()
+            .expect("startup should fail without a successful probe");
+        assert_eq!(Deadline::now() - started, STARTUP_TIMEOUT);
+        assert!(error.to_string().contains("30-second startup deadline"));
+        assert!(cancelled.is_closed());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn startup_finishes_early_when_all_probes_complete() {
+        let started = Deadline::now();
+        let mut tasks = JoinSet::new();
+        tasks.spawn(async { (0, Err(anyhow!("unreachable"))) });
+        assert!(
+            collect_baselines(tasks, 1, started + STARTUP_TIMEOUT)
+                .await
+                .is_err()
+        );
+        assert_eq!(Deadline::now(), started);
     }
 }

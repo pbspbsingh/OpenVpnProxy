@@ -1,12 +1,17 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
+use std::net::SocketAddr;
 
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::time::Instant;
 use tokio::sync::mpsc;
 
+use crate::tcp_diagnostics::control_packet;
+
 const RECEIVE_QUEUE_CAPACITY: usize = 1024;
 
 pub(crate) struct PacketDevice {
+    stack_id: u64,
+    pub stream_ids: HashMap<(u16, SocketAddr), u64>,
     inbound: VecDeque<Vec<u8>>,
     output: mpsc::Sender<Vec<u8>>,
     // Remember a failed reservation even if capacity returns before the worker waits.
@@ -17,8 +22,10 @@ pub(crate) struct PacketDevice {
 }
 
 impl PacketDevice {
-    pub(crate) fn new(mtu: usize, output: mpsc::Sender<Vec<u8>>) -> Self {
+    pub(crate) fn new(stack_id: u64, mtu: usize, output: mpsc::Sender<Vec<u8>>) -> Self {
         Self {
+            stack_id,
+            stream_ids: HashMap::new(),
             inbound: VecDeque::new(),
             output,
             output_blocked: false,
@@ -50,6 +57,8 @@ impl RxToken for ReceivePacket {
 }
 
 pub(crate) struct TransmitPacket<'a> {
+    stack_id: u64,
+    stream_ids: &'a HashMap<(u16, SocketAddr), u64>,
     permit: mpsc::Permit<'a, Vec<u8>>,
     packets: &'a mut u64,
     bytes: &'a mut u64,
@@ -61,6 +70,23 @@ impl TxToken for TransmitPacket<'_> {
     {
         let mut packet = vec![0; len];
         let result = f(&mut packet);
+        if let Some(control) = control_packet(&packet) {
+            let stream_id = self
+                .stream_ids
+                .get(&(control.source.port(), control.destination))
+                .copied();
+            let span = tracing::info_span!("tcp_control", stack_id = self.stack_id, stream_id, direction = "outbound",
+                source = %control.source, destination = %control.destination,
+                sequence = control.sequence, acknowledgment = ?control.acknowledgment,
+                fin = control.fin, rst = control.rst, window = control.window,
+                hop_limit = control.hop_limit, payload_bytes = control.payload_bytes);
+            let _entered = span.enter();
+            if stream_id.is_some() {
+                tracing::info!("TCP control packet queued to tunnel");
+            } else {
+                tracing::debug!("TCP control packet queued without a matching stream");
+            }
+        }
         self.permit.send(packet);
         *self.packets += 1;
         *self.bytes += len as u64;
@@ -86,6 +112,8 @@ impl Device for PacketDevice {
         Some((
             ReceivePacket(packet),
             TransmitPacket {
+                stack_id: self.stack_id,
+                stream_ids: &self.stream_ids,
                 permit,
                 packets: &mut self.transmitted_packets,
                 bytes: &mut self.transmitted_bytes,
@@ -98,6 +126,8 @@ impl Device for PacketDevice {
             return None;
         };
         Some(TransmitPacket {
+            stack_id: self.stack_id,
+            stream_ids: &self.stream_ids,
             permit,
             packets: &mut self.transmitted_packets,
             bytes: &mut self.transmitted_bytes,

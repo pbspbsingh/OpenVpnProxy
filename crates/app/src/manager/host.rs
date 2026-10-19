@@ -137,7 +137,7 @@ impl HostWorker {
                     let score = match fresh_score {
                         Ok(score) => score,
                         Err(error) => {
-                            tracing::warn!(host_id = id, %endpoint, %error, "fresh VPN host probe failed");
+                            tracing::warn!(host_id = id, %endpoint, %error, error_chain = ?error, "fresh VPN host probe failed");
                             self.shared.down(id, false).await;
                             tunnel.shutdown().await;
                             drop(permit);
@@ -183,7 +183,7 @@ impl HostWorker {
                         continue;
                     }
                     if let Err(error) = result {
-                        tracing::warn!(host_id = id, %endpoint, %error, cause = %error.root_cause(), "VPN host disconnected");
+                        tracing::warn!(host_id = id, %endpoint, %error, error_chain = ?error, cause = %error.root_cause(), "VPN host disconnected");
                     }
                     if active_since.elapsed() >= STABLE_SESSION_WINDOW {
                         delay = INITIAL_RETRY_DELAY;
@@ -191,7 +191,7 @@ impl HostWorker {
                 }
                 Err(error) => {
                     self.shared.down(id, false).await;
-                    tracing::warn!(host_id = id, %endpoint, %error, cause = %error.root_cause(), "VPN host connection failed");
+                    tracing::warn!(host_id = id, %endpoint, %error, error_chain = ?error, cause = %error.root_cause(), "VPN host connection failed");
                     drop(permit);
                 }
             }
@@ -231,7 +231,7 @@ pub(super) async fn benchmark_host(
         let mut tunnel = match connection {
             Ok(Ok(connection)) => connection,
             Ok(Err(error)) => {
-                tracing::warn!(host_id = id, %endpoint, %error, "VPN baseline connection failed");
+                tracing::warn!(host_id = id, %endpoint, %error, error_chain = ?error, "VPN baseline connection failed");
                 last_error = Some(error);
                 continue;
             }
@@ -246,11 +246,11 @@ pub(super) async fn benchmark_host(
         tunnel.shutdown().await;
         match score {
             Ok(score) => {
-                tracing::info!(host_id = id, %endpoint, ?setup_elapsed, latency_score = ?score.median, score_elapsed = ?score.elapsed, total_elapsed = ?host_started.elapsed(), successful_samples = score.successful_samples, "VPN baseline latency score measured");
+                tracing::debug!(host_id = id, %endpoint, ?setup_elapsed, latency_score = ?score.median, score_elapsed = ?score.elapsed, total_elapsed = ?host_started.elapsed(), successful_samples = score.successful_samples, "VPN baseline latency score measured");
                 return Ok((endpoint, score));
             }
             Err(error) => {
-                tracing::warn!(host_id = id, %endpoint, ?setup_elapsed, total_elapsed = ?started.elapsed(), %error, "VPN baseline probe failed");
+                tracing::warn!(host_id = id, %endpoint, ?setup_elapsed, total_elapsed = ?started.elapsed(), %error, error_chain = ?error, "VPN baseline probe failed");
                 last_error = Some(error);
             }
         }
@@ -258,6 +258,7 @@ pub(super) async fn benchmark_host(
     Err(last_error.unwrap_or_else(|| anyhow!("VPN host has no endpoints")))
 }
 
+#[tracing::instrument(name = "vpn_session", skip_all, fields(%endpoint))]
 async fn connect_host(
     endpoint: SocketAddr,
     profile: &Profile,
@@ -297,12 +298,15 @@ async fn connect_host(
                 })
                 .collect(),
         });
+    let resolver = dns.endpoint();
     let tunnel = TunnelConfig::new(settings.local, settings.gateway, dns, settings.mtu, ipv6)
         .context("invalid VPN tunnel settings")?;
     let (tx, rx) = mpsc::channel(TUNNEL_PACKET_QUEUE_CAPACITY);
     let stack = StackOwner::start(tunnel, tx)
         .await
         .context("VPN packet stack setup failed")?;
+    tracing::debug!(stack_id = stack.client().id(), %resolver, mtu = settings.mtu,
+        "VPN userspace stack ready with authenticated DoT resolver");
     Ok(HostSession {
         endpoint,
         session,

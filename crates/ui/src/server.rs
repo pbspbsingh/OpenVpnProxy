@@ -1,6 +1,8 @@
 mod configuration;
+mod pac;
 
 use std::future::Future;
+use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
@@ -92,6 +94,7 @@ pub async fn serve<S: DashboardSource>(
     logs: LogHub,
     shutdown_request: watch::Sender<bool>,
     configurations: Option<Arc<dyn ConfigurationControl>>,
+    socks5_address: SocketAddr,
 ) -> Result<(), UiError> {
     let source: Arc<dyn DashboardSource> = Arc::new(source);
     let updates = source.subscribe();
@@ -128,9 +131,10 @@ pub async fn serve<S: DashboardSource>(
         )
         .route("/ws", any(websocket))
         .route("/ws/logs", any(log_websocket))
+        .with_state(state)
+        .merge(pac::router(socks5_address))
         .layer(map_response(no_cache))
-        .layer(DefaultBodyLimit::max(2 * 1024 * 1024))
-        .with_state(state);
+        .layer(DefaultBodyLimit::max(2 * 1024 * 1024));
     tracing::info!(address = %listener.local_addr()?, "dashboard listening");
 
     let result = axum::serve(listener, router)

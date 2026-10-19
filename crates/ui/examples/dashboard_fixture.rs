@@ -167,6 +167,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         logs,
         shutdown_request,
         None,
+        "127.0.0.1:1080".parse()?,
     )
     .await;
     sampler.abort();

@@ -80,6 +80,7 @@ async fn serve_with_dashboard(
         logs,
         shutdown_request,
         Some(std::sync::Arc::new(configurations.clone())),
+        config.socks5_address,
     ));
     let mut next = Some(StartRequest::Startup);
     let mut selection_updates = configurations.subscribe();

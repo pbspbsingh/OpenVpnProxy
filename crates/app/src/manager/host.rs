@@ -1,4 +1,4 @@
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -33,7 +33,7 @@ pub(super) struct HostWorker {
     pub profile: Arc<Profile>,
     pub username: Arc<str>,
     pub password: Arc<str>,
-    pub dns_override: Option<Ipv4Addr>,
+    pub dns: ovpn_dns::ResolverConfig,
     pub permits: Arc<Semaphore>,
     pub enabled: watch::Receiver<HostActivation>,
     pub traffic: HostTraffic,
@@ -116,7 +116,7 @@ impl HostWorker {
                 .handshake_window
                 .saturating_add(CONTROL_SETUP_ALLOWANCE);
             let result = tokio::select! {
-                result = time::timeout(connect_timeout, connect_host(endpoint, &self.profile, &self.username, &self.password, self.dns_override)) =>
+                result = time::timeout(connect_timeout, connect_host(endpoint, &self.profile, &self.username, &self.password, self.dns.clone())) =>
                     result.map_err(|_| anyhow!("VPN host connection timed out")).and_then(|result| result),
                 _ = self.enabled.changed() => continue,
                 _ = self.stop.changed() => break,
@@ -214,7 +214,7 @@ pub(super) async fn benchmark_host(
     profile: &Profile,
     username: &str,
     password: &str,
-    dns_override: Option<Ipv4Addr>,
+    dns: ovpn_dns::ResolverConfig,
 ) -> Result<(SocketAddr, LatencyScore)> {
     let host_started = Instant::now();
     let connect_timeout = profile
@@ -225,7 +225,7 @@ pub(super) async fn benchmark_host(
         let started = Instant::now();
         let connection = time::timeout(
             connect_timeout,
-            connect_host(endpoint, profile, username, password, dns_override),
+            connect_host(endpoint, profile, username, password, dns.clone()),
         )
         .await;
         let mut tunnel = match connection {
@@ -263,7 +263,7 @@ async fn connect_host(
     profile: &Profile,
     username: &str,
     password: &str,
-    dns_override: Option<Ipv4Addr>,
+    dns: ovpn_dns::ResolverConfig,
 ) -> Result<HostSession> {
     let config = ClientConfig {
         endpoint,
@@ -280,9 +280,6 @@ async fn connect_host(
         .await
         .context("OpenVPN session failed")?;
     let settings = &session.config().tunnel;
-    let dns = dns_override
-        .map(|address| vec![IpAddr::V4(address)])
-        .unwrap_or_else(|| settings.dns.clone());
     let ipv6 = settings
         .ipv6
         .as_ref()

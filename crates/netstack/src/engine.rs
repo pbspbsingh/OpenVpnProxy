@@ -6,16 +6,16 @@ use std::time::{Duration, Instant as Clock};
 
 use bytes::{Buf, Bytes};
 use smoltcp::iface::{Config, Interface, Route, SocketHandle, SocketSet};
-use smoltcp::socket::{dns, tcp};
+use smoltcp::socket::tcp;
 use smoltcp::time::Instant;
-use smoltcp::wire::{DnsQueryType, HardwareAddress, IpAddress, IpCidr, Ipv4Address};
+use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr, Ipv4Address};
 use tokio::sync::{Notify, mpsc, oneshot};
 use tokio::time;
 
 use crate::device::PacketDevice;
 use crate::error::{Result, StackError};
 use crate::stack::{Command, ConnectRequest};
-use crate::types::{IpVersion, Ipv6Route, StackPhase, StreamEvent, TunnelConfig, matches_route};
+use crate::types::{Ipv6Route, StackPhase, StreamEvent, TunnelConfig, matches_route};
 
 const TCP_RECEIVE_BUFFER_BYTES: usize = 256 * 1024;
 const TCP_SEND_BUFFER_BYTES: usize = 32 * 1024;
@@ -23,7 +23,6 @@ const IPV4_HOST_PREFIX_BITS: u8 = 32;
 const EPHEMERAL_PORT_START: u16 = 40_000;
 const EPHEMERAL_PORT_END: u16 = 60_000;
 const MAX_CONNECTIONS: usize = 256;
-const DNS_QUERY_TIMEOUT: Duration = Duration::from_secs(10);
 const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 // Linux's default tcp_retries2 reference budget, rather than a short app timeout.
 // https://docs.kernel.org/networking/ip-sysctl.html#tcp-retries2-integer
@@ -181,23 +180,12 @@ struct Connection {
     deadline: Clock,
 }
 
-struct PendingDns {
-    host: String,
-    version: IpVersion,
-    query: dns::QueryHandle,
-    reply: oneshot::Sender<Result<Vec<IpAddr>>>,
-    deadline: Clock,
-}
-
 struct Engine {
     id: u64,
     iface: Interface,
     device: PacketDevice,
     sockets: SocketSet<'static>,
-    dns_socket: SocketHandle,
-    dns_available: bool,
     ipv6_routes: Vec<Ipv6Route>,
-    pending_dns: Vec<PendingDns>,
     connections: HashMap<u64, Connection>,
     next_port: u16,
     io: mpsc::Sender<Vec<u8>>,
@@ -246,20 +234,15 @@ impl Engine {
                 return Err(StackError::RouteTableFull);
             }
         }
-        let servers: Vec<IpAddress> = config.dns.iter().copied().map(smol_ip).collect();
-        let mut sockets = SocketSet::new(vec![]);
-        let dns_socket = sockets.add(dns::Socket::new(&servers, vec![]));
-        tracing::debug!(local = %config.local, gateway = %config.gateway, mtu = config.mtu, dns_servers = servers.len(), ipv6_routes = config.ipv6.as_ref().map_or(0, |ipv6| ipv6.routes.len()), "userspace packet stack initialized");
+        let sockets = SocketSet::new(vec![]);
+        tracing::debug!(local = %config.local, gateway = %config.gateway, mtu = config.mtu, ipv6_routes = config.ipv6.as_ref().map_or(0, |ipv6| ipv6.routes.len()), "userspace packet stack initialized");
         let ipv6_routes = config.ipv6.map_or_else(Vec::new, |ipv6| ipv6.routes);
         Ok(Self {
             id,
             iface,
             device,
             sockets,
-            dns_socket,
-            dns_available: !servers.is_empty(),
             ipv6_routes,
-            pending_dns: Vec::new(),
             connections: HashMap::new(),
             next_port: EPHEMERAL_PORT_START,
             io,
@@ -278,31 +261,9 @@ impl Engine {
                     self.stats.inbound_dropped += 1;
                 }
             }
-            Command::Resolve(host, version, reply) => {
-                if !self.dns_available {
-                    tracing::warn!(%host, "tunneled DNS requested without a DNS server");
-                    let _ = reply.send(Err(StackError::NoDnsServer));
-                    return;
-                }
-                tracing::debug!(%host, ?version, "starting tunneled DNS query");
-                let socket = self.sockets.get_mut::<dns::Socket>(self.dns_socket);
-                let query_type = match version {
-                    IpVersion::V4 => DnsQueryType::A,
-                    IpVersion::V6 => DnsQueryType::Aaaa,
-                };
-                match socket.start_query(self.iface.context(), &host, query_type) {
-                    Ok(query) => self.pending_dns.push(PendingDns {
-                        host,
-                        version,
-                        query,
-                        reply,
-                        deadline: Clock::now() + DNS_QUERY_TIMEOUT,
-                    }),
-                    Err(error) => {
-                        tracing::warn!(%host, ?error, "could not start tunneled DNS query");
-                        let _ = reply.send(Err(StackError::DnsQuery(format!("{error:?}"))));
-                    }
-                }
+            #[cfg(test)]
+            Command::Barrier(reply) => {
+                let _ = reply.send(());
             }
             Command::Connect(ConnectRequest {
                 id,
@@ -394,45 +355,6 @@ impl Engine {
         }
         self.device.output_blocked = false;
         self.iface.poll(now, &mut self.device, &mut self.sockets);
-        // Work backwards so swap_remove only moves requests already checked.
-        // Pending requests reuse this vector's allocation; query order is immaterial.
-        for index in (0..self.pending_dns.len()).rev() {
-            let request = self.pending_dns.swap_remove(index);
-            let socket = self.sockets.get_mut::<dns::Socket>(self.dns_socket);
-            if request.reply.is_closed() {
-                socket.cancel_query(request.query);
-                continue;
-            }
-            if Clock::now() >= request.deadline {
-                tracing::warn!(host = %request.host, "tunneled DNS query timed out");
-                socket.cancel_query(request.query);
-                let _ = request.reply.send(Err(StackError::DnsTimeout));
-                continue;
-            }
-            match socket.get_query_result(request.query) {
-                Ok(addresses) => {
-                    let addresses: Vec<_> = addresses
-                        .iter()
-                        .filter_map(|address| match (request.version, address) {
-                            (IpVersion::V4, IpAddress::Ipv4(value)) => Some(IpAddr::V4(*value)),
-                            (IpVersion::V6, IpAddress::Ipv6(value)) => Some(IpAddr::V6(*value)),
-                            _ => None,
-                        })
-                        .collect();
-                    tracing::debug!(host = %request.host, ?addresses, "tunneled DNS query completed");
-                    let _ = request.reply.send(if addresses.is_empty() {
-                        Err(StackError::NoDnsAddress)
-                    } else {
-                        Ok(addresses)
-                    });
-                }
-                Err(dns::GetQueryResultError::Pending) => self.pending_dns.push(request),
-                Err(_) => {
-                    tracing::warn!(host = %request.host, "tunneled DNS query failed");
-                    let _ = request.reply.send(Err(StackError::DnsFailed));
-                }
-            }
-        }
         let mut close = Vec::new();
         for (&id, connection) in &mut self.connections {
             let socket = self.sockets.get_mut::<tcp::Socket>(connection.socket);
@@ -605,19 +527,14 @@ impl Engine {
 
         let current = Clock::now();
         let application_delay = self
-            .pending_dns
-            .iter()
-            .map(|request| request.deadline.saturating_duration_since(current))
-            .chain(
-                self.connections
-                    .values()
-                    .filter(|connection| !connection.established)
-                    .map(|connection| connection.deadline.saturating_duration_since(current)),
-            )
+            .connections
+            .values()
+            .filter(|connection| !connection.established)
+            .map(|connection| connection.deadline.saturating_duration_since(current))
             .min();
         // A full device remains immediately pollable inside smoltcp. Wait for
         // channel capacity instead of spinning on protocol work it cannot send.
-        // Application deadlines still run, so stalled connects/DNS can expire.
+        // Application deadlines still run, so stalled connects can expire.
         let protocol_delay = if self.io.capacity() == 0 {
             None
         } else {
@@ -641,7 +558,6 @@ impl Engine {
             stack_id = self.id,
             ?window,
             connections = self.connections.len(),
-            pending_dns = self.pending_dns.len(),
             polls = stats.polls,
             inbound_packets = stats.inbound_packets,
             inbound_bytes = stats.inbound_bytes,
@@ -666,14 +582,10 @@ impl Engine {
         self.log_status();
         tracing::info!(
             connections = self.connections.len(),
-            pending_dns = self.pending_dns.len(),
             "userspace packet stack shutting down"
         );
         for (_, connection) in self.connections.drain() {
             let _ = connection.events.try_send(StreamEvent::Closed);
-        }
-        for request in self.pending_dns.drain(..) {
-            let _ = request.reply.send(Err(StackError::Disconnected));
         }
     }
 }

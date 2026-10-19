@@ -19,14 +19,10 @@ pub enum StackError {
     VpnDown,
     #[error("tunneled DNS timed out")]
     DnsTimeout,
-    #[error("VPN pushed no DNS server; set dns_override in config.toml")]
-    NoDnsServer,
     #[error("tunneled DNS query failed: {0}")]
-    DnsQuery(String),
+    DnsQuery(#[source] ovpn_dns::Error),
     #[error("tunneled DNS returned no address")]
     NoDnsAddress,
-    #[error("tunneled DNS failed")]
-    DnsFailed,
     #[error("VPN disconnected")]
     Disconnected,
     #[error("tunnel TCP connection timed out")]

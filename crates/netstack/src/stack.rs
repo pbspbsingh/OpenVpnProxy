@@ -12,13 +12,14 @@ use crate::engine::Worker;
 use crate::error::{Result, StackError};
 use crate::stream::{StreamEvents, TunnelStream};
 use crate::types::{IpVersion, Ipv6Route, StackPhase, StreamEvent, TunnelConfig};
+use ovpn_dns::Client;
 
 const COMMAND_QUEUE_CAPACITY: usize = 2048;
 const CONNECTION_EVENT_QUEUE_CAPACITY: usize = 32;
 pub(crate) const STREAM_WRITE_CHUNK_BYTES: usize = 8192;
 const STREAM_WRITE_QUEUE_CAPACITY: usize = 256 * 1024 / STREAM_WRITE_CHUNK_BYTES;
-const DNS_RESPONSE_TIMEOUT: Duration = Duration::from_secs(12);
 const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(16);
+const MAX_DNS_ANSWERS: usize = 16;
 static NEXT_STACK_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Exclusive owner of one tunnel's packet worker.
@@ -44,6 +45,7 @@ impl StackOwner {
             .map_or_else(Vec::new, |ipv6| ipv6.routes.clone());
         let (stop, stopped) = oneshot::channel();
         let (ready, started) = oneshot::channel();
+        let dns = Arc::new(Client::new(config.dns.clone()));
         let worker = Worker {
             id,
             config,
@@ -57,6 +59,7 @@ impl StackOwner {
         let owner = Self {
             client: Stack {
                 id,
+                dns,
                 tx,
                 phase,
                 next_id: Arc::new(AtomicU64::new(1)),
@@ -119,6 +122,7 @@ impl Drop for StackOwner {
 #[derive(Clone)]
 pub struct Stack {
     id: u64,
+    dns: Arc<Client<TunnelStream>>,
     pub(crate) tx: mpsc::Sender<Command>,
     phase: Arc<AtomicU8>,
     next_id: Arc<AtomicU64>,
@@ -148,8 +152,8 @@ impl Stack {
         StackPhase::from_raw(self.phase.load(Ordering::Acquire))
     }
 
-    /// Returns this family's DNS answers through the session, including mailbox
-    /// wait in the deadline. At most 16 addresses are retained per query.
+    /// Resolves through authenticated DNS over TLS on this session. The deadline
+    /// includes pool wait, connection and TLS. At most 16 answers are retained.
     pub async fn resolve(&self, host: &str, version: IpVersion) -> Result<Vec<IpAddr>> {
         if !self.is_ready() {
             return Err(StackError::VpnDown);
@@ -157,16 +161,20 @@ impl Stack {
         if version == IpVersion::V6 && !self.supports_ipv6() {
             return Err(StackError::NoIpv6Route);
         }
-        time::timeout(DNS_RESPONSE_TIMEOUT, async {
-            let (reply, received) = oneshot::channel();
-            self.tx
-                .send(Command::Resolve(host.to_owned(), version, reply))
-                .await
-                .map_err(|_| StackError::WorkerStopped)?;
-            received.await.map_err(|_| StackError::WorkerStopped)?
-        })
-        .await
-        .map_err(|_| StackError::DnsTimeout)?
+        self.dns
+            .resolve(host, version, |address| async move {
+                self.connect(address).await.map_err(std::io::Error::other)
+            })
+            .await
+            .map(|mut addresses| {
+                addresses.truncate(MAX_DNS_ANSWERS);
+                addresses
+            })
+            .map_err(|error| match error {
+                ovpn_dns::Error::Timeout => StackError::DnsTimeout,
+                ovpn_dns::Error::NoAddress => StackError::NoDnsAddress,
+                error => StackError::DnsQuery(error),
+            })
     }
 
     /// Connects and returns an independently owned, bidirectional TCP stream.
@@ -222,7 +230,8 @@ impl Stack {
 
 pub(crate) enum Command {
     Packet(Vec<u8>),
-    Resolve(String, IpVersion, oneshot::Sender<Result<Vec<IpAddr>>>),
+    #[cfg(test)]
+    Barrier(oneshot::Sender<()>),
     Connect(ConnectRequest),
     #[cfg(test)]
     Close(u64),

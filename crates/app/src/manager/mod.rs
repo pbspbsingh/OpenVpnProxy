@@ -5,7 +5,8 @@ mod probe;
 mod routing;
 pub(crate) mod telemetry;
 
-use std::net::{Ipv4Addr, SocketAddr};
+use ovpn_dns::ResolverConfig;
+use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Instant;
@@ -40,11 +41,11 @@ impl ConnectionManager {
         profile: Profile,
         username: String,
         password: String,
-        dns_override: Option<Ipv4Addr>,
+        dns: ResolverConfig,
         max_active_vpn_hosts: Option<NonZeroUsize>,
         telemetry: Telemetry,
     ) -> Result<Self> {
-        let mut candidates = resolve_candidates(&profile).await?;
+        let mut candidates = resolve_candidates(&profile, dns.clone()).await?;
         let max_active_vpn_hosts = max_active_vpn_hosts
             .map(NonZeroUsize::get)
             .unwrap_or(DEFAULT_MAX_ACTIVE_VPN_HOSTS);
@@ -60,7 +61,7 @@ impl ConnectionManager {
             Arc::clone(&profile),
             Arc::clone(&username),
             Arc::clone(&password),
-            dns_override,
+            dns.clone(),
             probe_permits,
         )
         .await?;
@@ -131,7 +132,7 @@ impl ConnectionManager {
                 profile: Arc::clone(&profile),
                 username: Arc::clone(&username),
                 password: Arc::clone(&password),
-                dns_override,
+                dns: dns.clone(),
                 permits: Arc::clone(&permits),
                 enabled,
                 traffic: HostTraffic::new(id, telemetry.clone()),
@@ -198,7 +199,7 @@ async fn benchmark_hosts(
     profile: Arc<Profile>,
     username: Arc<str>,
     password: Arc<str>,
-    dns_override: Option<Ipv4Addr>,
+    dns: ResolverConfig,
     permits: Arc<Semaphore>,
 ) -> Result<Baselines> {
     let started = Instant::now();
@@ -208,12 +209,12 @@ async fn benchmark_hosts(
         let username = Arc::clone(&username);
         let password = Arc::clone(&password);
         let permits = Arc::clone(&permits);
+        let dns = dns.clone();
         tasks.spawn(async move {
             let permit = permits.acquire_owned().await;
             let result = match permit {
                 Ok(_permit) => {
-                    benchmark_host(id, &candidate, &profile, &username, &password, dns_override)
-                        .await
+                    benchmark_host(id, &candidate, &profile, &username, &password, dns).await
                 }
                 Err(error) => Err(error.into()),
             };

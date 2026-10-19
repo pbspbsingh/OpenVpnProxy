@@ -38,6 +38,7 @@ pub struct ConfigurationSummary {
     pub password_set: bool,
     pub profile_name: String,
     pub dns_override: Option<Ipv4Addr>,
+    pub dns_tls_name: Option<String>,
     pub max_active_vpn_hosts: Option<NonZeroUsize>,
 }
 
@@ -86,6 +87,7 @@ pub struct ConfigurationInput {
     pub profile: Option<ProfileUpload>,
     pub revision: Option<u64>,
     pub dns_override: Option<Ipv4Addr>,
+    pub dns_tls_name: Option<String>,
     pub max_active_vpn_hosts: Option<NonZeroUsize>,
 }
 

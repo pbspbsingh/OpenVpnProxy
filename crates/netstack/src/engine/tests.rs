@@ -15,11 +15,35 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 const MSS: usize = 1360;
 const TEST_TIMEOUT: Duration = Duration::from_secs(2);
 
+#[tokio::test]
+async fn dns_uses_tunneled_tcp_to_default_resolver_and_cancels_cleanly() {
+    let (io, mut outbound) = mpsc::channel(16);
+    let owner = StackOwner::start(tunnel_config(), io).await.unwrap();
+    let stack = owner.client();
+    let mut query = Box::pin(stack.resolve("example.com", crate::IpVersion::V4));
+    let packet = tokio::select! {
+        result = &mut query => panic!("DNS returned before TCP connected: {result:?}"),
+        packet = time::timeout(TEST_TIMEOUT, outbound.recv()) => packet.unwrap().unwrap(),
+    };
+    let ip = Ipv4Packet::new_checked(&packet[..]).unwrap();
+    assert_eq!(ip.dst_addr(), ovpn_dns::DEFAULT_SERVER);
+    assert_eq!(ip.next_header(), IpProtocol::Tcp);
+    let tcp = TcpPacket::new_checked(ip.payload()).unwrap();
+    assert_eq!(tcp.dst_port(), 853);
+    assert!(tcp.syn());
+    drop(query);
+    time::timeout(TEST_TIMEOUT, owner.shutdown()).await.unwrap();
+    assert!(matches!(
+        stack.resolve("example.com", crate::IpVersion::V4).await,
+        Err(StackError::VpnDown)
+    ));
+}
+
 fn tunnel_config() -> TunnelConfig {
     TunnelConfig::new(
         "10.8.0.2".parse().unwrap(),
         "10.8.0.1".parse().unwrap(),
-        vec![],
+        ovpn_dns::ResolverConfig::default(),
         1400,
         None,
     )
@@ -179,7 +203,7 @@ async fn connected() -> (StackOwner, u64, StreamEvents, Peer) {
         TunnelConfig::new(
             Ipv4Addr::new(10, 8, 0, 2),
             Ipv4Addr::new(10, 8, 0, 1),
-            vec![],
+            ovpn_dns::ResolverConfig::default(),
             1400,
             None,
         )
@@ -357,10 +381,9 @@ async fn output_capacity_wakes_worker_and_full_output_does_not_block_shutdown() 
     let (_first_id, _first_events) = stack.open("1.1.1.1:443".parse().unwrap()).await.unwrap();
     let (_second_id, _second_events) = stack.open("1.1.1.1:443".parse().unwrap()).await.unwrap();
     // This reply proves both preceding connect commands have been processed.
-    assert!(matches!(
-        stack.resolve("barrier.test", IpVersion::V4).await,
-        Err(StackError::NoDnsServer)
-    ));
+    let (reply, received) = oneshot::channel();
+    stack.tx.send(Command::Barrier(reply)).await.unwrap();
+    received.await.unwrap();
     assert_eq!(outbound.len(), 1);
     let first = outbound.recv().await.unwrap();
     let second = time::timeout(TEST_TIMEOUT, outbound.recv())
@@ -376,10 +399,9 @@ async fn output_capacity_wakes_worker_and_full_output_does_not_block_shutdown() 
     assert!(stack.is_ready());
 
     let (_third_id, _third_events) = stack.open("1.1.1.1:443".parse().unwrap()).await.unwrap();
-    assert!(matches!(
-        stack.resolve("barrier.test", IpVersion::V4).await,
-        Err(StackError::NoDnsServer)
-    ));
+    let (reply, received) = oneshot::channel();
+    stack.tx.send(Command::Barrier(reply)).await.unwrap();
+    received.await.unwrap();
     assert_eq!(outbound.len(), 1);
     time::timeout(TEST_TIMEOUT, owner.shutdown()).await.unwrap();
     assert!(!stack.is_ready());
@@ -391,10 +413,9 @@ async fn retransmissions_resume_when_a_previously_full_output_is_drained() {
     let owner = StackOwner::start(tunnel_config(), io).await.unwrap();
     let stack = owner.client();
     let (_id, _events) = stack.open("1.1.1.1:443".parse().unwrap()).await.unwrap();
-    assert!(matches!(
-        stack.resolve("barrier.test", IpVersion::V4).await,
-        Err(StackError::NoDnsServer)
-    ));
+    let (reply, received) = oneshot::channel();
+    stack.tx.send(Command::Barrier(reply)).await.unwrap();
+    received.await.unwrap();
     let first = outbound.recv().await.unwrap();
     // With no new commands or incoming packets, capacity recovery must restore
     // the protocol timer so an unanswered SYN is retransmitted.
@@ -436,7 +457,7 @@ fn unacknowledged_data_times_out_while_idle_connections_survive() {
         let config = TunnelConfig::new(
             "10.8.0.2".parse().unwrap(),
             "10.8.0.1".parse().unwrap(),
-            vec![],
+            ovpn_dns::ResolverConfig::default(),
             1400,
             None,
         )
@@ -508,119 +529,11 @@ fn unacknowledged_data_times_out_while_idle_connections_survive() {
 }
 
 #[test]
-fn pending_dns_survives_other_queries_being_cancelled_or_timing_out() {
-    let mut config = tunnel_config();
-    config.dns = vec!["8.8.8.8".parse().unwrap()];
-    let (io, _outbound) = mpsc::channel(1024);
-    let mut engine = Engine::new(0, config, io).unwrap();
-    let mut replies = Vec::new();
-    for host in ["first.test", "cancelled.test", "timeout.test", "last.test"] {
-        let (reply, received) = oneshot::channel();
-        engine.handle(Command::Resolve(host.into(), IpVersion::V4, reply));
-        replies.push(received);
-    }
-    drop(replies.remove(1));
-    engine.pending_dns[2].deadline = Clock::now() - Duration::from_secs(1);
-
-    for _ in 0..3 {
-        engine.tick(Instant::ZERO).unwrap();
-        let mut pending: Vec<_> = engine
-            .pending_dns
-            .iter()
-            .map(|request| request.host.as_str())
-            .collect();
-        pending.sort_unstable();
-        assert_eq!(pending, ["first.test", "last.test"]);
-        for index in [0, 2] {
-            assert!(matches!(
-                replies[index].try_recv(),
-                Err(oneshot::error::TryRecvError::Empty)
-            ));
-        }
-    }
-    assert!(matches!(
-        replies[1].try_recv(),
-        Ok(Err(StackError::DnsTimeout))
-    ));
-
-    for request in &mut engine.pending_dns {
-        request.deadline = Clock::now() - Duration::from_secs(1);
-    }
-    engine.tick(Instant::ZERO).unwrap();
-    assert!(engine.pending_dns.is_empty());
-    for index in [0, 2] {
-        assert!(matches!(
-            replies[index].try_recv(),
-            Ok(Err(StackError::DnsTimeout))
-        ));
-    }
-}
-
-#[test]
-fn dns_response_retains_multiple_addresses() {
-    use smoltcp::wire::UdpPacket;
-    let local: Ipv4Addr = "10.8.0.2".parse().unwrap();
-    let server: Ipv4Addr = "10.8.0.53".parse().unwrap();
-    let config = TunnelConfig::new(
-        local,
-        "10.8.0.1".parse().unwrap(),
-        vec![server.into()],
-        1400,
-        None,
-    )
-    .unwrap();
-    let (io, mut outbound) = mpsc::channel(1024);
-    let mut engine = Engine::new(0, config, io).unwrap();
-    let (reply, mut result) = oneshot::channel();
-    engine.handle(Command::Resolve("example.com".into(), IpVersion::V4, reply));
-    engine.tick(Instant::ZERO).unwrap();
-    let query = outbound.try_recv().unwrap();
-    let ip = Ipv4Packet::new_checked(&query[..]).unwrap();
-    let udp = UdpPacket::new_checked(ip.payload()).unwrap();
-    let mut response = udp.payload().to_vec();
-    response[2..4].copy_from_slice(&0x8180_u16.to_be_bytes()); // Standard successful response.
-    response[6..8].copy_from_slice(&2_u16.to_be_bytes());
-    for address in [[192, 0, 2, 1], [192, 0, 2, 2]] {
-        // Name points at the question; type A, class IN, TTL 60, four address bytes.
-        response.extend_from_slice(&[0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4]);
-        response.extend_from_slice(&address);
-    }
-    let repr = Ipv4Repr {
-        src_addr: server,
-        dst_addr: local,
-        next_header: IpProtocol::Udp,
-        payload_len: 8 + response.len(),
-        hop_limit: 64,
-    };
-    let mut packet = vec![0; repr.buffer_len() + repr.payload_len];
-    repr.emit(
-        &mut Ipv4Packet::new_unchecked(&mut packet[..]),
-        &ChecksumCapabilities::default(),
-    );
-    let mut answer = UdpPacket::new_unchecked(&mut packet[repr.buffer_len()..]);
-    answer.set_src_port(53);
-    answer.set_dst_port(udp.src_port());
-    answer.set_len((8 + response.len()) as u16);
-    answer.payload_mut().copy_from_slice(&response);
-    answer.fill_checksum(&server.into(), &local.into());
-    engine.handle(Command::Packet(packet));
-    engine.tick(Instant::from_millis(1)).unwrap();
-    let addresses = result.try_recv().unwrap().unwrap();
-    assert_eq!(
-        addresses,
-        vec![
-            "192.0.2.1".parse::<IpAddr>().unwrap(),
-            "192.0.2.2".parse().unwrap()
-        ]
-    );
-}
-
-#[test]
 fn pending_connect_waits_for_protocol_progress_instead_of_spinning() {
     let config = TunnelConfig::new(
         "10.8.0.2".parse().unwrap(),
         "10.8.0.1".parse().unwrap(),
-        vec![],
+        ovpn_dns::ResolverConfig::default(),
         1400,
         None,
     )

@@ -26,8 +26,11 @@ rustls = { version = "0.23.45", default-features = false, features = ["std", "tl
 rustls-pemfile = "2.2.0"
 x509-parser = "0.18.1"
 
-# Userspace TCP, IP, and DNS
-smoltcp = { version = "0.14.0", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-dns", "iface-max-route-count-4", "dns-max-server-count-4", "dns-max-result-count-16"] }
+# Userspace TCP/IP and authenticated DNS over TLS
+smoltcp = { version = "0.14.0", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp", "iface-max-route-count-4"] }
+hickory-proto = "0.26.3"
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["tls12", "aws_lc_rs"] }
+webpki-roots = "1.0.9"
 
 # TOML application configuration
 serde = { version = "1.0", features = ["derive"] }
@@ -54,6 +57,7 @@ tracing-subscriber = { version = "0.3.20", features = ["env-filter", "fmt"] }
 # Local workspace crates
 ovpn-profile = { path = "crates/profile" }
 ovpn-client = { path = "crates/openvpn" }
+ovpn-dns = { path = "crates/dns" }
 ovpn-netstack = { path = "crates/netstack" }
 ovpn-socks5 = { path = "crates/socks5" }
 ovpn-ui = { path = "crates/ui" }

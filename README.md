@@ -15,7 +15,7 @@ The OS handles the first TCP connection and the UDP sockets to VPN servers. `smo
 Application ── local TCP / SOCKS5 ──> Proxy
                                       │
                                       ▼
-                              smoltcp: DNS + TCP/IP
+                              DoT + smoltcp TCP/IP
                                       │ IPv4 or IPv6 packets
                                       ▼
                               OpenVPN data channel
@@ -24,7 +24,7 @@ Application ── local TCP / SOCKS5 ──> Proxy
                               VPN server ──> Website
 ```
 
-Only applications configured to use this SOCKS5 proxy follow this path. The project does not install a system-wide VPN. DNS lookup of a **VPN server hostname** may use the OS resolver before the tunnel exists; lookup of a **SOCKS destination hostname** uses DNS inside the tunnel.
+Only applications configured to use this SOCKS5 proxy follow this path. The project does not install a system-wide VPN. DNS lookup of a **VPN server hostname** uses authenticated DNS over TLS (DoT) through the normal internet connection before the tunnel exists; lookup of a **SOCKS destination hostname** uses DoT inside its assigned tunnel. Both default to `1.1.1.1:853`, verify the resolver certificate, and never fall back to plaintext DNS or the OS resolver. Literal VPN server IPs need no DNS.
 
 ## Workspace architecture
 
@@ -32,12 +32,13 @@ Only applications configured to use this SOCKS5 proxy follow this path. The proj
 | --- | --- | --- |
 | `ovpn-profile` | Parses the supported `.ovpn` directives into remotes, CA, `tls-crypt` key, and timing settings. | Profile text in; typed `Profile` out. No network runtime. |
 | `ovpn-client` | OpenVPN UDP session, protected control channel, TLS, authentication exchange, pushed settings, encrypted data packets, keepalives, and key rotation. | Plain IP packets in/out through `Session`; no knowledge of SOCKS5 or `smoltcp`. |
-| `ovpn-netstack` | Virtual IP interface, DNS queries, TCP connections, and IP packet production/consumption using `smoltcp`. | An exclusive `StackOwner` for the host; cloneable `Stack` connection handles and standard async `TunnelStream`s for clients. |
+| `ovpn-dns` | Shared authenticated DoT client, DNS message validation, and bounded address results. | Generic async TCP transport supplied by the caller; reusable TLS connections scoped to that client. |
+| `ovpn-netstack` | Virtual IP interface, tunneled DoT queries, TCP connections, and IP packet production/consumption using `smoltcp`. | An exclusive `StackOwner` for the host; cloneable `Stack` connection handles and standard async `TunnelStream`s for clients. |
 | `ovpn-socks5` | SOCKS5 negotiation and bidirectional stream forwarding, including TCP half-close. | An application-supplied `Connector` returns an async stream. No VPN or packet-stack dependency. |
 | `ovpn-ui` | Embedded dashboard with shutdown control, WebSocket feeds, bounded log buffer, and in-memory one-minute chart history. | Transports serialized dashboard frames and log events; no VPN or SOCKS dependency. |
 | `openvpn-proxy-app` | TOML config, saved configurations, activation, host discovery, connection manager, sticky routing, tunnel supervision, SOCKS and dashboard listeners, and shutdown. | Executable and composition root. |
 
-The app composes `profile`, `client`, `netstack`, `socks5`, and `ui`. The VPN client also uses the profile crate's pure policy types, so parsing and TLS negotiation share one definition of supported TLS versions. The app owns one OpenVPN session and one packet stack **per active VPN host**, connects their plain IP packet streams, and supplies routing/DNS/connection policy to SOCKS through its connector. Reusable crates expose typed errors with `thiserror`; the app adds context with `anyhow` and logs through `tracing`.
+The app composes `profile`, `client`, `dns`, `netstack`, `socks5`, and `ui`. The VPN client also uses the profile crate's pure policy types, so parsing and TLS negotiation share one definition of supported TLS versions. The app owns one OpenVPN session and one packet stack **per active VPN host**, connects their plain IP packet streams, and supplies routing/DNS/connection policy to SOCKS through its connector. Reusable crates expose typed errors with `thiserror`; the app adds context with `anyhow` and logs through `tracing`.
 
 ### Connection manager and sticky routing
 
@@ -68,7 +69,7 @@ Profiles support `tls-version-min` and `tls-version-max`, with TLS 1.2 through 1
 
 ### Inside the packet stack
 
-`Stack` is a cloneable async handle. Its commands go to one `smoltcp` engine task; callers receive connection events through channels. The engine polls a virtual IP device, runs DNS and TCP state machines, and emits IPv4 or IPv6 packets to the app according to the VPN server's routes. The device is an in-memory packet queue, not a TUN interface. The engine wakes for commands, consumed connection events, and the next TCP or application deadline; it does not need a dedicated OS thread for `smoltcp`.
+`Stack` is a cloneable async handle. Its commands go to one `smoltcp` engine task; callers receive connection events through channels. The engine polls a virtual IP device, runs TCP state machines, and emits IPv4 or IPv6 packets to the app according to the VPN server's routes. `ovpn-dns` wraps tunneled TCP streams in TLS for DNS. The device is an in-memory packet queue, not a TUN interface. The engine wakes for commands, consumed connection events, and the next TCP or application deadline; it does not need a dedicated OS thread for `smoltcp`.
 
 `smoltcp` supplies the TCP behavior a SOCKS client expects: connection setup, sequencing, acknowledgments, retransmission, and teardown. The SOCKS handler works with byte streams and connection events; it does not construct TCP or IP headers. Each connection's `StreamWriter` has a bounded upload queue. When that queue fills, SOCKS pauses client reads while continuing to receive responses and monitor tunnel failure. Ready buffered work yields cooperatively without waiting on the timer wheel.
 
@@ -112,7 +113,7 @@ sequenceDiagram
     participant Socks as SOCKS5 handler
     participant Connector as Application connector
     participant Manager as Connection manager
-    participant Stack as smoltcp engine
+    participant Stack as Tunnel stack + DoT client
     participant App as Host worker packet loop
     participant VPN as OpenVPN session
     participant Server as VPN server
@@ -128,12 +129,12 @@ sequenceDiagram
     Manager-->>Connector: Lease for one ready host and its stack
     opt Destination is a hostname
         Connector->>Stack: Resolve A or AAAA record
-        Stack->>App: DNS query as IP packet
+        Stack->>App: TLS-encrypted DNS over tunneled TCP/IP
         App->>VPN: Encrypt packet
         VPN->>Server: UDP data packet
         Server-->>VPN: Encrypted DNS response
         VPN-->>App: Plain IP packet
-        App-->>Stack: Deliver DNS response
+        App-->>Stack: Deliver TLS-encrypted DNS response
         Stack-->>Connector: Destination IP address
     end
     Connector->>Stack: Connect virtual TCP stream to address:443
@@ -166,7 +167,7 @@ sequenceDiagram
 
 The application owns a `JoinSet` of client tasks and the connection manager. Shutdown stops accepting clients, cancels and joins client handlers, stops host workers, then stops and joins routing. The manager observes unexpected routing/host task completion while serving. Dropping an owner cancels its task as a fallback during startup cancellation or error unwinding.
 
-Each host worker owns a `HostSession`: its OpenVPN session, packet output receiver, and exclusive `StackOwner`. The stack actor alone changes stack lifecycle state and owns TCP/DNS state. Client `Stack` handles carry immutable session routes and connection access; they cannot configure, reset, or inject packets. A reconnect creates a new stack identity. Probe results from an old identity are rejected by routing. Probe tasks are children of their host session and are cancelled and joined on exit.
+Each host worker owns a `HostSession`: its OpenVPN session, packet output receiver, and exclusive `StackOwner`. The stack actor alone changes stack lifecycle state and owns TCP state. Client `Stack` handles carry immutable session routes and connection access; they cannot configure, reset, or inject packets. Each stack also owns its DoT connection pool; a reconnect creates a new stack identity and resolver pool. Probe results from an old identity are rejected by routing. Probe tasks are children of their host session and are cancelled and joined on exit.
 
 One routing actor owns selection policy, sticky assignments, lease accounting, pool idle time, and sticky expiry. Activation messages describe desired membership and preferred endpoints; host workers report actual connection state. Each connected client owns its route lease through its `LeasedStream`. Tokio's bidirectional forwarding allows upload and download to progress independently; write shutdown keeps the socket alive until queued bytes are acknowledged and its TCP write half closes, while reads can continue. A reset with unacknowledged upload data fails the stream.
 
@@ -195,7 +196,7 @@ cp config.toml.example config.toml
 cargo run --release -p openvpn-proxy-app
 ```
 
-Pass a path as the sole argument to use a config file other than `config.toml`. Application settings (`socks5_address`, `webui_address`, and `dashboard_log_capacity`) stay at the top level. The optional `[openvpn_config]` section holds `profile_path`, `username`, `password`, `dns_override`, and `max_active_vpn_hosts`. Relative `profile_path` values resolve from the application TOML file's directory. Each VPN's `max_active_vpn_hosts` defaults to 16. Set `webui_address` to enable the dashboard; omitting it starts no web server. When enabled, the dashboard binds before profile loading, SOCKS binding, and VPN probing. A failed dashboard bind stops startup; a later proxy startup or listener failure appears in the dashboard, which stays available until shutdown. `dns_override` is optional; it replaces the server-pushed resolver for SOCKS destination lookups and still sends those queries through the assigned VPN. Without a usable DNS server, hostname requests fail; direct IP address requests can still work.
+Pass a path as the sole argument to use a config file other than `config.toml`. Application settings (`socks5_address`, `webui_address`, and `dashboard_log_capacity`) stay at the top level. The optional `[openvpn_config]` section holds `profile_path`, `username`, `password`, `dns_override`, `dns_tls_name`, and `max_active_vpn_hosts`. Relative `profile_path` values resolve from the application TOML file's directory. Each VPN's `max_active_vpn_hosts` defaults to 16. Set `webui_address` to enable the dashboard; omitting it starts no web server. When enabled, the dashboard binds before profile loading, SOCKS binding, and VPN probing. A failed dashboard bind stops startup; a later proxy startup or listener failure appears in the dashboard, which stays available until shutdown. `dns_override` optionally sets the IPv4 DoT resolver for both VPN host discovery and SOCKS destination lookups; it defaults to `1.1.1.1`. Server-pushed DNS addresses are not used. `dns_tls_name` optionally supplies the certificate hostname (for example `cloudflare-dns.com`); without it, the certificate must cover the resolver IP. DoT uses TCP port 853 and trusted public certificate authorities. No plaintext bootstrap lookup is needed. Custom resolvers must be reachable before the VPN connects and through the VPN. Resolver connection, TLS, and response failures fail the lookup without plaintext fallback.
 
 ```sh
 curl --socks5-hostname 127.0.0.1:1080 https://example.com
@@ -232,6 +233,7 @@ username = "your-user"
 password = "your-password"
 max_active_vpn_hosts = 16
 # dns_override = "1.1.1.1"
+# dns_tls_name = "cloudflare-dns.com"
 ```
 
 Existing installations must move their top-level VPN fields into `[openvpn_config]`.
@@ -239,7 +241,7 @@ The Default entry is read-only through the API and dashboard; changing its appli
 TOML settings requires restarting the executable. The referenced default `.ovpn` is
 read again when Default is activated.
 
-Custom entries contain a name, username/password, uploaded `.ovpn`, optional DNS override,
+Custom entries contain a name, username/password, uploaded `.ovpn`, optional DoT resolver and TLS hostname,
 and host limit. They are stored as `configs/<id>.toml` **under the current working directory**,
 regardless of the application TOML file's location. Each record contains metadata plus
 an `[openvpn_config]` section with the credentials and inline profile text. No database

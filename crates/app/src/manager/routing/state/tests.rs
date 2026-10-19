@@ -20,7 +20,7 @@ async fn test_stack_with_ipv6(
         ovpn_netstack::TunnelConfig::new(
             "10.8.0.2".parse().unwrap(),
             "10.8.0.1".parse().unwrap(),
-            vec![],
+            ovpn_dns::ResolverConfig::default(),
             1400,
             ipv6,
         )

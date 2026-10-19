@@ -241,7 +241,7 @@ impl Proxy {
             prepared.profile,
             prepared.username,
             prepared.password,
-            prepared.dns_override,
+            prepared.dns,
             prepared.max_active_vpn_hosts,
             dashboard
                 .map(DashboardHandle::telemetry)

@@ -14,4 +14,8 @@ webui_address = "127.0.0.1:8080"
 # username = ""
 # password = ""
 # max_active_vpn_hosts = 16
+# Authenticated DNS over TLS for VPN discovery and tunneled destinations.
+# Defaults to 1.1.1.1:853; never falls back to plaintext.
+# Without dns_tls_name, the certificate must cover the resolver IP.
 # dns_override = "1.1.1.1"
+# dns_tls_name = "cloudflare-dns.com"

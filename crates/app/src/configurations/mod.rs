@@ -26,7 +26,7 @@ pub(crate) struct PreparedConfiguration {
     pub profile: Profile,
     pub username: String,
     pub password: String,
-    pub dns_override: Option<Ipv4Addr>,
+    pub dns: ovpn_dns::ResolverConfig,
     pub max_active_vpn_hosts: Option<NonZeroUsize>,
 }
 
@@ -64,6 +64,7 @@ struct SavedOpenVpnConfig {
     profile_name: String,
     profile_text: String,
     dns_override: Option<Ipv4Addr>,
+    dns_tls_name: Option<String>,
     max_active_vpn_hosts: Option<NonZeroUsize>,
 }
 
@@ -210,6 +211,7 @@ impl Configurations {
             &vpn.username,
             &vpn.password,
             vpn.dns_override,
+            vpn.dns_tls_name.as_deref(),
             vpn.max_active_vpn_hosts,
         )?;
         Ok((record.name, record.revision, prepared))
@@ -309,6 +311,7 @@ impl Configurations {
             &input.username,
             &password,
             input.dns_override,
+            input.dns_tls_name.as_deref(),
             input.max_active_vpn_hosts,
         )?;
         let revision = previous
@@ -327,6 +330,7 @@ impl Configurations {
                 profile_name,
                 profile_text,
                 dns_override: input.dns_override,
+                dns_tls_name: input.dns_tls_name,
                 max_active_vpn_hosts: input.max_active_vpn_hosts,
             },
         };
@@ -437,6 +441,7 @@ impl ConfigurationControl for Configurations {
                         .to_string_lossy()
                         .into_owned(),
                     dns_override: default.dns_override,
+                    dns_tls_name: default.dns_tls_name.clone(),
                     max_active_vpn_hosts: default.max_active_vpn_hosts,
                 });
             }
@@ -481,6 +486,7 @@ impl SavedConfiguration {
             password_set: !self.openvpn_config.password.is_empty(),
             profile_name: self.openvpn_config.profile_name.clone(),
             dns_override: self.openvpn_config.dns_override,
+            dns_tls_name: self.openvpn_config.dns_tls_name.clone(),
             max_active_vpn_hosts: self.openvpn_config.max_active_vpn_hosts,
         }
     }
@@ -511,6 +517,7 @@ pub(crate) async fn prepare_default(
         &config.username,
         &config.password,
         config.dns_override,
+        config.dns_tls_name.as_deref(),
         config.max_active_vpn_hosts,
     )
 }
@@ -520,6 +527,7 @@ fn prepare(
     username: &str,
     password: &str,
     dns_override: Option<Ipv4Addr>,
+    dns_tls_name: Option<&str>,
     max_active_vpn_hosts: Option<NonZeroUsize>,
 ) -> Result<PreparedConfiguration, ConfigurationError> {
     if text.len() > MAX_PROFILE_BYTES {
@@ -551,11 +559,13 @@ fn prepare(
     if profile.needs_credentials && (username.is_empty() || password.is_empty()) {
         return invalid("This OpenVPN profile requires a username and password");
     }
+    let dns = ovpn_dns::ResolverConfig::new(dns_override, dns_tls_name)
+        .map_err(|error| ConfigurationError::Invalid(error.to_string()))?;
     Ok(PreparedConfiguration {
         profile,
         username: username.to_owned(),
         password: password.to_owned(),
-        dns_override,
+        dns,
         max_active_vpn_hosts,
     })
 }

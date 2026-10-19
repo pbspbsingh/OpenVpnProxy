@@ -6,14 +6,9 @@ pub(crate) const MIN_TUN_MTU: usize = 576;
 pub(crate) const MAX_TUN_MTU: usize = 1400;
 pub(crate) const MIN_IPV6_MTU: usize = 1280;
 const MAX_IPV6_ROUTES: usize = 3;
-const MAX_DNS_SERVERS: usize = 4;
 
-/// Address family used for a tunneled DNS lookup.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum IpVersion {
-    V4,
-    V6,
-}
+pub use ovpn_dns::IpVersion;
+use ovpn_dns::ResolverConfig;
 
 /// A route installed in the userspace IPv6 stack.
 #[derive(Clone, Debug)]
@@ -51,17 +46,17 @@ pub struct Ipv6Config {
 pub struct TunnelConfig {
     pub(crate) local: Ipv4Addr,
     pub(crate) gateway: Ipv4Addr,
-    pub(crate) dns: Vec<IpAddr>,
+    pub(crate) dns: ResolverConfig,
     pub(crate) mtu: usize,
     pub(crate) ipv6: Option<Ipv6Config>,
 }
 
 impl TunnelConfig {
-    /// Validates the tunnel settings and removes DNS servers without a route.
+    /// Validates the tunnel IP settings.
     pub fn new(
         local: Ipv4Addr,
         gateway: Ipv4Addr,
-        dns: Vec<IpAddr>,
+        dns: ResolverConfig,
         mtu: usize,
         ipv6: Option<Ipv6Config>,
     ) -> Result<Self> {
@@ -92,21 +87,6 @@ impl TunnelConfig {
                 }))
         {
             return Err(StackError::InvalidIpv6Config);
-        }
-        let routes = ipv6
-            .as_ref()
-            .map_or(&[][..], |config| config.routes.as_slice());
-        let mut dns: Vec<_> = dns
-            .into_iter()
-            .filter(|&server| matches_route(routes, server))
-            .collect();
-        if dns.len() > MAX_DNS_SERVERS {
-            tracing::warn!(
-                servers = dns.len(),
-                limit = MAX_DNS_SERVERS,
-                "VPN pushed too many DNS servers; extra servers ignored"
-            );
-            dns.truncate(MAX_DNS_SERVERS);
         }
         Ok(Self {
             local,
@@ -177,25 +157,5 @@ mod tests {
             ..default
         };
         assert!(!invalid.contains("fe80::1".parse().unwrap()));
-    }
-
-    #[test]
-    fn ipv6_dns_server_requires_a_tunnel_route() {
-        let server = IpAddr::V6("2001:db8::53".parse().unwrap());
-        let local = Ipv4Addr::new(10, 8, 0, 2);
-        let gateway = Ipv4Addr::new(10, 8, 0, 1);
-        let without_ipv6 = TunnelConfig::new(local, gateway, vec![server], 1400, None).unwrap();
-        assert!(without_ipv6.dns.is_empty());
-        let ipv6 = Ipv6Config {
-            local: "2001:db8:1::2".parse().unwrap(),
-            prefix_len: 64,
-            routes: vec![Ipv6Route {
-                network: "2000::".parse().unwrap(),
-                prefix_len: 3,
-                gateway: "2001:db8:1::1".parse().unwrap(),
-            }],
-        };
-        let with_ipv6 = TunnelConfig::new(local, gateway, vec![server], 1400, Some(ipv6)).unwrap();
-        assert_eq!(with_ipv6.dns, vec![server]);
     }
 }

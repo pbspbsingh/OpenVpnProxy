@@ -27,6 +27,7 @@ pub(crate) struct OpenVpnConfig {
     #[serde(default)]
     pub password: String,
     pub dns_override: Option<Ipv4Addr>,
+    pub dns_tls_name: Option<String>,
     pub max_active_vpn_hosts: Option<NonZeroUsize>,
 }
 

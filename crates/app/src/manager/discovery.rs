@@ -1,6 +1,9 @@
+use ovpn_dns::{Client, IpVersion, ResolverConfig};
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::{Ipv4Addr, SocketAddr};
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::net::TcpStream;
 
 use anyhow::{Context, Result, bail};
 use ovpn_profile::Profile;
@@ -17,10 +20,14 @@ pub(super) struct HostCandidate {
     pub endpoints: Vec<SocketAddr>,
 }
 
-pub(super) async fn resolve_candidates(profile: &Profile) -> Result<Vec<HostCandidate>> {
+pub(super) async fn resolve_candidates(
+    profile: &Profile,
+    dns: ResolverConfig,
+) -> Result<Vec<HostCandidate>> {
     if profile.remotes.len() > MAX_PROFILE_REMOTES {
         bail!("profile contains too many VPN remotes");
     }
+    let resolver = Arc::new(Client::<TcpStream>::new(dns));
     let mut lookups = JoinSet::new();
     let distinct_remotes: BTreeSet<_> = profile.remotes.iter().cloned().collect();
     tracing::debug!(
@@ -29,15 +36,28 @@ pub(super) async fn resolve_candidates(profile: &Profile) -> Result<Vec<HostCand
         "deduplicated profile remotes"
     );
     for (host, port) in distinct_remotes {
+        let resolver = Arc::clone(&resolver);
         lookups.spawn(async move {
-            let result = time::timeout(
-                REMOTE_DNS_TIMEOUT,
-                tokio::net::lookup_host((host.as_str(), port)),
-            )
-            .await
-            .map(|result| {
-                result.map(|addresses| addresses.filter(SocketAddr::is_ipv4).collect::<Vec<_>>())
-            });
+            let result = time::timeout(REMOTE_DNS_TIMEOUT, async {
+                // Literal endpoints require no DNS request.
+                if let Ok(address) = host.parse::<std::net::IpAddr>() {
+                    return Ok(if address.is_ipv4() {
+                        vec![SocketAddr::new(address, port)]
+                    } else {
+                        vec![]
+                    });
+                }
+                resolver
+                    .resolve(&host, IpVersion::V4, TcpStream::connect)
+                    .await
+                    .map(|addresses| {
+                        addresses
+                            .into_iter()
+                            .map(|address| SocketAddr::new(address, port))
+                            .collect::<Vec<_>>()
+                    })
+            })
+            .await;
             (host, port, result)
         });
     }
@@ -76,4 +96,35 @@ pub(super) async fn resolve_candidates(profile: &Profile) -> Result<Vec<HostCand
         .into_iter()
         .map(|(address, endpoints)| HostCandidate { address, endpoints })
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn literal_vpn_hosts_need_no_resolver_and_preserve_distinct_ports() {
+        let profile = Profile::parse(&format!(
+            "client\nproto udp\nremote 192.0.2.1 1194\nremote 192.0.2.1 443\nremote 192.0.2.1 443\nremote 2001:db8::1 1194\n<ca>\nCERT\n</ca>\n<tls-crypt>\n{}\n</tls-crypt>\n",
+            "00".repeat(256)
+        )).unwrap();
+        // An unreachable resolver proves literal remotes do not need DNS.
+        let dns = ResolverConfig::new(Some("192.0.2.53".parse().unwrap()), None).unwrap();
+        let candidates = time::timeout(Duration::from_secs(1), resolve_candidates(&profile, dns))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(
+            candidates[0].address,
+            "192.0.2.1".parse::<Ipv4Addr>().unwrap()
+        );
+        assert_eq!(
+            candidates[0].endpoints,
+            vec![
+                "192.0.2.1:443".parse::<SocketAddr>().unwrap(),
+                "192.0.2.1:1194".parse().unwrap()
+            ]
+        );
+    }
 }

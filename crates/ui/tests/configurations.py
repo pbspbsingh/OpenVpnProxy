@@ -156,10 +156,16 @@ def exercise(cdp, url, directory):
     cdp.wait("document.querySelector('#configuration-password').placeholder.includes('leave blank')")
     fill(cdp, "#configuration-name", "Ireland edited")
     fill(cdp, "#configuration-username", "edited-user")
+    fill(cdp, "#configuration-dns", "1.1.1.1")
+    fill(cdp, "#configuration-dns-tls-name", "cloudflare-dns.com")
     cdp.evaluate("document.querySelector('#configuration-save').click()")
     cdp.wait(f"{row}.querySelector('strong').textContent === 'Ireland edited'")
     stored = tomllib.loads((directory / "configs" / f"{identifier}.toml").read_text())
     assert stored["revision"] == 2
+    assert stored["openvpn_config"]["dns_override"] == "1.1.1.1"
+    assert stored["openvpn_config"]["dns_tls_name"] == "cloudflare-dns.com"
+    assert api(url)["configurations"][0]["dns_tls_name"] == "cloudflare-dns.com"
+    check(cdp, "document.querySelector('#configuration-dns-tls-name').value === 'cloudflare-dns.com'")
     assert stored["openvpn_config"]["password"] == SECRET
     assert stored["openvpn_config"]["profile_text"] == PROFILE
     cdp.evaluate(f"window.confirm = () => false; {activate_button}.click()")

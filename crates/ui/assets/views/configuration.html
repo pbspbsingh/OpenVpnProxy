@@ -43,8 +43,11 @@
      <label for="configuration-file">OpenVPN file</label>
      <input id="configuration-file" x-ref="file" type="file" accept=".ovpn,text/plain" @change="chooseFile($event)" :required="!editingId">
      <p class="muted" id="configuration-file-status" x-text="reading ? 'Reading file…' : uploadName ? `Selected: ${uploadName}` : profileName ? `Stored: ${profileName} — choose a file to replace it` : 'Choose an .ovpn file (maximum 256 KiB)'"></p>
-     <label for="configuration-dns">DNS override <span class="muted">(optional IPv4 address)</span></label>
-     <input id="configuration-dns" x-model="draft.dns" placeholder="Use the VPN server’s DNS">
+     <label for="configuration-dns">DNS over TLS resolver <span class="muted">(optional IPv4 address)</span></label>
+     <input id="configuration-dns" x-model="draft.dns" placeholder="1.1.1.1">
+     <label for="configuration-dns-tls-name">DNS TLS hostname <span class="muted">(optional; otherwise verify resolver IP)</span></label>
+     <input id="configuration-dns-tls-name" x-model="draft.dnsTlsName" maxlength="253" placeholder="e.g. cloudflare-dns.com">
+     <p class="muted">Defaults to 1.1.1.1. A custom resolver must be reachable before and through the VPN.</p>
      <label for="configuration-limit">Maximum active VPN hosts <span class="muted">(optional)</span></label>
      <input id="configuration-limit" x-model="draft.limit" type="number" min="1" max="64" placeholder="16">
      <button class="config-button primary" id="configuration-save" type="submit" x-show="!readOnly" :disabled="busy || reading" x-text="busy ? 'Working…' : 'Save configuration'">Save configuration</button>

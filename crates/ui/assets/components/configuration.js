@@ -7,7 +7,7 @@ export function configuration() {
     editingId: null, readOnly: false, passwordSet: false,
     profileName: "", uploadName: "", reading: false, busy: false,
     notice: "", error: "",
-    draft: { name: "", username: "", password: "", clearPassword: false, dns: "", limit: "", revision: null },
+    draft: { name: "", username: "", password: "", clearPassword: false, dns: "", dnsTlsName: "", limit: "", revision: null },
     get active() { return this.$store.dashboard.tab === "configuration" && !this.$store.dashboard.stopping; },
     get starting() { return this.status?.phase === "starting"; },
     get stateLabel() {
@@ -48,7 +48,7 @@ export function configuration() {
       this.notice = this.error = "";
       this.draft = {
         name: entry?.name ?? "", username: entry?.username ?? "", password: "", clearPassword: false,
-        dns: entry?.dns_override ?? "", limit: entry?.max_active_vpn_hosts ?? "", revision: entry?.revision ?? null,
+        dns: entry?.dns_override ?? "", dnsTlsName: entry?.dns_tls_name ?? "", limit: entry?.max_active_vpn_hosts ?? "", revision: entry?.revision ?? null,
       };
       this.$refs.file.value = "";
     },
@@ -82,6 +82,7 @@ export function configuration() {
           password: this.draft.clearPassword ? "" : this.draft.password || null,
           profile: upload, revision: this.draft.revision,
           dns_override: this.draft.dns.trim() || null,
+          dns_tls_name: this.draft.dnsTlsName.trim() || null,
           max_active_vpn_hosts: this.draft.limit === "" ? null : Number(this.draft.limit),
         };
         const saved = await this.api(`/api/configurations${id ? `/${id}` : ""}`, {

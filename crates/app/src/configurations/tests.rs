@@ -41,6 +41,7 @@ fn input(name: &str) -> ConfigurationInput {
         }),
         revision: None,
         dns_override: None,
+        dns_tls_name: None,
         max_active_vpn_hosts: None,
     }
 }
@@ -53,6 +54,7 @@ fn edit(revision: u64) -> ConfigurationInput {
         profile: None,
         revision: Some(revision),
         dns_override: Some("1.1.1.1".parse().unwrap()),
+        dns_tls_name: Some("cloudflare-dns.com".into()),
         max_active_vpn_hosts: NonZeroUsize::new(2),
     }
 }
@@ -94,6 +96,10 @@ async fn save_edit_and_reload_retain_secrets_but_only_return_metadata() {
     assert_eq!(records[0].1.openvpn_config.profile_text, profile());
     let list = service.list().await.unwrap();
     assert_eq!(list.configurations[0].name, "Renamed");
+    assert_eq!(
+        list.configurations[0].dns_tls_name.as_deref(),
+        Some("cloudflare-dns.com")
+    );
     let metadata = toml::to_string(&list.configurations[0]).unwrap();
     assert!(!metadata.contains("private-password"));
     assert!(!metadata.contains("profile_text"));
@@ -136,6 +142,7 @@ async fn default_is_optional_read_only_and_separate_from_saved_files() {
         username: "default-user".into(),
         password: "default-secret".into(),
         dns_override: None,
+        dns_tls_name: None,
         max_active_vpn_hosts: None,
     };
     let (service, _) = Configurations::new(Some(default), directory.repository());
@@ -207,7 +214,7 @@ async fn invalid_input_and_failed_validation_leave_saved_and_running_state_intac
     let first = service.save(None, input("Ireland")).await.unwrap();
     let original =
         std::fs::read(directory.repository().join(format!("{}.toml", first.id))).unwrap();
-    for change in 0..5 {
+    for change in 0..7 {
         let mut value = edit(1);
         match change {
             0 => value.password = Some(String::new()),
@@ -219,6 +226,8 @@ async fn invalid_input_and_failed_validation_leave_saved_and_running_state_intac
             }
             2 => value.max_active_vpn_hosts = NonZeroUsize::new(65),
             3 => value.name = "Default".into(),
+            4 => value.dns_tls_name = Some("https://bad/name".into()),
+            5 => value.dns_override = Some("0.0.0.0".parse().unwrap()),
             _ => {
                 value.profile = Some(ProfileUpload {
                     name: "../outside.ovpn".into(),
@@ -329,6 +338,7 @@ fn cancelling_a_queued_disk_commit_keeps_its_write_lock_until_completion() {
                 profile_name: "client.ovpn".into(),
                 profile_text: profile(),
                 dns_override: None,
+                dns_tls_name: None,
                 max_active_vpn_hosts: None,
             },
         };
@@ -393,6 +403,7 @@ async fn startup_restores_last_successful_identity_using_latest_saved_settings()
         username: "default".into(),
         password: "default".into(),
         dns_override: None,
+        dns_tls_name: None,
         max_active_vpn_hosts: None,
     };
     let (restarted, _) = Configurations::new(Some(default), directory.repository());
@@ -417,6 +428,7 @@ async fn default_is_only_used_when_no_successful_selection_has_been_saved() {
         username: "default-user".into(),
         password: "default-password".into(),
         dns_override: None,
+        dns_tls_name: None,
         max_active_vpn_hosts: None,
     };
     let (service, _) = Configurations::new(Some(default), directory.repository());

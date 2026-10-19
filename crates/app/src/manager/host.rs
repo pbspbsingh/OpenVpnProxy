@@ -13,7 +13,7 @@ use tokio::time;
 use super::discovery::HostCandidate;
 use super::domain::{HostActivation, HostPhase};
 use super::probe::{
-    LatencyScore, PROBE_INTERVAL, SessionHealth, check_health, measure_with_session,
+    LatencyScore, PROBE_INTERVAL, SessionHealth, assess_readiness_with_session, check_health,
 };
 use super::routing::Shared;
 use super::telemetry::HostTraffic;
@@ -124,7 +124,7 @@ impl HostWorker {
             match result {
                 Ok(mut tunnel) => {
                     let fresh_score = tokio::select! {
-                        result = tunnel.measure() => result,
+                        result = tunnel.assess_readiness() => result,
                         _ = self.enabled.changed() => {
                             tunnel.shutdown().await;
                             continue;
@@ -242,7 +242,7 @@ pub(super) async fn benchmark_host(
             }
         };
         let setup_elapsed = started.elapsed();
-        let score = tunnel.measure().await;
+        let score = tunnel.assess_readiness().await;
         tunnel.shutdown().await;
         match score {
             Ok(score) => {
@@ -324,8 +324,8 @@ struct HostSession {
 }
 
 impl HostSession {
-    async fn measure(&mut self) -> Result<LatencyScore> {
-        measure_with_session(&mut self.session, &self.stack, &mut self.outbound).await
+    async fn assess_readiness(&mut self) -> Result<LatencyScore> {
+        assess_readiness_with_session(&mut self.session, &self.stack, &mut self.outbound).await
     }
 
     async fn shutdown(self) {
@@ -385,12 +385,14 @@ impl HostSession {
                                 let started = Instant::now();
                                 let report = check_health(&stack).await;
                                 shared.record_probe(id, stack.id(), report.score, started.elapsed()).await;
-                                report.reachability
+                                report.health
                             });
                         }
                     }
                     Some(result) = probes.join_next(), if !probes.is_empty() => {
-                        health.record(result.context("VPN probe task failed")?)?;
+                        let assessment = result.context("VPN probe task failed")?;
+                        tracing::info_span!("vpn_health", host_id = id, stack_id)
+                            .in_scope(|| health.record(assessment))?;
                     }
                     packet = outbound.recv() => {
                         let packet = packet.context("VPN packet output channel closed")?;

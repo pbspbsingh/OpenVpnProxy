@@ -1,9 +1,10 @@
+use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use ovpn_client::Session;
-use ovpn_netstack::{Stack, StackError, StackOwner};
+use ovpn_netstack::{IpVersion, Stack, StackError, StackOwner};
 use tokio::sync::mpsc;
 use tokio::time;
 
@@ -15,6 +16,7 @@ const PROBE_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 // HTTPS endpoints operated independently of the latency target (Cloudflare).
 const HEALTH_TARGETS: [Ipv4Addr; 2] = [Ipv4Addr::new(8, 8, 8, 8), Ipv4Addr::new(9, 9, 9, 9)];
 const MAX_FAILED_HEALTH_CHECKS: u8 = 3;
+const DNS_HEALTH_NAME: &str = "one.one.one.one";
 
 pub(super) const PROBE_INTERVAL: Duration = Duration::from_secs(60);
 
@@ -27,14 +29,31 @@ pub(super) struct LatencyScore {
 
 pub(super) struct ProbeReport {
     pub score: Result<LatencyScore>,
-    pub reachability: Reachability,
+    pub health: HealthAssessment,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum Reachability {
     Reachable,
     Unreachable,
     Inconclusive,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct HealthAssessment {
+    tcp: Reachability,
+    dns: Reachability,
+}
+
+impl HealthAssessment {
+    fn reachability(self) -> Reachability {
+        use Reachability::{Inconclusive, Reachable, Unreachable};
+        match (self.tcp, self.dns) {
+            (Unreachable, _) | (_, Unreachable) => Unreachable,
+            (Reachable, Reachable) => Reachable,
+            _ => Inconclusive,
+        }
+    }
 }
 
 /// Lives with one host session. An error uses the worker's normal teardown,
@@ -45,14 +64,35 @@ pub(super) struct SessionHealth {
 }
 
 impl SessionHealth {
-    pub(super) fn record(&mut self, reachability: Reachability) -> Result<()> {
-        match reachability {
-            Reachability::Reachable => self.failed_checks = 0,
-            Reachability::Unreachable => self.failed_checks += 1,
-            Reachability::Inconclusive => return Ok(()),
+    pub(super) fn record(&mut self, health: HealthAssessment) -> Result<()> {
+        match health.reachability() {
+            Reachability::Reachable => {
+                if self.failed_checks > 0 {
+                    tracing::info!(
+                        previous_failures = self.failed_checks,
+                        "VPN TCP and DNS health recovered"
+                    );
+                }
+                self.failed_checks = 0;
+            }
+            Reachability::Unreachable => {
+                self.failed_checks += 1;
+                tracing::warn!(tcp = ?health.tcp, dns = ?health.dns,
+                    consecutive_failures = self.failed_checks, threshold = MAX_FAILED_HEALTH_CHECKS,
+                    "VPN health assessment failed");
+            }
+            Reachability::Inconclusive => {
+                tracing::debug!(tcp = ?health.tcp, dns = ?health.dns,
+                    consecutive_failures = self.failed_checks, "VPN health assessment inconclusive");
+                return Ok(());
+            }
         }
         if self.failed_checks >= MAX_FAILED_HEALTH_CHECKS {
-            bail!("VPN internet reachability failed repeatedly");
+            bail!(
+                "VPN health failed repeatedly (TCP: {:?}, DNS: {:?})",
+                health.tcp,
+                health.dns
+            );
         }
         Ok(())
     }
@@ -60,6 +100,26 @@ impl SessionHealth {
 
 /// A failed latency target alone must not evict a working VPN host.
 pub(super) async fn check_health(stack: &Stack) -> ProbeReport {
+    assess_health(check_tcp(stack), check_dns(stack)).await
+}
+
+async fn assess_health(
+    tcp: impl Future<Output = (Result<LatencyScore>, Reachability)>,
+    dns: impl Future<Output = Result<()>>,
+) -> ProbeReport {
+    let ((score, tcp), dns) = tokio::join!(tcp, dns);
+    let dns = match dns {
+        Ok(()) => Reachability::Reachable,
+        Err(error) if local_capacity_error(&error) => Reachability::Inconclusive,
+        Err(_) => Reachability::Unreachable,
+    };
+    ProbeReport {
+        score,
+        health: HealthAssessment { tcp, dns },
+    }
+}
+
+async fn check_tcp(stack: &Stack) -> (Result<LatencyScore>, Reachability) {
     let score = measure(stack).await;
     let reachability = if score.is_ok() {
         Reachability::Reachable
@@ -83,17 +143,32 @@ pub(super) async fn check_health(stack: &Stack) -> ProbeReport {
             _ => Reachability::Inconclusive,
         }
     };
-    ProbeReport {
-        score,
-        reachability,
-    }
+    (score, reachability)
+}
+
+#[tracing::instrument(name = "vpn_dns_health", skip_all, fields(stack_id = stack.id(), host = DNS_HEALTH_NAME))]
+async fn check_dns(stack: &Stack) -> Result<()> {
+    stack
+        .resolve(DNS_HEALTH_NAME, IpVersion::V4)
+        .await
+        .context("VPN DNS health lookup failed")?;
+    Ok(())
 }
 
 fn local_capacity_error(error: &anyhow::Error) -> bool {
-    matches!(
-        error.downcast_ref::<StackError>(),
-        Some(StackError::ConnectionLimit)
-    )
+    error.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<StackError>(),
+            Some(StackError::ConnectionLimit)
+        ) || cause.downcast_ref::<std::io::Error>().is_some_and(|error| {
+            matches!(
+                error
+                    .get_ref()
+                    .and_then(|error| error.downcast_ref::<StackError>()),
+                Some(StackError::ConnectionLimit)
+            )
+        })
+    })
 }
 
 pub(super) async fn measure(stack: &Stack) -> Result<LatencyScore> {
@@ -134,13 +209,16 @@ pub(super) async fn measure(stack: &Stack) -> Result<LatencyScore> {
     })
 }
 
-pub(super) async fn measure_with_session(
+pub(super) async fn assess_readiness_with_session(
     session: &mut Session,
     owner: &StackOwner,
     outbound: &mut mpsc::Receiver<Vec<u8>>,
 ) -> Result<LatencyScore> {
     let stack = owner.client();
-    let probe = measure(&stack);
+    let probe = async {
+        let (score, ()) = tokio::try_join!(measure(&stack), check_dns(&stack))?;
+        Ok(score)
+    };
     tokio::pin!(probe);
     loop {
         tokio::select! {
@@ -168,20 +246,4 @@ async fn connect_once(stack: &Stack, destination: SocketAddr) -> Result<Duration
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn only_repeated_confirmed_failures_end_a_session() {
-        use Reachability::{Inconclusive, Reachable, Unreachable};
-        let mut health = SessionHealth::default();
-        assert!(health.record(Unreachable).is_ok());
-        assert!(health.record(Inconclusive).is_ok());
-        assert!(health.record(Reachable).is_ok());
-        assert!(health.record(Unreachable).is_ok());
-        assert!(health.record(Unreachable).is_ok());
-        assert!(health.record(Unreachable).is_err());
-        // A replacement session starts with a fresh failure history.
-        assert!(SessionHealth::default().record(Unreachable).is_ok());
-    }
-}
+mod tests;
